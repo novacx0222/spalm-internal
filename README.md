@@ -1,6 +1,6 @@
-# spalm
+# SPALM
 
-Matrix multiplication library with a CPU (Intel MKL) backend.
+This repository contains code used in the paper 'SPALM: A Sparsity-Pattern-Adaptive Library for Matrices'.
 
 ## Building and running via Docker (`setup.sh`)
 
