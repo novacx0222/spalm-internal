@@ -28,9 +28,6 @@ All Docker-based commands are in a single script. Run from this directory:
 # One-time: build the image
 ./setup.sh build
 
-# Run the matrix multiplication example
-cd example && ./compile.sh && ./run.sh
-
 # Compile libraries
 ./setup.sh build-libs
 
@@ -44,7 +41,6 @@ cd example && ./compile.sh && ./run.sh
 # Find thresholds (custom size)
 ./setup.sh find-thresholds --size 4096
 
-# Run a custom command in the container
-./setup.sh run make clean
-./setup.sh bash
+# Run the matrix multiplication example
+cd example && ./compile.sh && ./run.sh
 ```
