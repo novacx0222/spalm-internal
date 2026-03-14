@@ -1,0 +1,4 @@
+slice_height:1
+slice_length:512
+tile_size_l2:128
+tile_size_l3:2304

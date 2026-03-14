@@ -1,0 +1,7 @@
+*.so
+*.o
+*.csv
+*.png
+decision_thresholds.txt
+OpenBLAS-0.3.30*
+example/bin/

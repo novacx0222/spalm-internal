@@ -1,0 +1,649 @@
+#include "cpu/dense_dense_matmul.h"
+
+#include <immintrin.h>
+#include <omp.h>
+#include <sched.h>  // For sched_setaffinity and CPU_SET macros
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <thread>
+#include <unordered_set>
+#include <vector>
+
+#include "cpu/kernel.h"
+#include "slice_decision.h"
+#include "util.h"
+
+// Custom deleter for aligned memory allocated with posix_memalign
+struct AlignedDeleter {
+  void operator()(void* ptr) const { free(ptr); }
+};
+
+template <typename T>
+using aligned_unique_ptr = std::unique_ptr<T[], AlignedDeleter>;
+
+// Helper function to allocate aligned memory and return a unique_ptr
+template <typename T>
+aligned_unique_ptr<T> make_aligned_unique(size_t count, size_t alignment = 64) {
+  void* ptr = nullptr;
+  if (posix_memalign(&ptr, alignment, sizeof(T) * count) != 0) {
+    throw std::bad_alloc();
+  }
+  return aligned_unique_ptr<T>(static_cast<T*>(ptr));
+}
+
+template <typename T>
+void inline dense_dense_matmul_task_shared(
+    const int slice_col, const int R_slice_start, const int R_slice_start_task,
+    const int R_slice_end, const int S_slice_start, const int S_slice_end,
+    T* R_packed_mem, BIT_DTYPE* R_bm, T* S_packed_mem, BIT_DTYPE* S_bm,
+    ss_matrix<T>& R_ssm, ss_matrix<T>& S_ssm, T* ret, bool sparse_result) {
+  const int M = R_ssm.csr_mat.rows;
+  const int K = R_ssm.csr_mat.cols;
+  const int N = S_ssm.csr_mat.rows;
+
+  const int mr = R_ssm.sh;
+  const int nr = S_ssm.sh;
+
+  const int sl = R_ssm.sl;
+
+  const int k_offset = slice_col * sl;
+  int row_offset;
+
+  __m512i gather_idx =
+      _mm512_set_epi32(0, 0, 0, 0, N * 11, N * 10, N * 9, N * 8, N * 7, N * 6,
+                       N * 5, N * 4, N * 3, N * 2, N, 0);
+
+  if (S_slice_end > S_slice_start) {
+    memset(S_bm, 0,
+           sizeof(BIT_DTYPE) * (S_slice_end - S_slice_start) *
+               div_ceil(sl, BITS));
+    for (int S_si = S_slice_start; S_si < S_slice_end; S_si++) {
+      const int s_idx = S_si - S_slice_start;
+      memset(&S_packed_mem[s_idx * sl * nr], 0, sizeof(T) * sl * nr);
+      const slice& S_s = S_ssm.s_csc_mat.vals[S_si];
+      pack_slice_new(S_s, S_ssm, k_offset, sl, nr,
+                     &S_packed_mem[s_idx * sl * nr],
+                     &S_bm[(s_idx * sl) / BITS]);
+    }
+  }
+
+  for (int R_si = R_slice_start_task; R_si < R_slice_end; R_si++) {
+    const int R_s_idx = R_si - R_slice_start;
+    const slice& R_s = R_ssm.s_csc_mat.vals[R_si];
+    const int* R_row_idxs = &R_ssm.sr_csc_mat.row_idxs[R_s.start];
+    for (int S_si = S_slice_start; S_si < S_slice_end; S_si++) {
+      const int S_s_idx = S_si - S_slice_start;
+      const slice& S_s = S_ssm.s_csc_mat.vals[S_si];
+      const int* S_row_idxs = &S_ssm.sr_csc_mat.row_idxs[S_s.start];
+      switch (get_alg(R_s.b, S_s.b)) {
+        case SPARSE_SPARSE:
+          break;
+        case DENSE_DENSE_RIGHT_INNER_KERNEL:
+          dense_right_inner_kernel(
+              S_s, S_ssm, R_s, R_row_idxs, mr,
+              &R_packed_mem[R_s_idx * sl * mr - (k_offset * mr)], M, N, ret,
+              gather_idx);
+          break;
+        case DENSE_DENSE_LEFT_INNER_KERNEL:
+          dense_left_inner_kernel(
+              R_s, R_ssm, S_s, S_row_idxs, nr,
+              &S_packed_mem[S_s_idx * sl * nr - (k_offset * nr)], M, N, ret);
+          break;
+        case DENSE_DENSE:
+          inner_kernel_bm(
+              &R_packed_mem[R_s_idx * sl * mr], &R_bm[(R_s_idx * sl) / BITS],
+              &S_packed_mem[S_s_idx * sl * nr], &S_bm[(S_s_idx * sl) / BITS],
+              sl, 1, 1, R_s, R_row_idxs, S_s, S_row_idxs, M, N, ret,
+              sparse_result, nullptr, row_offset);
+          break;
+      }
+    }
+  }
+}
+
+static const int divide_rule[][2] = {
+    {0, 0},  {1, 1},  {1, 2},  {1, 3},  {2, 2},  {1, 5},  {2, 3},  {1, 7},
+    {2, 4},  {3, 3},  {2, 5},  {1, 11}, {2, 6},  {1, 13}, {2, 7},  {3, 5},
+    {16, 1}, {1, 17}, {3, 6},  {1, 19}, {4, 5},  {3, 7},  {2, 11}, {1, 23},
+    {4, 6},  {5, 5},  {2, 13}, {3, 9},  {4, 7},  {1, 29}, {5, 6},  {1, 31},
+    {4, 8},  {3, 11}, {2, 17}, {5, 7},  {6, 6},  {1, 37}, {2, 19}, {3, 13},
+    {5, 8},  {1, 41}, {6, 7},  {1, 43}, {4, 11}, {5, 9},  {2, 23}, {1, 47},
+    {6, 8},  {7, 7},  {5, 10}, {3, 17}, {4, 13}, {1, 53}, {6, 9},  {5, 11},
+    {7, 8},  {3, 19}, {2, 29}, {1, 59}, {6, 10}, {1, 61}, {2, 31}, {7, 9},
+    {8, 8},
+};
+
+template <typename T>
+void dense_dense_matmul(ss_matrix<T>& R_ssm, ss_matrix<T>& S_ssm,
+                        const int tile_size_l2, const int tile_size_l3, T* ret,
+                        bool sparse_result, const int threads) {
+  std::chrono::time_point<std::chrono::high_resolution_clock> start, end;
+  auto dense_mm_start = std::chrono::high_resolution_clock::now();
+  const int M = R_ssm.csr_mat.rows;
+  const int K = R_ssm.csr_mat.cols;
+  const int N = S_ssm.csr_mat.rows;
+
+  auto mm_start = std::chrono::high_resolution_clock::now();
+
+  const int sl = R_ssm.sl;
+  const int mr = R_ssm.sh;
+  const int nr = S_ssm.sh;
+
+  auto mem_alloc_start = std::chrono::high_resolution_clock::now();
+
+  const int num_slice_cols = R_ssm.s_csc_mat.cols;
+
+  int max_slices_in_col_R = 0;
+  for (int col = 0; col < num_slice_cols; col++) {
+    int slices_in_col =
+        R_ssm.s_csc_mat.col_ptrs[col + 1] - R_ssm.s_csc_mat.col_ptrs[col];
+    max_slices_in_col_R = std::max(max_slices_in_col_R, slices_in_col);
+  }
+
+  const int S_slices_per_agg_tile = div_ceil(tile_size_l2, nr);
+
+  const int R_slices_per_l3 = div_ceil(tile_size_l3, mr);
+  const int R_block_size = R_slices_per_l3 * sl * mr;
+  const int R_bm_size = R_slices_per_l3 * div_ceil(sl, BITS);
+  auto R_packed_mem = make_aligned_unique<T>(R_block_size);
+  auto R_bm = make_aligned_unique<BIT_DTYPE>(R_bm_size);
+
+  auto mem_alloc_end = std::chrono::high_resolution_clock::now();
+  print_time("Memory allocation time: ", mem_alloc_end - mem_alloc_start);
+
+  std::vector<aligned_unique_ptr<T>> S_packed_mem_threads(threads);
+  std::vector<aligned_unique_ptr<BIT_DTYPE>> S_bm_threads(threads);
+  std::vector<int> thread_cores(threads);
+
+  omp_set_dynamic(0);
+#pragma omp parallel num_threads(threads)
+  {
+    thread_cores[omp_get_thread_num()] = sched_getcpu();
+    S_packed_mem_threads[omp_get_thread_num()] =
+        make_aligned_unique<T>(S_slices_per_agg_tile * sl * nr);
+    S_bm_threads[omp_get_thread_num()] = make_aligned_unique<BIT_DTYPE>(
+        (S_slices_per_agg_tile + 8) * div_ceil(sl, BITS));
+  }
+
+#pragma omp parallel num_threads(threads)
+  {
+    for (int R_slice_outer_it = 0; R_slice_outer_it < max_slices_in_col_R;
+         R_slice_outer_it += R_slices_per_l3) {
+      for (int slice_col = 0; slice_col < num_slice_cols; slice_col++) {
+        const int k_offset = slice_col * sl;
+        int row_offset;
+
+        const int R_si_l3 =
+            R_ssm.s_csc_mat.col_ptrs[slice_col] + R_slice_outer_it;
+        const int R_si_l3_end = std::min(
+            R_si_l3 + R_slices_per_l3, R_ssm.s_csc_mat.col_ptrs[slice_col + 1]);
+
+#pragma omp for schedule(static)
+        for (int R_si = R_si_l3; R_si < R_si_l3_end; R_si++) {
+          const int s_idx = R_si - R_si_l3;
+          memset(&R_bm[s_idx * sl / BITS], 0,
+                 sizeof(BIT_DTYPE) * div_ceil(sl, BITS));
+          memset(&R_packed_mem[s_idx * sl * mr], 0, sizeof(T) * sl * mr);
+          const slice& R_s = R_ssm.s_csc_mat.vals[R_si];
+          pack_slice_new(R_s, R_ssm, k_offset, sl, mr,
+                         &R_packed_mem[s_idx * sl * mr],
+                         &R_bm[(s_idx * sl) / BITS]);
+        }
+
+        const int task_num =
+            div_ceil(S_ssm.s_csc_mat.col_ptrs[slice_col + 1] -
+                             S_ssm.s_csc_mat.col_ptrs[slice_col],
+                         S_slices_per_agg_tile);
+        if (task_num == 0) {
+          continue;
+        }
+        const int R_div = div_ceil(threads, task_num);
+        const int R_slices_per_it = div_ceil(R_si_l3_end - R_si_l3, R_div);
+
+#pragma omp for collapse(2) schedule(dynamic, 1)
+        for (int R_slice_start_task = R_si_l3; R_slice_start_task < R_si_l3_end;
+             R_slice_start_task += R_slices_per_it) {
+          for (int S_si = S_ssm.s_csc_mat.col_ptrs[slice_col];
+               S_si < S_ssm.s_csc_mat.col_ptrs[slice_col + 1];
+               S_si += S_slices_per_agg_tile) {
+            const int S_slice_end =
+                std::min(S_si + S_slices_per_agg_tile,
+                         S_ssm.s_csc_mat.col_ptrs[slice_col + 1]);
+
+            const int R_slice_end =
+                std::min(R_si_l3_end, R_slice_start_task + R_slices_per_it);
+
+            T* S_packed_mem_private =
+                S_packed_mem_threads[omp_get_thread_num()].get();
+            BIT_DTYPE* S_bm_private = S_bm_threads[omp_get_thread_num()].get();
+            dense_dense_matmul_task_shared(
+                slice_col, R_si_l3, R_slice_start_task, R_slice_end, S_si,
+                S_slice_end, R_packed_mem.get(), R_bm.get(),
+                S_packed_mem_private, S_bm_private, R_ssm, S_ssm, ret,
+                sparse_result);
+          }
+        }
+      }
+    }
+  }
+
+  auto mm_end = std::chrono::high_resolution_clock::now();
+  print_time("Dense MM time: ", mm_end - mem_alloc_end);
+  print_time("Total dense MM time: ", mm_end - dense_mm_start);
+}
+
+void inline sparse_dense_inner_kernel_iter(const subrow& sr,
+                                           csr<double>& csr_mat,
+                                           const double* packed_mem,
+                                           const int nr, __m512d& res0,
+                                           __m512d& res1) {
+  res0 = _mm512_setzero_pd();
+  res1 = _mm512_setzero_pd();
+
+  const int unroll_factor = 4;
+  const int sr_end = sr.start + sr.len;
+
+  int k_idx = sr.start;
+  int iters = sr.len / unroll_factor;
+  int k_end = k_idx + iters * unroll_factor;
+
+  for (; k_idx < k_end; k_idx += unroll_factor) {
+    int k = csr_mat.col_idxs[k_idx];
+    __m512d r_val = _mm512_broadcastsd_pd(_mm_set_sd(csr_mat.vals[k_idx]));
+    __m512d s_vals0 = _mm512_loadu_pd(&packed_mem[nr * k]);
+    __m512d s_vals1 = _mm512_loadu_pd(&packed_mem[nr * k + 8]);
+    res0 = _mm512_fmadd_pd(r_val, s_vals0, res0);
+    res1 = _mm512_fmadd_pd(r_val, s_vals1, res1);
+
+    k = csr_mat.col_idxs[k_idx + 1];
+    r_val = _mm512_broadcastsd_pd(_mm_set_sd(csr_mat.vals[k_idx + 1]));
+    s_vals0 = _mm512_loadu_pd(&packed_mem[nr * k]);
+    s_vals1 = _mm512_loadu_pd(&packed_mem[nr * k + 8]);
+    res0 = _mm512_fmadd_pd(r_val, s_vals0, res0);
+    res1 = _mm512_fmadd_pd(r_val, s_vals1, res1);
+
+    k = csr_mat.col_idxs[k_idx + 2];
+    r_val = _mm512_broadcastsd_pd(_mm_set_sd(csr_mat.vals[k_idx + 2]));
+    s_vals0 = _mm512_loadu_pd(&packed_mem[nr * k]);
+    s_vals1 = _mm512_loadu_pd(&packed_mem[nr * k + 8]);
+    res0 = _mm512_fmadd_pd(r_val, s_vals0, res0);
+    res1 = _mm512_fmadd_pd(r_val, s_vals1, res1);
+
+    k = csr_mat.col_idxs[k_idx + 3];
+    r_val = _mm512_broadcastsd_pd(_mm_set_sd(csr_mat.vals[k_idx + 3]));
+    s_vals0 = _mm512_loadu_pd(&packed_mem[nr * k]);
+    s_vals1 = _mm512_loadu_pd(&packed_mem[nr * k + 8]);
+    res0 = _mm512_fmadd_pd(r_val, s_vals0, res0);
+    res1 = _mm512_fmadd_pd(r_val, s_vals1, res1);
+  }
+  for (; k_idx < sr_end; k_idx++) {
+    int k = csr_mat.col_idxs[k_idx];
+    __m512d r_val = _mm512_broadcastsd_pd(_mm_set_sd(csr_mat.vals[k_idx]));
+    __m512d s_vals0 = _mm512_loadu_pd(&packed_mem[nr * k]);
+    __m512d s_vals1 = _mm512_loadu_pd(&packed_mem[nr * k + 8]);
+    res0 = _mm512_fmadd_pd(r_val, s_vals0, res0);
+    res1 = _mm512_fmadd_pd(r_val, s_vals1, res1);
+  }
+}
+
+void inline sparse_dense_inner_kernel_iter(const subrow& sr,
+                                           csr<float>& csr_mat,
+                                           const float* packed_mem,
+                                           const int nr, __m512& res0,
+                                           __m512& res1) {
+  res0 = _mm512_setzero_ps();
+  res1 = _mm512_setzero_ps();
+
+  const int unroll_factor = 4;
+  const int sr_end = sr.start + sr.len;
+
+  int k_idx = sr.start;
+  int iters = sr.len / unroll_factor;
+  int k_end = k_idx + iters * unroll_factor;
+
+  for (; k_idx < k_end; k_idx += unroll_factor) {
+    int k = csr_mat.col_idxs[k_idx];
+    __m512 r_val = _mm512_broadcastss_ps(_mm_set_ss(csr_mat.vals[k_idx]));
+    __m512 s_vals0 = _mm512_loadu_ps(&packed_mem[nr * k]);
+    __m512 s_vals1 = _mm512_loadu_ps(&packed_mem[nr * k + 16]);
+    res0 = _mm512_fmadd_ps(r_val, s_vals0, res0);
+    res1 = _mm512_fmadd_ps(r_val, s_vals1, res1);
+
+    k = csr_mat.col_idxs[k_idx + 1];
+    r_val = _mm512_broadcastss_ps(_mm_set_ss(csr_mat.vals[k_idx + 1]));
+    s_vals0 = _mm512_loadu_ps(&packed_mem[nr * k]);
+    s_vals1 = _mm512_loadu_ps(&packed_mem[nr * k + 16]);
+    res0 = _mm512_fmadd_ps(r_val, s_vals0, res0);
+    res1 = _mm512_fmadd_ps(r_val, s_vals1, res1);
+
+    k = csr_mat.col_idxs[k_idx + 2];
+    r_val = _mm512_broadcastss_ps(_mm_set_ss(csr_mat.vals[k_idx + 2]));
+    s_vals0 = _mm512_loadu_ps(&packed_mem[nr * k]);
+    s_vals1 = _mm512_loadu_ps(&packed_mem[nr * k + 16]);
+    res0 = _mm512_fmadd_ps(r_val, s_vals0, res0);
+    res1 = _mm512_fmadd_ps(r_val, s_vals1, res1);
+
+    k = csr_mat.col_idxs[k_idx + 3];
+    r_val = _mm512_broadcastss_ps(_mm_set_ss(csr_mat.vals[k_idx + 3]));
+    s_vals0 = _mm512_loadu_ps(&packed_mem[nr * k]);
+    s_vals1 = _mm512_loadu_ps(&packed_mem[nr * k + 16]);
+    res0 = _mm512_fmadd_ps(r_val, s_vals0, res0);
+    res1 = _mm512_fmadd_ps(r_val, s_vals1, res1);
+  }
+  for (; k_idx < sr_end; k_idx++) {
+    int k = csr_mat.col_idxs[k_idx];
+    __m512 r_val = _mm512_broadcastss_ps(_mm_set_ss(csr_mat.vals[k_idx]));
+    __m512 s_vals0 = _mm512_loadu_ps(&packed_mem[nr * k]);
+    __m512 s_vals1 = _mm512_loadu_ps(&packed_mem[nr * k + 16]);
+    res0 = _mm512_fmadd_ps(r_val, s_vals0, res0);
+    res1 = _mm512_fmadd_ps(r_val, s_vals1, res1);
+  }
+}
+
+template <typename T>
+void dense_left_inner_kernel(const slice& R_s, ss_matrix<T>& R_ssm,
+                             const slice& S_s, const int* S_row_idxs,
+                             const int nr, const T* packed_mem, const int M,
+                             const int N, T* ret);
+
+template <>
+void dense_left_inner_kernel<double>(const slice& R_s, ss_matrix<double>& R_ssm,
+                                     const slice& S_s, const int* S_row_idxs,
+                                     const int nr, const double* packed_mem,
+                                     const int M, const int N, double* ret) {
+  __mmask8 k0 = 0b11111111;
+  __mmask8 k1 = 0b11111111;
+  __m256i scatter_idx0, scatter_idx1;
+  if (S_s.continuous) {
+    const int J = S_row_idxs[0];
+    const int write_length = N - J;
+    int shift = write_length >= 8 ? 0 : 8 - write_length;
+    k0 >>= shift;
+    shift = write_length >= 16 ? 0 : 16 - write_length;
+    k1 >>= shift;
+  } else {
+    const int last_write_S =
+        N - S_row_idxs[S_s.len - 1] < 1 ? N - S_row_idxs[S_s.len - 1] : 1;
+    const int write_length = (S_s.len - 1) + last_write_S;
+
+    int scatter_locations[16];
+    for (int i = 0; i < S_s.len; i++) {
+      scatter_locations[i] = S_row_idxs[i];
+    }
+
+    scatter_idx0 = _mm256_loadu_si256((__m256i*)scatter_locations);
+    scatter_idx1 = _mm256_loadu_si256((__m256i*)(scatter_locations + 8));
+    int shift = write_length >= 8 ? 0 : 8 - write_length;
+    k0 >>= shift;
+    shift = write_length >= 16 ? 0 : 16 - write_length;
+    k1 >>= shift;
+  }
+
+  const int J = S_row_idxs[0];
+
+  for (int si = 0; si < R_s.len; si++) {
+    const subrow& sr = R_ssm.sr_csc_mat.vals[R_s.start + si];
+    const int I = R_ssm.sr_csc_mat.row_idxs[R_s.start + si];
+    if (sr.len == 0) {
+      continue;
+    }
+
+    __m512d res0, res1;
+    sparse_dense_inner_kernel_iter(sr, R_ssm.csr_mat, packed_mem, nr, res0,
+                                   res1);
+
+    if (S_s.continuous) {
+      res0 = _mm512_add_pd(res0, _mm512_loadu_pd(&ret[I * N + J]));
+      res1 = _mm512_add_pd(res1, _mm512_loadu_pd(&ret[I * N + J + 8]));
+      _mm512_mask_storeu_pd(&ret[I * N + J], k0, res0);
+      _mm512_mask_storeu_pd(&ret[I * N + J + 8], k1, res1);
+    } else {
+      double* write_location = &ret[I * N];
+      _mm512_mask_i32scatter_pd(
+          write_location, k0, scatter_idx0,
+          _mm512_add_pd(res0, _mm512_mask_i32gather_pd(res0, k0, scatter_idx0,
+                                                       write_location, 8)),
+          8);
+      _mm512_mask_i32scatter_pd(
+          write_location, k1, scatter_idx1,
+          _mm512_add_pd(res1, _mm512_mask_i32gather_pd(res1, k1, scatter_idx1,
+                                                       write_location, 8)),
+          8);
+    }
+  }
+}
+
+template <>
+void dense_left_inner_kernel<float>(const slice& R_s, ss_matrix<float>& R_ssm,
+                                    const slice& S_s, const int* S_row_idxs,
+                                    const int nr, const float* packed_mem,
+                                    const int M, const int N, float* ret) {
+  __mmask16 k0 = 0b1111111111111111;
+  __mmask16 k1 = 0b1111111111111111;
+  __m512i scatter_idx0, scatter_idx1;
+  if (S_s.continuous) {
+    const int J = S_row_idxs[0];
+    const int write_length = N - J;
+    int shift = write_length >= 16 ? 0 : 16 - write_length;
+    k0 >>= shift;
+    shift = write_length >= 32 ? 0 : 32 - write_length;
+    k1 >>= shift;
+  } else {
+    const int last_write_S =
+        N - S_row_idxs[S_s.len - 1] < 1 ? N - S_row_idxs[S_s.len - 1] : 1;
+    const int write_length = (S_s.len - 1) + last_write_S;
+
+    int scatter_locations[32];
+    for (int i = 0; i < S_s.len; i++) {
+      scatter_locations[i] = S_row_idxs[i];
+    }
+
+    scatter_idx0 = _mm512_loadu_si512((__m512i*)scatter_locations);
+    scatter_idx1 = _mm512_loadu_si512((__m512i*)(scatter_locations + 16));
+    int shift = write_length >= 16 ? 0 : 16 - write_length;
+    k0 >>= shift;
+    shift = write_length >= 32 ? 0 : 32 - write_length;
+    k1 >>= shift;
+  }
+
+  const int J = S_row_idxs[0];
+
+  for (int si = 0; si < R_s.len; si++) {
+    const subrow& sr = R_ssm.sr_csc_mat.vals[R_s.start + si];
+    const int I = R_ssm.sr_csc_mat.row_idxs[R_s.start + si];
+    if (sr.len == 0) {
+      continue;
+    }
+
+    __m512 res0, res1;
+    sparse_dense_inner_kernel_iter(sr, R_ssm.csr_mat, packed_mem, nr, res0,
+                                   res1);
+
+    if (S_s.continuous) {
+      res0 = _mm512_add_ps(res0, _mm512_loadu_ps(&ret[I * N + J]));
+      res1 = _mm512_add_ps(res1, _mm512_loadu_ps(&ret[I * N + J + 16]));
+      _mm512_mask_storeu_ps(&ret[I * N + J], k0, res0);
+      _mm512_mask_storeu_ps(&ret[I * N + J + 16], k1, res1);
+    } else {
+      float* write_location = &ret[I * N];
+      _mm512_mask_i32scatter_ps(
+          write_location, k0, scatter_idx0,
+          _mm512_add_ps(res0, _mm512_mask_i32gather_ps(res0, k0, scatter_idx0,
+                                                       write_location, 4)),
+          4);
+      _mm512_mask_i32scatter_ps(
+          write_location, k1, scatter_idx1,
+          _mm512_add_ps(res1, _mm512_mask_i32gather_ps(res1, k1, scatter_idx1,
+                                                       write_location, 4)),
+          4);
+    }
+  }
+}
+
+template <typename T>
+void dense_right_inner_kernel(const slice& S_s, ss_matrix<T>& S_ssm,
+                              const slice& R_s, const int* R_row_idxs,
+                              const int mr, const T* packed_mem, const int M,
+                              const int N, T* ret, __m512i gather_idx_512);
+
+template <>
+void dense_right_inner_kernel<double>(const slice& S_s,
+                                      ss_matrix<double>& S_ssm,
+                                      const slice& R_s, const int* R_row_idxs,
+                                      const int mr, const double* packed_mem,
+                                      const int M, const int N, double* ret,
+                                      __m512i gather_idx_512) {
+  __mmask8 k0 = 0b11111111;
+  __mmask8 k1 = 0b1111;
+  __m256i scatter_idx0, scatter_idx1;
+  if (R_s.continuous) {
+    const int I = R_row_idxs[0];
+    int shift = I + 8 <= M ? 0 : 8 - (M - I);
+    k0 >>= shift;
+    shift = I + 12 <= M ? 0 : 12 - (M - I);
+    k1 >>= shift;
+  } else {
+    const int last_write_R =
+        M - R_row_idxs[R_s.len - 1] < 1 ? M - R_row_idxs[R_s.len - 1] : 1;
+    const int write_height = (R_s.len - 1) + last_write_R;
+
+    int scatter_locations[16];
+    for (int i = 0; i < R_s.len; i++) {
+      scatter_locations[i] = R_row_idxs[i] * N;
+    }
+
+    scatter_idx0 = _mm256_loadu_si256((__m256i*)scatter_locations);
+    scatter_idx1 = _mm256_loadu_si256((__m256i*)(scatter_locations + 8));
+    int shift = write_height >= 8 ? 0 : 8 - write_height;
+    k0 >>= shift;
+    shift = write_height >= 12 ? 0 : 12 - write_height;
+    k1 >>= shift;
+  }
+
+  const int I = R_row_idxs[0];
+
+  __m256i gather_idx = _mm512_castsi512_si256(gather_idx_512);
+
+  for (int si = 0; si < S_s.len; si++) {
+    const subrow& sr = S_ssm.sr_csc_mat.vals[S_s.start + si];
+    const int J = S_ssm.sr_csc_mat.row_idxs[S_s.start + si];
+    if (sr.len == 0) {
+      continue;
+    }
+
+    __m512d res0, res1;
+    sparse_dense_inner_kernel_iter(sr, S_ssm.csr_mat, packed_mem, mr, res0,
+                                   res1);
+
+    if (R_s.continuous) {
+      res0 = _mm512_add_pd(res0, _mm512_mask_i32gather_pd(res0, k0, gather_idx,
+                                                          &ret[I * N + J], 8));
+      res1 = _mm512_add_pd(res1,
+                           _mm512_mask_i32gather_pd(res1, k1, gather_idx,
+                                                    &ret[(I + 8) * N + J], 8));
+      _mm512_mask_i32scatter_pd(&ret[I * N + J], k0, gather_idx, res0, 8);
+      _mm512_mask_i32scatter_pd(&ret[(I + 8) * N + J], k1, gather_idx, res1, 8);
+    } else {
+      double* write_location = &ret[J];
+      _mm512_mask_i32scatter_pd(
+          write_location, k0, scatter_idx0,
+          _mm512_add_pd(res0, _mm512_mask_i32gather_pd(res0, k0, scatter_idx0,
+                                                       write_location, 8)),
+          8);
+      _mm512_mask_i32scatter_pd(
+          write_location, k1, scatter_idx1,
+          _mm512_add_pd(res1, _mm512_mask_i32gather_pd(res1, k1, scatter_idx1,
+                                                       write_location, 8)),
+          8);
+    }
+  }
+}
+
+template <>
+void dense_right_inner_kernel<float>(const slice& S_s, ss_matrix<float>& S_ssm,
+                                     const slice& R_s, const int* R_row_idxs,
+                                     const int mr, const float* packed_mem,
+                                     const int M, const int N, float* ret,
+                                     __m512i gather_idx) {
+  __mmask16 k0 = 0b111111111111;
+  __m512i scatter_idx0;
+  if (R_s.continuous) {
+    const int I = R_row_idxs[0];
+    int shift = I + 12 <= M ? 0 : 12 - (M - I);
+    k0 >>= shift;
+  } else {
+    const int last_write_R =
+        M - R_row_idxs[R_s.len - 1] < 1 ? M - R_row_idxs[R_s.len - 1] : 1;
+    const int write_height = (R_s.len - 1) + last_write_R;
+
+    int scatter_locations[12];
+    for (int i = 0; i < R_s.len; i++) {
+      scatter_locations[i] = R_row_idxs[i] * N;
+    }
+
+    scatter_idx0 = _mm512_loadu_si512((__m512i*)scatter_locations);
+    int shift = write_height >= 12 ? 0 : 12 - write_height;
+    k0 >>= shift;
+  }
+
+  const int I = R_row_idxs[0];
+
+  for (int si = 0; si < S_s.len; si++) {
+    const subrow& sr = S_ssm.sr_csc_mat.vals[S_s.start + si];
+    const int J = S_ssm.sr_csc_mat.row_idxs[S_s.start + si];
+    if (sr.len == 0) {
+      continue;
+    }
+
+    __m512 res0, res1;
+    sparse_dense_inner_kernel_iter(sr, S_ssm.csr_mat, packed_mem, mr, res0,
+                                   res1);
+
+    if (R_s.continuous) {
+      res0 = _mm512_add_ps(res0, _mm512_mask_i32gather_ps(res0, k0, gather_idx,
+                                                          &ret[I * N + J], 4));
+      _mm512_mask_i32scatter_ps(&ret[I * N + J], k0, gather_idx, res0, 4);
+    } else {
+      float* write_location = &ret[J];
+      _mm512_mask_i32scatter_ps(
+          write_location, k0, scatter_idx0,
+          _mm512_add_ps(res0, _mm512_mask_i32gather_ps(res0, k0, scatter_idx0,
+                                                       write_location, 4)),
+          4);
+    }
+  }
+}
+
+  template void dense_dense_matmul_task_shared<float>(
+    const int slice_col, const int R_slice_start, const int R_slice_start_task,
+    const int R_slice_end, const int S_slice_start, const int S_slice_end,
+    float* R_packed_mem, BIT_DTYPE* R_bm, float* S_packed_mem,
+    BIT_DTYPE* S_bm, ss_matrix<float>& R_ssm, ss_matrix<float>& S_ssm,
+    float* ret, bool sparse_result);
+  template void dense_dense_matmul_task_shared<double>(
+    const int slice_col, const int R_slice_start, const int R_slice_start_task,
+    const int R_slice_end, const int S_slice_start, const int S_slice_end,
+    double* R_packed_mem, BIT_DTYPE* R_bm, double* S_packed_mem,
+    BIT_DTYPE* S_bm, ss_matrix<double>& R_ssm, ss_matrix<double>& S_ssm,
+    double* ret, bool sparse_result);
+
+  template void pack_slice_new<float>(const slice& s, ss_matrix<float>& ssm,
+                    const int join_idx, const int sl,
+                    const int ik, float* packed_mem_original,
+                    BIT_DTYPE* bm_original);
+  template void pack_slice_new<double>(const slice& s, ss_matrix<double>& ssm,
+                     const int join_idx, const int sl,
+                     const int ik,
+                     double* packed_mem_original,
+                     BIT_DTYPE* bm_original);
+
+  template void dense_dense_matmul<float>(
+    ss_matrix<float>& R_ssm, ss_matrix<float>& S_ssm, const int tile_size_l2,
+    const int tile_size_l3, float* ret, bool sparse_result,
+    const int threads);
+  template void dense_dense_matmul<double>(
+    ss_matrix<double>& R_ssm, ss_matrix<double>& S_ssm,
+    const int tile_size_l2, const int tile_size_l3, double* ret,
+    bool sparse_result, const int threads);
