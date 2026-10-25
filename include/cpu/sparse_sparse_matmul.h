@@ -7,49 +7,53 @@
 
 #include "ss_mat.h"
 
-void sparse_sparse_mm_count_results(const int start, const int end,
-                                    const int* Rj, const int* Sa, const int* Sj,
-                                    const int* Sj_1, const int write_val,
-                                    const __m512i& write_val_reg, int* scratch,
-                                    int* result_cnt);
+void sparse_sparse_mm_count_results(
+    const int start, const int end, const int *Rj, const int *Sa, const int *Sj,
+    const int *Sj_1, const int write_val, const __m512i &write_val_reg,
+    int *scratch, int *result_cnt
+);
 
 template <typename T>
-void sparse_sparse_mm_calculate_results(const int start, const int end,
-                                        const int* Rj, const double* Rv,
-                                        const int* Sa, const int* Sj,
-                                        const int* Sj_1, const T* Sv,
-                                        int* scratch, int* row_result_cnt,
-                                        const int offset, csr<T>& result_csr);
+void sparse_sparse_mm_calculate_results(
+    const int start, const int end, const int *Rj, const double *Rv,
+    const int *Sa, const int *Sj, const int *Sj_1, const T *Sv, int *scratch,
+    int *row_result_cnt, const int offset, csr<T> &result_csr
+);
 
 template <typename T>
-void csr_csr_matmul_kernel(const int start, const int end, const int* Rj,
-                           const T* Rv, const int* Sa, const int* Sj,
-                           const int* Sj_1, const T* Sv, T* ret);
+void csr_csr_matmul_kernel(
+    const int start, const int end, const int *Rj, const T *Rv, const int *Sa,
+    const int *Sj, const int *Sj_1, const T *Sv, T *ret
+);
 
-void csr_csr_matmul_kernel(const int start, const int end, const int* Rj,
-                           const double* Rv, const int* Sa, const int* Sj,
-                           const int* Sj_1, const double* Sv, double* ret);
-
-template <typename T>
-void spgemm_rows_dense_result(ss_matrix<T>& R_ssm, int* R_subrow_buckets,
-                              int* s_agg_idxs, T* s_vals, int* sj_buckets,
-                              const int N, T* ret, int threads);
+void csr_csr_matmul_kernel(
+    const int start, const int end, const int *Rj, const double *Rv,
+    const int *Sa, const int *Sj, const int *Sj_1, const double *Sv, double *ret
+);
 
 template <typename T>
-void transpose_s_matrix_vanilla(const int thread_idx, const int threads,
-                                ss_matrix<T>& S_ssm,
-                                std::unique_ptr<int[]>& s_col_idxs_ref,
-                                std::unique_ptr<int[]>& s_agg_idxs_ref,
-                                std::unique_ptr<T[]>& s_vals_ref);
+void spgemm_rows_dense_result(
+    ss_matrix<T> &R_ssm, int *R_subrow_buckets, int *s_agg_idxs, T *s_vals,
+    int *sj_buckets, const int N, T *ret, int threads
+);
 
 template <typename T>
-void spgemm_rows_dense_result_vanilla(const int N, ss_matrix<T>& R_ssm,
-                                      int* s_col_idxs, int* s_agg_idxs,
-                                      T* s_vals, T* ret, int threads);
+void transpose_s_matrix_vanilla(
+    const int thread_idx, const int threads, ss_matrix<T> &S_ssm,
+    std::unique_ptr<int[]> &s_col_idxs_ref,
+    std::unique_ptr<int[]> &s_agg_idxs_ref, std::unique_ptr<T[]> &s_vals_ref
+);
 
 template <typename T>
-void sparse_sparse_matmul(ss_matrix<T>& R_ssm, ss_matrix<T>& S_ssm, T* ret,
-                          bool sparse_output, const int threads,
-                          const bool all_sparse = false);
+void spgemm_rows_dense_result_vanilla(
+    const int N, ss_matrix<T> &R_ssm, int *s_col_idxs, int *s_agg_idxs,
+    T *s_vals, T *ret, int threads
+);
+
+template <typename T>
+void sparse_sparse_matmul(
+    ss_matrix<T> &R_ssm, ss_matrix<T> &S_ssm, T *ret, bool sparse_output,
+    const int threads, const bool all_sparse = false
+);
 
 #endif

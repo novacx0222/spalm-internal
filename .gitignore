@@ -5,3 +5,22 @@
 decision_thresholds.txt
 OpenBLAS-0.3.30*
 example/bin/
+
+# Build output
+bin/
+
+# Editors and tooling
+.idea/
+.vscode/
+cmake-build-*/
+.cache/
+compile_commands.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS
+.DS_Store

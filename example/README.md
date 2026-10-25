@@ -1,6 +1,7 @@
 # spalm example
 
 Demonstrates sparse matrix multiplication using `spalm.so` on two 8000×8000 matrices:
+
 - **A**: diagonal band pattern (band width = 99)
 - **B**: edges pattern (border width = 200)
 

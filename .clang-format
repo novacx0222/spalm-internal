@@ -1,0 +1,40 @@
+# Requires clang-format >= 14 (AlignAfterOpenBracket: BlockIndent).
+# Tested with clang-format 23.1.4.
+#
+# Base: LLVM, clang-format's reference style. Overrides below keep the
+# 4-space / `T *p` / `(float) x` style and put a closing bracket on its own
+# line when a declaration or call does not fit:
+#
+#   bool init_decision_thresholds(
+#       const char *thres_exec_method, const int type, const char *platform
+#   );
+---
+Language: Cpp
+BasedOnStyle: LLVM
+
+IndentWidth: 4
+ContinuationIndentWidth: 4
+AccessModifierOffset: -4
+UseTab: Never
+ColumnLimit: 80
+
+# Break after "(" and put ")" on its own line; keep parameters packed.
+AlignAfterOpenBracket: BlockIndent
+BinPackParameters: true
+BinPackArguments: true
+AllowAllParametersOfDeclarationOnNextLine: true
+AllowAllArgumentsOnNextLine: true
+
+PointerAlignment: Right
+DerivePointerAlignment: false
+SpaceAfterCStyleCast: true
+
+# Keep existing one-line guards and loops, e.g. `if (n == 0) return 0;`.
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+
+# Do not reorder includes or rewrap comments: formatting only.
+SortIncludes: Never
+IncludeBlocks: Preserve
+ReflowComments: false
+...

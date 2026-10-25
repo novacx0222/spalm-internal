@@ -52,7 +52,7 @@ def generate_uniform_csr(rows, cols, density, dtype=np.float32, seed=None):
     density = min(density, 1.0)
     rng = np.random.default_rng(seed)
     mat = sparse_random(rows, cols, density=density, format="csr",
-                        dtype=dtype, random_state=rng.integers(2**31))
+                        dtype=dtype, random_state=rng.integers(2 ** 31))
     if mat.nnz > 0:
         mat.data[:] = rng.standard_normal(mat.nnz).astype(dtype)
         mat.data[mat.data == 0] = dtype(1e-6)
@@ -76,7 +76,7 @@ def _make_kv_params(d):
 
 
 def call_spalm(lib, A_csr, B_csr, C, init_method, dtype, slice_length,
-                threads=4):
+               threads=4):
     """Call spalm with a given init_method, return captured stdout."""
     M, K = A_csr.shape
     N, _ = B_csr.shape
@@ -86,9 +86,9 @@ def call_spalm(lib, A_csr, B_csr, C, init_method, dtype, slice_length,
 
     func = lib.spalm
     params = {
-        "init_method":  init_method,
+        "init_method": init_method,
         "slice_length": slice_length,
-        "threads":      threads,
+        "threads": threads,
     }
     n, keys_arr, vals_arr = _make_kv_params(params)
 
@@ -188,6 +188,8 @@ def interpolate_thresholds(sampled, num_buckets):
                 val = sampled[lo] * (1 - frac) + sampled[hi] * frac
                 arr[b] = int(round(val))
     return [max(0, min(255, v)) for v in arr]
+
+
 def early_stop_boundary(comparisons, count):
     """Return the first bucket where *a* loses for `count` consecutive entries.
 
@@ -293,7 +295,7 @@ def main():
 
     def call_fn(*, A_csr, B_csr, C, init_method):
         return call_spalm(lib, A_csr, B_csr, C, init_method,
-                           dtype, BK, threads=args.threads)
+                          dtype, BK, threads=args.threads)
 
     print(f"Config: {M}x{K} matrices, platform={platform}, BK={BK}, "
           f"{args.dtype}")
@@ -315,7 +317,7 @@ def main():
     matrices = {}
     for i, b in enumerate(buckets):
         density = bucket_to_density(b)
-        print(f"  [{i+1}/{n}] bucket {b:3d}: density={density*100:.4f}% ...", end="", flush=True)
+        print(f"  [{i + 1}/{n}] bucket {b:3d}: density={density * 100:.4f}% ...", end="", flush=True)
         mat = generate_uniform_csr(M, K, density, dtype=dtype, seed=b + 42)
         matrices[b] = mat
         print(f"  nnz={mat.nnz}")
@@ -496,7 +498,7 @@ def main():
             comparisons.append((rb, ri_t <= best_non_ri))
         boundary = early_stop_boundary(comparisons, es)
         ri_sampled[lb] = boundary if boundary is not None else (
-            num_buckets + 1)
+                num_buckets + 1)
 
     ri_upper = interpolate_thresholds(ri_sampled, num_buckets)
 
@@ -507,7 +509,7 @@ def main():
         comparisons.append((lb, li_t <= dd_time))
     boundary = early_stop_boundary(comparisons, es)
     left_dense_threshold = boundary if boundary is not None else (
-        num_buckets + 1)
+            num_buckets + 1)
     print(f"  left_dense_threshold = {left_dense_threshold}")
 
     # -- Save decision_thresholds.txt ------------------------------------------
@@ -545,7 +547,7 @@ def main():
         tick_buckets = list(range(0, num_buckets + 1, tick_step))
         if tick_buckets[-1] != num_buckets:
             tick_buckets.append(num_buckets)
-        tick_labels = [f"{bucket_to_density(b)*100:.1f}" for b in tick_buckets]
+        tick_labels = [f"{bucket_to_density(b) * 100:.1f}" for b in tick_buckets]
 
         def apply_density_ticks(ax):
             ax.set_xticks(tick_buckets)

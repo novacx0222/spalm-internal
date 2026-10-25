@@ -6,86 +6,110 @@
 #include "mkl.h"
 #include "util.h"
 
+extern "C" void run_baseline(
+    int type, const char *baseline_name, int *Ri, int *Rj, void *Rv, void *R,
+    int *Si, int *Sj, void *Sv, void *S, void *ret, const int M, const int K,
+    const int N, const int threads
+) {
+    std::cout << baseline_name << std::endl;
+    std::cout << M << " " << K << " " << N << std::endl;
+    std::cout << "THREADS: " << threads << std::endl;
 
-extern "C" void run_baseline(int type, const char* baseline_name, int* Ri,
-                             int* Rj, void* Rv, void* R, int* Si, int* Sj,
-                             void* Sv, void* S, void* ret, const int M,
-                             const int K, const int N, const int threads) {
-  std::cout << baseline_name << std::endl;
-  std::cout << M << " " << K << " " << N << std::endl;
-  std::cout << "THREADS: " << threads << std::endl;
+    mkl_set_num_threads(threads);
 
-  mkl_set_num_threads(threads);
+    std::chrono::time_point<std::chrono::high_resolution_clock> total_start,
+        start, end, e2e_start;
+    e2e_start = std::chrono::high_resolution_clock::now();
 
-  std::chrono::time_point<std::chrono::high_resolution_clock> total_start,
-      start, end, e2e_start;
-  e2e_start = std::chrono::high_resolution_clock::now();
+    std::string baseline_name_str = baseline_name;
 
-  std::string baseline_name_str = baseline_name;
+    if (baseline_name_str == "MKL sparse-sparse") {
+        sparse_matrix_t R_csr;
+        sparse_matrix_t S_csr;
+        if (type == 1) {
+            mkl_sparse_d_create_csr(
+                &R_csr, SPARSE_INDEX_BASE_ZERO, M, K, Ri, Ri + 1, Rj,
+                (double *) Rv
+            );
+            mkl_sparse_d_create_csr(
+                &S_csr, SPARSE_INDEX_BASE_ZERO, N, K, Si, Si + 1, Sj,
+                (double *) Sv
+            );
+        } else if (type == 0) {
+            mkl_sparse_s_create_csr(
+                &R_csr, SPARSE_INDEX_BASE_ZERO, M, K, Ri, Ri + 1, Rj,
+                (float *) Rv
+            );
+            mkl_sparse_s_create_csr(
+                &S_csr, SPARSE_INDEX_BASE_ZERO, N, K, Si, Si + 1, Sj,
+                (float *) Sv
+            );
+        }
 
-  if (baseline_name_str == "MKL sparse-sparse") {
-    sparse_matrix_t R_csr;
-    sparse_matrix_t S_csr;
-    if (type == 1) {
-      mkl_sparse_d_create_csr(&R_csr, SPARSE_INDEX_BASE_ZERO, M, K, Ri, Ri + 1,
-                              Rj, (double*)Rv);
-      mkl_sparse_d_create_csr(&S_csr, SPARSE_INDEX_BASE_ZERO, N, K, Si, Si + 1,
-                              Sj, (double*)Sv);
-    } else if (type == 0) {
-      mkl_sparse_s_create_csr(&R_csr, SPARSE_INDEX_BASE_ZERO, M, K, Ri, Ri + 1,
-                              Rj, (float*)Rv);
-      mkl_sparse_s_create_csr(&S_csr, SPARSE_INDEX_BASE_ZERO, N, K, Si, Si + 1,
-                              Sj, (float*)Sv);
-    }
+        sparse_matrix_t S_T_csr;
+        auto total_start = std::chrono::high_resolution_clock::now();
+        mkl_sparse_convert_csr(S_csr, SPARSE_OPERATION_TRANSPOSE, &S_T_csr);
+        end = std::chrono::high_resolution_clock::now();
+        print_time("CSR transpose: ", end - total_start);
 
-    sparse_matrix_t S_T_csr;
-    auto total_start = std::chrono::high_resolution_clock::now();
-    mkl_sparse_convert_csr(S_csr, SPARSE_OPERATION_TRANSPOSE, &S_T_csr);
-    end = std::chrono::high_resolution_clock::now();
-    print_time("CSR transpose: ", end - total_start);
+        start = std::chrono::high_resolution_clock::now();
+        if (type == 1) {
+            mkl_sparse_d_spmmd(
+                SPARSE_OPERATION_NON_TRANSPOSE, R_csr, S_T_csr,
+                SPARSE_LAYOUT_ROW_MAJOR, (double *) ret, N
+            );
+        } else if (type == 0) {
+            mkl_sparse_s_spmmd(
+                SPARSE_OPERATION_NON_TRANSPOSE, R_csr, S_T_csr,
+                SPARSE_LAYOUT_ROW_MAJOR, (float *) ret, N
+            );
+        }
+        end = std::chrono::high_resolution_clock::now();
+        print_time("Sparse MM time: ", end - start);
+        print_time("Total Sparse MM: ", end - total_start);
 
-    start = std::chrono::high_resolution_clock::now();
-    if (type == 1) {
-      mkl_sparse_d_spmmd(SPARSE_OPERATION_NON_TRANSPOSE, R_csr, S_T_csr,
-                         SPARSE_LAYOUT_ROW_MAJOR, (double*)ret, N);
-    } else if (type == 0) {
-      mkl_sparse_s_spmmd(SPARSE_OPERATION_NON_TRANSPOSE, R_csr, S_T_csr,
-                         SPARSE_LAYOUT_ROW_MAJOR, (float*)ret, N);
-    }
-    end = std::chrono::high_resolution_clock::now();
-    print_time("Sparse MM time: ", end - start);
-    print_time("Total Sparse MM: ", end - total_start);
+        mkl_sparse_destroy(R_csr);
+        mkl_sparse_destroy(S_csr);
+        mkl_sparse_destroy(S_T_csr);
+    } else if (baseline_name_str == "MKL block sparse-sparse") {
+        const int block_size = 8;
+        sparse_matrix_t R_csr;
+        sparse_matrix_t S_csr;
+        if (type == 1) {
+            mkl_sparse_d_create_csr(
+                &R_csr, SPARSE_INDEX_BASE_ZERO, M, K, Ri, Ri + 1, Rj,
+                (double *) Rv
+            );
+            mkl_sparse_d_create_csr(
+                &S_csr, SPARSE_INDEX_BASE_ZERO, N, K, Si, Si + 1, Sj,
+                (double *) Sv
+            );
+        } else if (type == 0) {
+            mkl_sparse_s_create_csr(
+                &R_csr, SPARSE_INDEX_BASE_ZERO, M, K, Ri, Ri + 1, Rj,
+                (float *) Rv
+            );
+            mkl_sparse_s_create_csr(
+                &S_csr, SPARSE_INDEX_BASE_ZERO, N, K, Si, Si + 1, Sj,
+                (float *) Sv
+            );
+        }
 
-    mkl_sparse_destroy(R_csr);
-    mkl_sparse_destroy(S_csr);
-    mkl_sparse_destroy(S_T_csr);
-  } else if (baseline_name_str == "MKL block sparse-sparse") {
-    const int block_size = 8;
-    sparse_matrix_t R_csr;
-    sparse_matrix_t S_csr;
-    if (type == 1) {
-      mkl_sparse_d_create_csr(&R_csr, SPARSE_INDEX_BASE_ZERO, M, K, Ri, Ri + 1,
-                              Rj, (double*)Rv);
-      mkl_sparse_d_create_csr(&S_csr, SPARSE_INDEX_BASE_ZERO, N, K, Si, Si + 1,
-                              Sj, (double*)Sv);
-    } else if (type == 0) {
-      mkl_sparse_s_create_csr(&R_csr, SPARSE_INDEX_BASE_ZERO, M, K, Ri, Ri + 1,
-                              Rj, (float*)Rv);
-      mkl_sparse_s_create_csr(&S_csr, SPARSE_INDEX_BASE_ZERO, N, K, Si, Si + 1,
-                              Sj, (float*)Sv);
-    }
+        sparse_matrix_t R_bsr;
+        sparse_matrix_t S_T_bsr;
+        auto total_start = std::chrono::high_resolution_clock::now();
+        mkl_sparse_convert_bsr(
+            R_csr, block_size, SPARSE_LAYOUT_ROW_MAJOR,
+            SPARSE_OPERATION_NON_TRANSPOSE, &R_bsr
+        );
+        mkl_sparse_convert_bsr(
+            S_csr, block_size, SPARSE_LAYOUT_ROW_MAJOR,
+            SPARSE_OPERATION_TRANSPOSE, &S_T_bsr
+        );
+        end = std::chrono::high_resolution_clock::now();
+        print_time("BSR creation: ", end - total_start);
 
-    sparse_matrix_t R_bsr;
-    sparse_matrix_t S_T_bsr;
-    auto total_start = std::chrono::high_resolution_clock::now();
-    mkl_sparse_convert_bsr(R_csr, block_size, SPARSE_LAYOUT_ROW_MAJOR,
-                           SPARSE_OPERATION_NON_TRANSPOSE, &R_bsr);
-    mkl_sparse_convert_bsr(S_csr, block_size, SPARSE_LAYOUT_ROW_MAJOR,
-                           SPARSE_OPERATION_TRANSPOSE, &S_T_bsr);
-    end = std::chrono::high_resolution_clock::now();
-    print_time("BSR creation: ", end - total_start);
-
-    /*
+        /*
     sparse_matrix_t S_T_bsr;
     start = std::chrono::high_resolution_clock::now();
     mkl_sparse_convert_bsr(S_bsr, block_size, SPARSE_LAYOUT_COLUMN_MAJOR,
@@ -94,30 +118,34 @@ extern "C" void run_baseline(int type, const char* baseline_name, int* Ri,
     - start);
     */
 
-    start = std::chrono::high_resolution_clock::now();
-    if (type == 1) {
-      mkl_sparse_d_spmmd(SPARSE_OPERATION_NON_TRANSPOSE, R_bsr, S_T_bsr,
-                         SPARSE_LAYOUT_ROW_MAJOR, (double*)ret, N);
-      /*
+        start = std::chrono::high_resolution_clock::now();
+        if (type == 1) {
+            mkl_sparse_d_spmmd(
+                SPARSE_OPERATION_NON_TRANSPOSE, R_bsr, S_T_bsr,
+                SPARSE_LAYOUT_ROW_MAJOR, (double *) ret, N
+            );
+            /*
       mkl_sparse_d_spmmd(SPARSE_OPERATION_NON_TRANSPOSE, R_csr, S_csr,
                          SPARSE_LAYOUT_ROW_MAJOR, (double*)ret, N);
       */
-    } else if (type == 0) {
-      mkl_sparse_s_spmmd(SPARSE_OPERATION_NON_TRANSPOSE, R_bsr, S_T_bsr,
-                         SPARSE_LAYOUT_ROW_MAJOR, (float*)ret, N);
-    }
-    end = std::chrono::high_resolution_clock::now();
-    print_time("Sparse MM time: ", end - start);
-    print_time("Total Sparse MM: ", end - total_start);
+        } else if (type == 0) {
+            mkl_sparse_s_spmmd(
+                SPARSE_OPERATION_NON_TRANSPOSE, R_bsr, S_T_bsr,
+                SPARSE_LAYOUT_ROW_MAJOR, (float *) ret, N
+            );
+        }
+        end = std::chrono::high_resolution_clock::now();
+        print_time("Sparse MM time: ", end - start);
+        print_time("Total Sparse MM: ", end - total_start);
 
-    mkl_sparse_destroy(R_csr);
-    mkl_sparse_destroy(S_csr);
-    mkl_sparse_destroy(R_bsr);
-    mkl_sparse_destroy(S_T_bsr);
-  } else if (baseline_name_str == "MKL sparse-dense") {
-    if (type == 1) {
-      start = std::chrono::high_resolution_clock::now();
-      /*
+        mkl_sparse_destroy(R_csr);
+        mkl_sparse_destroy(S_csr);
+        mkl_sparse_destroy(R_bsr);
+        mkl_sparse_destroy(S_T_bsr);
+    } else if (baseline_name_str == "MKL sparse-dense") {
+        if (type == 1) {
+            start = std::chrono::high_resolution_clock::now();
+            /*
       double* S_T = new double[K * N];
       for (int i = 0; i < K; i++) {
         for (int j = 0; j < N; j++) {
@@ -128,24 +156,28 @@ extern "C" void run_baseline(int type, const char* baseline_name, int* Ri,
       print_time("S transpose: ", end - start);
       */
 
-      sparse_matrix_t R_csr;
-      mkl_sparse_d_create_csr(&R_csr, SPARSE_INDEX_BASE_ZERO, M, K, Ri, Ri + 1,
-                              Rj, (double*)Rv);
+            sparse_matrix_t R_csr;
+            mkl_sparse_d_create_csr(
+                &R_csr, SPARSE_INDEX_BASE_ZERO, M, K, Ri, Ri + 1, Rj,
+                (double *) Rv
+            );
 
-      struct matrix_descr R_descr;
-      R_descr.type = SPARSE_MATRIX_TYPE_GENERAL;
+            struct matrix_descr R_descr;
+            R_descr.type = SPARSE_MATRIX_TYPE_GENERAL;
 
-      start = std::chrono::high_resolution_clock::now();
-      mkl_sparse_d_mm(SPARSE_OPERATION_NON_TRANSPOSE, 1, R_csr, R_descr,
-                      SPARSE_LAYOUT_ROW_MAJOR, (double*)S, N, N, 1,
-                      (double*)ret, N);
-      end = std::chrono::high_resolution_clock::now();
-      print_time("Sparse-Dense MM time: ", end - start);
+            start = std::chrono::high_resolution_clock::now();
+            mkl_sparse_d_mm(
+                SPARSE_OPERATION_NON_TRANSPOSE, 1, R_csr, R_descr,
+                SPARSE_LAYOUT_ROW_MAJOR, (double *) S, N, N, 1, (double *) ret,
+                N
+            );
+            end = std::chrono::high_resolution_clock::now();
+            print_time("Sparse-Dense MM time: ", end - start);
 
-      // delete[] S_T;
-    } else if (type == 0) {
-      start = std::chrono::high_resolution_clock::now();
-      /*
+            // delete[] S_T;
+        } else if (type == 0) {
+            start = std::chrono::high_resolution_clock::now();
+            /*
       double* S_T = new double[K * N];
       for (int i = 0; i < K; i++) {
         for (int j = 0; j < N; j++) {
@@ -156,74 +188,93 @@ extern "C" void run_baseline(int type, const char* baseline_name, int* Ri,
       print_time("S transpose: ", end - start);
       */
 
-      sparse_matrix_t R_csr;
-      mkl_sparse_s_create_csr(&R_csr, SPARSE_INDEX_BASE_ZERO, M, K, Ri, Ri + 1,
-                              Rj, (float*)Rv);
+            sparse_matrix_t R_csr;
+            mkl_sparse_s_create_csr(
+                &R_csr, SPARSE_INDEX_BASE_ZERO, M, K, Ri, Ri + 1, Rj,
+                (float *) Rv
+            );
 
-      struct matrix_descr R_descr;
-      R_descr.type = SPARSE_MATRIX_TYPE_GENERAL;
+            struct matrix_descr R_descr;
+            R_descr.type = SPARSE_MATRIX_TYPE_GENERAL;
 
-      start = std::chrono::high_resolution_clock::now();
-      mkl_sparse_s_mm(SPARSE_OPERATION_NON_TRANSPOSE, 1, R_csr, R_descr,
-                      SPARSE_LAYOUT_ROW_MAJOR, (float*)S, N, N, 1, (float*)ret,
-                      N);
-      end = std::chrono::high_resolution_clock::now();
-      print_time("Sparse-Dense MM time: ", end - start);
+            start = std::chrono::high_resolution_clock::now();
+            mkl_sparse_s_mm(
+                SPARSE_OPERATION_NON_TRANSPOSE, 1, R_csr, R_descr,
+                SPARSE_LAYOUT_ROW_MAJOR, (float *) S, N, N, 1, (float *) ret, N
+            );
+            end = std::chrono::high_resolution_clock::now();
+            print_time("Sparse-Dense MM time: ", end - start);
 
-      // delete[] S_T;
+            // delete[] S_T;
+        }
+    } else if (baseline_name_str == "OpenBLAS") {
+        void *handle = dlopen(
+            resolve_path_near_lib(
+                reinterpret_cast<void *>(&run_baseline),
+                "../OpenBLAS-0.3.30/libopenblas.so",
+                "OpenBLAS-0.3.30/libopenblas.so"
+            )
+                .c_str(),
+            RTLD_LAZY
+        );
+        void (*cblas_dgemm_openblas)(
+            int, int, int, int, int, int, double, double *, int, double *, int,
+            double, double *, int
+        ) =
+            (void (*)(
+                int, int, int, int, int, int, double, double *, int, double *,
+                int, double, double *, int
+            )) dlsym(handle, "cblas_dgemm");
+        void (*cblas_sgemm_openblas)(
+            int, int, int, int, int, int, float, float *, int, float *, int,
+            float, float *, int
+        ) =
+            (void (*)(
+                int, int, int, int, int, int, float, float *, int, float *, int,
+                float, float *, int
+            )) dlsym(handle, "cblas_sgemm");
+
+        void (*openblas_set_threads)(int) =
+            (void (*)(int)) dlsym(handle, "openblas_set_num_threads");
+        openblas_set_threads(threads);
+
+        start = std::chrono::high_resolution_clock::now();
+        if (type == 0) {
+            cblas_sgemm_openblas(
+                CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0,
+                (float *) R, K, (float *) S, K, 1.0, (float *) ret, N
+            );
+        } else if (type == 1) {
+            cblas_dgemm_openblas(
+                CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0,
+                (double *) R, K, (double *) S, K, 1.0, (double *) ret, N
+            );
+        }
+        end = std::chrono::high_resolution_clock::now();
+        print_time("Dense MM time: ", end - start);
+    } else if (baseline_name_str == "MKL dense-dense") {
+        int mem, buf;
+        mem = mkl_mem_stat(&buf);
+        std::cout << mem << " " << buf << std::endl;
+        start = std::chrono::high_resolution_clock::now();
+        if (type == 0) {
+            cblas_sgemm(
+                CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0,
+                (float *) R, K, (float *) S, K, 1.0, (float *) ret, N
+            );
+        } else {
+            cblas_dgemm(
+                CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0,
+                (double *) R, K, (double *) S, K, 1.0, (double *) ret, N
+            );
+        }
+        end = std::chrono::high_resolution_clock::now();
+        print_time("Dense MM time: ", end - start);
+        mem = mkl_mem_stat(&buf);
+        std::cout << mem << " " << buf << std::endl;
+        mkl_free_buffers();
     }
 
-  } else if (baseline_name_str == "OpenBLAS") {
-    void* handle = dlopen(
-        resolve_path_near_lib(reinterpret_cast<void*>(&run_baseline),
-                              "../OpenBLAS-0.3.30/libopenblas.so",
-                              "OpenBLAS-0.3.30/libopenblas.so")
-            .c_str(),
-        RTLD_LAZY);
-    void (*cblas_dgemm_openblas)(int, int, int, int, int, int, double, double*,
-                                 int, double*, int, double, double*, int) =
-        (void (*)(int, int, int, int, int, int, double, double*, int, double*,
-                  int, double, double*, int))dlsym(handle, "cblas_dgemm");
-    void (*cblas_sgemm_openblas)(int, int, int, int, int, int, float, float*,
-                                 int, float*, int, float, float*, int) =
-        (void (*)(int, int, int, int, int, int, float, float*, int, float*, int,
-                  float, float*, int))dlsym(handle, "cblas_sgemm");
-
-    void (*openblas_set_threads)(int) =
-        (void (*)(int))dlsym(handle, "openblas_set_num_threads");
-    openblas_set_threads(threads);
-
-    start = std::chrono::high_resolution_clock::now();
-    if (type == 0) {
-      cblas_sgemm_openblas(CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K,
-                           1.0, (float*)R, K, (float*)S, K, 1.0, (float*)ret,
-                           N);
-    } else if (type == 1) {
-      cblas_dgemm_openblas(CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K,
-                           1.0, (double*)R, K, (double*)S, K, 1.0, (double*)ret,
-                           N);
-    }
     end = std::chrono::high_resolution_clock::now();
-    print_time("Dense MM time: ", end - start);
-  } else if (baseline_name_str == "MKL dense-dense") {
-    int mem, buf;
-    mem = mkl_mem_stat(&buf);
-    std::cout << mem << " " << buf << std::endl;
-    start = std::chrono::high_resolution_clock::now();
-    if (type == 0) {
-      cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0,
-                  (float*)R, K, (float*)S, K, 1.0, (float*)ret, N);
-    } else {
-      cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0,
-                  (double*)R, K, (double*)S, K, 1.0, (double*)ret, N);
-    }
-    end = std::chrono::high_resolution_clock::now();
-    print_time("Dense MM time: ", end - start);
-    mem = mkl_mem_stat(&buf);
-    std::cout << mem << " " << buf << std::endl;
-    mkl_free_buffers();
-  }
-  
-  end = std::chrono::high_resolution_clock::now();
-  print_time("E2E MM time: ", end - e2e_start);
+    print_time("E2E MM time: ", end - e2e_start);
 }
