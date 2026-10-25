@@ -113,12 +113,13 @@ int main() {
         return 1;
     }
 
-    //   void spalm(int type, int* Ri, int* Rj, void* Rv,
-    //              int* Si, int* Sj, void* Sv,
-    //              int M, int K, int N, bool sparse_result,
-    //              void* ret, int* reti, int* retj, void* retv,
-    //              int n, const char** keys, const char** vals)
-    auto spalm_fn = reinterpret_cast<void (*)(
+    //   int spalm(int type, int* Ri, int* Rj, void* Rv,
+    //             int* Si, int* Sj, void* Sv,
+    //             int M, int K, int N, bool sparse_result,
+    //             void* ret, int* reti, int* retj, void* retv,
+    //             int n, const char** keys, const char** vals)
+    // Returns 0 on success; the result is valid only then.
+    auto spalm_fn = reinterpret_cast<int (*)(
         int, int *, int *, void *, int *, int *, void *, int, int, int, bool,
         void *, int *, int *, void *, int, const char **, const char **
     )>(dlsym(sp_handle, "spalm"));
@@ -153,12 +154,13 @@ int main() {
     const char *keys[] = {"threads"};
     const char *vals[] = {"4"};
 
-    spalm_fn(
+    const int status = spalm_fn(
         /*float*/ 0, A_rp.data(), A_ci.data(), A_v.data(), Bt_rp.data(),
         Bt_ci.data(), Bt_v.data(), M, K, N, false, C.data(), nullptr, nullptr,
         nullptr, 1, keys, vals
     );
+    if (status != 0) std::cerr << "spalm failed with status " << status << "\n";
 
     dlclose(sp_handle);
-    return 0;
+    return status == 0 ? 0 : 1;
 }

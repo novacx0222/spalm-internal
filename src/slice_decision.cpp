@@ -1,5 +1,7 @@
 #include "slice_decision.h"
 
+#include <stdexcept>
+
 #include "path_utils.h"
 
 int num_buckets;
@@ -35,6 +37,9 @@ static void init_arrays(int nb) {
 bool init_decision_thresholds(
     const char *thres_exec_method, const int type, const char *platform
 ) {
+    // Reset before the early-return modes too; otherwise a previous
+    // "no_features" call leaks into a later forced-method call.
+    no_features = false;
     if (strcmp(thres_exec_method, "sparse") == 0) {
         init_arrays(DEFAULT_NUM_BUCKETS);
         std::fill(
@@ -114,6 +119,17 @@ bool init_decision_thresholds(
         return false;
     }
 
+    // find_thresholds.py writes num_buckets first, then num_buckets + 1
+    // values for each array. Reject anything else instead of writing past the
+    // arrays or leaving entries uninitialized. Bucket indices and thresholds
+    // up to num_buckets + 1 are stored as uint8_t, hence the 254 limit.
+    auto parse_error = [&](const char *what) {
+        std::cerr << "Error: invalid decision threshold file " << thres_path
+                  << ": " << what << std::endl;
+        return false;
+    };
+    bool have_num_buckets = false, have_left = false, have_dense = false;
+    int ss_count = -1, ri_count = -1;
     std::string line;
     while (std::getline(inputFile, line)) {
         size_t colon_pos = line.find(':');
@@ -126,25 +142,39 @@ bool init_decision_thresholds(
 
         if (key == "num_buckets") {
             int nb;
-            iss >> nb;
+            if (have_num_buckets || !(iss >> nb) || nb < 1 || nb > 254) {
+                return parse_error("num_buckets must appear once, in [1, 254]");
+            }
             init_arrays(nb);
-        } else if (key == "ss_upper") {
+            have_num_buckets = true;
+        } else if (key == "ss_upper" || key == "ri_upper") {
+            if (!have_num_buckets) {
+                return parse_error("num_buckets must precede the arrays");
+            }
+            const bool ss = key == "ss_upper";
+            uint8_t *values = ss ? ss_upper.get() : ri_upper.get();
             int val, cnt = 0;
             while (iss >> val) {
-                ss_upper[cnt++] = static_cast<uint8_t>(val);
+                if (cnt > num_buckets || val < 0 || val > num_buckets + 1) {
+                    return parse_error("threshold array value out of range");
+                }
+                values[cnt++] = static_cast<uint8_t>(val);
             }
-        } else if (key == "ri_upper") {
-            int val, cnt = 0;
-            while (iss >> val) {
-                ri_upper[cnt++] = static_cast<uint8_t>(val);
-            }
+            (ss ? ss_count : ri_count) = cnt;
         } else if (key == "left_dense_threshold") {
-            iss >> left_dense_threshold;
+            have_left = static_cast<bool>(iss >> left_dense_threshold);
         } else if (key == "dense_mm_threshold") {
-            iss >> dense_mm_threshold;
+            have_dense = static_cast<bool>(iss >> dense_mm_threshold);
         }
     }
     inputFile.close();
+    if (!have_num_buckets || ss_count != num_buckets + 1 ||
+        ri_count != num_buckets + 1 || !have_left || !have_dense) {
+        return parse_error(
+            "expected num_buckets, ss_upper and ri_upper (num_buckets + 1 "
+            "values each), left_dense_threshold and dense_mm_threshold"
+        );
+    }
     fallback = true;
     no_features = false;
 
@@ -207,9 +237,11 @@ bool read_tile_sizes(
                 } else if (key == "slice_height") {
                     slice_height = std::stoi(value_str);
                 }
-            } catch (const std::invalid_argument &e) {
+            } catch (const std::logic_error &e) {
+                // std::stoi throws invalid_argument or out_of_range.
                 std::cerr << "Invalid number format for key '" << key
                           << "': " << value_str << std::endl;
+                return false;
             }
         }
     }

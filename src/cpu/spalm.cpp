@@ -5,8 +5,10 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "cpu/dense_dense_matmul.h"
@@ -16,24 +18,53 @@
 #include "ss_mat.h"
 #include "util.h"
 
+// Return codes of spalm(). The output is valid only for SPALM_OK; previously
+// every failure returned silently and left the caller's output untouched.
+enum spalm_status : int {
+    SPALM_OK = 0,
+    SPALM_INVALID_ARGUMENT = 1, // bad type, dimensions, threads or options
+    SPALM_CONFIG_ERROR = 2,     // missing/invalid threshold or tile files
+    SPALM_BASELINE_ERROR = 3,   // run_baseline.so could not be loaded
+    SPALM_INTERNAL_ERROR = 4,   // exception, e.g. out of memory
+};
+
 // Used only as a dladdr anchor to locate this .so at runtime.
 static void spalm_lib_anchor() {}
 
+using run_baseline_fn = void (*)(
+    int, const char *, int *, int *, void *, void *, int *, int *, void *,
+    void *, void *, const int, const int, const int, const int
+);
+
+// Returns nullptr (after printing why) if the MKL baseline cannot be loaded.
+static run_baseline_fn load_run_baseline() {
+    void *handle = dlopen(
+        resolve_path_near_lib(
+            reinterpret_cast<void *>(&spalm_lib_anchor), "run_baseline.so",
+            "./bin/run_baseline.so"
+        )
+            .c_str(),
+        RTLD_LAZY
+    );
+    if (!handle) {
+        std::cerr << "Cannot open library: " << dlerror() << '\n';
+        return nullptr;
+    }
+    auto fn = (run_baseline_fn) dlsym(handle, "run_baseline");
+    if (!fn) std::cerr << "Cannot find run_baseline: " << dlerror() << '\n';
+    return fn;
+}
+
 template <typename T>
-void spalm_matmul(
+int spalm_matmul(
     const int type, int *Ri, int *Rj, T *Rv, int *Si, int *Sj, T *Sv,
     const int M, const int K, const int N, const int slice_length,
     const int tile_size_l2, const int tile_size_l3, bool sparse_result, T *ret,
     int *reti, int *retj, T *retv, const int threads
 ) {
-    int R_ik_slice_height, S_ik_slice_height;
-    if (type == 0) {
-        R_ik_slice_height = 12;
-        S_ik_slice_height = 32;
-    } else if (type == 1) {
-        R_ik_slice_height = 12;
-        S_ik_slice_height = 16;
-    }
+    // type is validated by spalm(): 0 = float, 1 = double.
+    const int R_ik_slice_height = 12;
+    const int S_ik_slice_height = type == 0 ? 32 : 16;
 
     ss_matrix<T> R_ssm;
     ss_matrix<T> S_ssm;
@@ -113,8 +144,9 @@ void spalm_matmul(
         // Fallback to mkl
         std::cout << "Fallback: MKL dense-dense" << std::endl;
         start = std::chrono::high_resolution_clock::now();
-        auto R = std::make_unique<T[]>(M * K);
-        auto S = std::make_unique<T[]>(N * K);
+        // size_t: M * K and N * K overflow int for large matrices.
+        auto R = std::make_unique<T[]>((size_t) M * K);
+        auto S = std::make_unique<T[]>((size_t) N * K);
         end = std::chrono::high_resolution_clock::now();
         print_time("Mem allocation time for MKL: ", end - start);
 
@@ -122,39 +154,19 @@ void spalm_matmul(
 #pragma omp parallel for num_threads(threads)
         for (int i = 0; i < M; i++) {
             for (int k = Ri[i]; k < Ri[i + 1]; k++) {
-                R[i * K + Rj[k]] = Rv[k];
+                R[(size_t) i * K + Rj[k]] = Rv[k];
             }
         }
 
 #pragma omp parallel for num_threads(threads)
         for (int i = 0; i < N; i++) {
             for (int k = Si[i]; k < Si[i + 1]; k++) {
-                S[i * K + Sj[k]] = Sv[k];
+                S[(size_t) i * K + Sj[k]] = Sv[k];
             }
         }
 
-        void *handle = dlopen(
-            resolve_path_near_lib(
-                reinterpret_cast<void *>(&spalm_lib_anchor), "run_baseline.so",
-                "./bin/run_baseline.so"
-            )
-                .c_str(),
-            RTLD_LAZY
-        );
-        if (!handle) {
-            std::cerr << "Cannot open library: " << dlerror() << '\n';
-            return;
-        }
-
-        void (*run_baseline)(
-            int, const char *, int *, int *, void *, void *, int *, int *,
-            void *, void *, void *, const int, const int, const int, const int
-        ) =
-            (void (*)(
-                int, const char *, int *, int *, void *, void *, int *, int *,
-                void *, void *, void *, const int, const int, const int,
-                const int
-            )) dlsym(handle, "run_baseline");
+        const run_baseline_fn run_baseline = load_run_baseline();
+        if (!run_baseline) return SPALM_BASELINE_ERROR;
 
         end = std::chrono::high_resolution_clock::now();
         print_time("Matrix initialization for MKL: ", end - start);
@@ -173,28 +185,8 @@ void spalm_matmul(
         mkl_free_buffers();
     } else if (do_sparse_mm && !do_dense_mm && fallback) {
         std::cout << "Fallback: MKL sparse-sparse" << std::endl;
-        void *handle = dlopen(
-            resolve_path_near_lib(
-                reinterpret_cast<void *>(&spalm_lib_anchor), "run_baseline.so",
-                "./bin/run_baseline.so"
-            )
-                .c_str(),
-            RTLD_LAZY
-        );
-        if (!handle) {
-            std::cerr << "Cannot open library: " << dlerror() << '\n';
-            return;
-        }
-
-        void (*run_baseline)(
-            int, const char *, int *, int *, void *, void *, int *, int *,
-            void *, void *, void *, const int, const int, const int, const int
-        ) =
-            (void (*)(
-                int, const char *, int *, int *, void *, void *, int *, int *,
-                void *, void *, void *, const int, const int, const int,
-                const int
-            )) dlsym(handle, "run_baseline");
+        const run_baseline_fn run_baseline = load_run_baseline();
+        if (!run_baseline) return SPALM_BASELINE_ERROR;
         start = std::chrono::high_resolution_clock::now();
         run_baseline(
             type, "MKL sparse-sparse", Ri, Rj, (void *) Rv, NULL, Si, Sj,
@@ -222,14 +214,40 @@ void spalm_matmul(
     std::cout << std::endl;
     print_time("Total MM time: ", end - total_start);
     print_time("E2E MM time: ", end - e2e_start);
+    return SPALM_OK;
 }
 
-extern "C" void spalm(
+// Frees the process-global decision arrays on every exit path.
+struct bucket_info_guard {
+    ~bucket_info_guard() { free_bucket_info(); }
+};
+
+static int spalm_impl(
     int type, int *Ri, int *Rj, void *Rv, int *Si, int *Sj, void *Sv,
     const int M, const int K, const int N, bool sparse_result, void *ret,
     int *reti, int *retj, void *retv, int n, const char **keys,
     const char **vals
 ) {
+    auto invalid = [](const char *what) {
+        std::cerr << "spalm: " << what << std::endl;
+        return SPALM_INVALID_ARGUMENT;
+    };
+    if (type != 0 && type != 1) return invalid("type must be 0 or 1");
+    if (M < 0 || K < 0 || N < 0) return invalid("negative dimension");
+    if (n < 0 || (n > 0 && (!keys || !vals))) {
+        return invalid("invalid key/value options");
+    }
+    // A zero-sized product leaves the caller's (initialized) output as is.
+    if (M == 0 || K == 0 || N == 0) return SPALM_OK;
+    if (!Ri || !Rj || !Rv || !Si || !Sj || !Sv || !ret) {
+        return invalid("null matrix or result pointer");
+    }
+    // The dense kernels address the result with 32-bit offsets, including
+    // gather/scatter indices up to 12 rows and 32 columns past a tile start.
+    if ((long long) (M + 16) * (N + 32) > INT_MAX) {
+        return invalid("M * N is too large for 32-bit result offsets");
+    }
+
     auto get_str = [&](const char *key, const char *def) -> const char * {
         for (int i = 0; i < n; i++)
             if (strcmp(keys[i], key) == 0) return vals[i];
@@ -243,6 +261,7 @@ extern "C" void spalm(
     const char *init_method = get_str("init_method", "");
     const char *bucket_method = get_str("bucket_method", "");
     int threads = get_int("threads", 4);
+    if (threads < 1) return invalid("threads must be at least 1");
 
     std::cout << "SPALM MATMUL" << std::endl;
     std::cout << M << " " << K << " " << N << std::endl;
@@ -253,34 +272,38 @@ extern "C" void spalm(
         std::cout << "FP64" << std::endl;
     }
 
-    parse_bucket_method(bucket_method);
+    if (!parse_bucket_method(bucket_method)) {
+        return invalid(
+            "bucket_method must be linear or log with curvature > 0"
+        );
+    }
+    bucket_info_guard bucket_info;
     bool read_success = init_decision_thresholds(init_method, type, "cpu");
     if (!read_success) {
-        std::cout << "Initialize decision thresholds." << std::endl;
-        return;
+        std::cerr << "Initialize decision thresholds." << std::endl;
+        return SPALM_CONFIG_ERROR;
     }
-    int _sh, slice_length, tile_size_l2, tile_size_l3;
+    int _sh = 0, slice_length = 0, tile_size_l2 = 0, tile_size_l3 = 0;
     read_success = read_tile_sizes(
         type, "cpu", _sh, slice_length, tile_size_l2, tile_size_l3
     );
     if (!read_success) {
-        std::cout << "Initialize tile sizes." << std::endl;
-        return;
+        std::cerr << "Initialize tile sizes." << std::endl;
+        return SPALM_CONFIG_ERROR;
     }
     slice_length = get_int("slice_length", slice_length);
     tile_size_l2 = get_int("tile_size_l2", tile_size_l2);
     tile_size_l3 = get_int("tile_size_l3", tile_size_l3);
 
     std::cout << "Slice length: " << slice_length << std::endl;
-    /*
-  if (slice_length < BITS) {
-    std::cout << "Slice length must be larger than " << BITS << std::endl;
-    return;
-  }
-  */
-    if ((slice_length & (slice_length - 1)) != 0) {
-        std::cout << "Slice length must be power of 2" << std::endl;
-        return;
+    // Subrow and slice lengths are uint16_t; 0 used to pass the power-of-2
+    // test and divide by zero later.
+    if (slice_length < 1 || slice_length > 32768 ||
+        (slice_length & (slice_length - 1)) != 0) {
+        return invalid("slice length must be a power of 2 in [1, 32768]");
+    }
+    if (tile_size_l2 < 1 || tile_size_l3 < 1) {
+        return invalid("tile sizes must be positive");
     }
     // std::cout << "Tile size join dim: " << tile_size_join_dim << std::endl;
     std::cout << "Tile size L2: " << tile_size_l2 << std::endl;
@@ -293,18 +316,44 @@ extern "C" void spalm(
     std::cout << std::endl;
 
     if (type == 0) {
-        spalm_matmul(
+        return spalm_matmul(
             type, Ri, Rj, (float *) Rv, Si, Sj, (float *) Sv, M, K, N,
             slice_length, tile_size_l2, tile_size_l3, sparse_result,
             (float *) ret, reti, retj, (float *) retv, threads
         );
-    } else if (type == 1) {
-        spalm_matmul(
-            type, Ri, Rj, (double *) Rv, Si, Sj, (double *) Sv, M, K, N,
-            slice_length, tile_size_l2, tile_size_l3, sparse_result,
-            (double *) ret, reti, retj, (double *) retv, threads
-        );
     }
+    return spalm_matmul(
+        type, Ri, Rj, (double *) Rv, Si, Sj, (double *) Sv, M, K, N,
+        slice_length, tile_size_l2, tile_size_l3, sparse_result, (double *) ret,
+        reti, retj, (double *) retv, threads
+    );
+}
 
-    free_bucket_info();
+// Returns a spalm_status; the result is valid only for 0 (SPALM_OK).
+// Callers that still declare this as returning void keep working.
+extern "C" int spalm(
+    int type, int *Ri, int *Rj, void *Rv, int *Si, int *Sj, void *Sv,
+    const int M, const int K, const int N, bool sparse_result, void *ret,
+    int *reti, int *retj, void *retv, int n, const char **keys,
+    const char **vals
+) {
+    // Decision thresholds and bucket settings are process-global, reset and
+    // freed by every call: serialize calls so concurrent queries in one
+    // process cannot overwrite or free each other's state mid-run.
+    static std::mutex spalm_mutex;
+    std::lock_guard<std::mutex> lock(spalm_mutex);
+    // Never let an exception cross the C ABI. Exceptions thrown inside
+    // OpenMP regions still terminate the process; this covers the rest
+    // (e.g. std::bad_alloc from the slice or MKL input allocations).
+    try {
+        return spalm_impl(
+            type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, sparse_result, ret, reti,
+            retj, retv, n, keys, vals
+        );
+    } catch (const std::exception &e) {
+        std::cerr << "spalm: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "spalm: unknown exception" << std::endl;
+    }
+    return SPALM_INTERNAL_ERROR;
 }

@@ -155,9 +155,10 @@ void create_subrow_csr(ss_matrix<T> &ssm, const int threads) {
     // Phase 1+3 combined: single pass over Rj per thread.
     // Each thread counts subrows (writes sr_row_ptrs[i+1]) AND stores
     // (col_idx, start, len) tuples in its private buffer.
-#pragma omp parallel num_threads(threads)
-    {
-        const int tid = omp_get_thread_num();
+    // Loop over the logical ranges rather than omp_get_thread_num(): OpenMP
+    // may give a smaller team than requested, and every range must run.
+#pragma omp parallel for num_threads(threads) schedule(static)
+    for (int tid = 0; tid < threads; tid++) {
         sr_tuple *buf = tl_bufs[tid].get();
         int buf_pos = 0;
 
@@ -205,9 +206,8 @@ void create_subrow_csr(ss_matrix<T> &ssm, const int threads) {
 
     // Phase 4: parallel scatter-copy from thread buffers to output.
     // O(total_subrows), not O(NNZ) — fast when average subrow length > 1.
-#pragma omp parallel num_threads(threads)
-    {
-        const int tid = omp_get_thread_num();
+#pragma omp parallel for num_threads(threads) schedule(static)
+    for (int tid = 0; tid < threads; tid++) {
         const sr_tuple *buf = tl_bufs[tid].get();
         int buf_pos = 0;
 
@@ -445,11 +445,13 @@ void mm_check(
         }
         // Compute sparse-sparse MM cost, assume uniform density
         // Approximate # of elements in S
-        int S_slice_sum = 0;
+        // 64-bit sums/products: slice counts times per-slice NNZ overflow int
+        // for large matrices.
+        unsigned long long S_slice_sum = 0;
         int S_slice_num = 0;
         for (int b = 0; b < ss_upper[i]; b++) {
-            S_slice_sum +=
-                S_slice_buckets[b] * bucket_to_nnz(b, S_slice_ele_num);
+            S_slice_sum += (unsigned long long) S_slice_buckets[b] *
+                           bucket_to_nnz(b, S_slice_ele_num);
             S_slice_num += S_slice_buckets[b];
         }
         const float average_nums_per_col = (float) S_slice_sum / sl;
@@ -482,9 +484,8 @@ void mm_check(
             sparse_dense_mm_cost += dense_mm_cost_one;
         } else {
             // dense-dense
-            dense_mm_cost_one =
-                (unsigned long long) (R_slice_buckets[i] * R_slice_ele_num) *
-                S_slice_num * nr;
+            dense_mm_cost_one = (unsigned long long) R_slice_buckets[i] *
+                                R_slice_ele_num * S_slice_num * nr;
             if (R_slice_buckets[i] > 0 && S_slice_num > 0 &&
                 dense_mm_cost_one < 1) {
                 dense_mm_cost_one = 1;
@@ -494,26 +495,27 @@ void mm_check(
         // Compute cost of dense-sparse
         S_slice_sum = 0;
         for (int b = sparse_end; b < dense_right_end; b++) {
-            S_slice_sum +=
-                S_slice_buckets[b] * bucket_to_nnz(b, S_slice_ele_num);
+            S_slice_sum += (unsigned long long) S_slice_buckets[b] *
+                           bucket_to_nnz(b, S_slice_ele_num);
         }
-        dense_sparse_mm_cost +=
-            (unsigned long long) S_slice_sum * mr * R_slice_buckets[i];
+        dense_sparse_mm_cost += S_slice_sum * mr * R_slice_buckets[i];
     }
 }
 
 // Pack a slice into dense memory for the inner kernel.
 // Each subrow in the slice corresponds to one row in the packed block.
+// Keys are made panel-local (k - join_idx) instead of offsetting the buffer
+// pointers backwards: that formed pointers outside the allocations, and for
+// slice lengths below 64 it set bits outside this slice's bitmap words.
 template <typename T>
 void pack_slice_new(
     const slice &s, ss_matrix<T> &ssm, const int join_idx, const int sl,
     const int ik, T *packed_mem_original, BIT_DTYPE *bm_original
 ) {
-    T *packed_mem_offseted = packed_mem_original - (join_idx * ik);
-    BIT_DTYPE *bm = bm_original - (join_idx / BITS);
+    BIT_DTYPE *bm = bm_original;
     for (int si = 0; si < s.len; si++) {
         const subrow &sr = ssm.sr_csc_mat.vals[s.start + si];
-        T *packed_mem = packed_mem_offseted + si;
+        T *packed_mem = packed_mem_original + si;
 
         const int unroll_factor = 4;
         const int sr_end = sr.start + sr.len;
@@ -524,29 +526,29 @@ void pack_slice_new(
         for (; k_idx < k_idx_end; k_idx += unroll_factor) {
             int k;
             T v;
-            k = ssm.csr_mat.col_idxs[k_idx];
+            k = ssm.csr_mat.col_idxs[k_idx] - join_idx;
             v = ssm.csr_mat.vals[k_idx];
             set_bit(bm, k);
             packed_mem[ik * k] = v;
 
-            k = ssm.csr_mat.col_idxs[k_idx + 1];
+            k = ssm.csr_mat.col_idxs[k_idx + 1] - join_idx;
             v = ssm.csr_mat.vals[k_idx + 1];
             set_bit(bm, k);
             packed_mem[ik * k] = v;
 
-            k = ssm.csr_mat.col_idxs[k_idx + 2];
+            k = ssm.csr_mat.col_idxs[k_idx + 2] - join_idx;
             v = ssm.csr_mat.vals[k_idx + 2];
             set_bit(bm, k);
             packed_mem[ik * k] = v;
 
-            k = ssm.csr_mat.col_idxs[k_idx + 3];
+            k = ssm.csr_mat.col_idxs[k_idx + 3] - join_idx;
             v = ssm.csr_mat.vals[k_idx + 3];
             set_bit(bm, k);
             packed_mem[ik * k] = v;
         }
 
         for (; k_idx < sr_end; k_idx++) {
-            int k = ssm.csr_mat.col_idxs[k_idx];
+            int k = ssm.csr_mat.col_idxs[k_idx] - join_idx;
             T v = ssm.csr_mat.vals[k_idx];
             set_bit(bm, k);
             packed_mem[ik * k] = v;

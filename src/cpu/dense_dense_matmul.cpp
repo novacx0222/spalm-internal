@@ -50,7 +50,10 @@ void inline dense_dense_matmul_task_shared(
     const int sl = R_ssm.sl;
 
     const int k_offset = slice_col * sl;
-    int row_offset;
+    const int row_offset = 0; // unused by inner_kernel_bm; was uninitialized
+    // One bitmap stride per slice: (s_idx * sl) / BITS made slices share
+    // bitmap words when sl < BITS.
+    const int bm_words = div_ceil(sl, BITS);
 
     __m512i gather_idx = _mm512_set_epi32(
         0, 0, 0, 0, N * 11, N * 10, N * 9, N * 8, N * 7, N * 6, N * 5, N * 4,
@@ -69,7 +72,7 @@ void inline dense_dense_matmul_task_shared(
             const slice &S_s = S_ssm.s_csc_mat.vals[S_si];
             pack_slice_new(
                 S_s, S_ssm, k_offset, sl, nr, &S_packed_mem[s_idx * sl * nr],
-                &S_bm[(s_idx * sl) / BITS]
+                &S_bm[s_idx * bm_words]
             );
         }
     }
@@ -86,27 +89,26 @@ void inline dense_dense_matmul_task_shared(
             case SPARSE_SPARSE:
                 break;
             case DENSE_DENSE_RIGHT_INNER_KERNEL:
+                // Pass the panel itself and k_offset; the kernels index with
+                // panel-local keys instead of a pointer before the buffer.
                 dense_right_inner_kernel(
                     S_s, S_ssm, R_s, R_row_idxs, mr,
-                    &R_packed_mem[R_s_idx * sl * mr - (k_offset * mr)], M, N,
-                    ret, gather_idx
+                    &R_packed_mem[R_s_idx * sl * mr], M, N, ret, gather_idx,
+                    k_offset
                 );
                 break;
             case DENSE_DENSE_LEFT_INNER_KERNEL:
                 dense_left_inner_kernel(
                     R_s, R_ssm, S_s, S_row_idxs, nr,
-                    &S_packed_mem[S_s_idx * sl * nr - (k_offset * nr)], M, N,
-                    ret
+                    &S_packed_mem[S_s_idx * sl * nr], M, N, ret, k_offset
                 );
                 break;
             case DENSE_DENSE:
                 inner_kernel_bm(
-                    &R_packed_mem[R_s_idx * sl * mr],
-                    &R_bm[(R_s_idx * sl) / BITS],
-                    &S_packed_mem[S_s_idx * sl * nr],
-                    &S_bm[(S_s_idx * sl) / BITS], sl, 1, 1, R_s, R_row_idxs,
-                    S_s, S_row_idxs, M, N, ret, sparse_result, nullptr,
-                    row_offset
+                    &R_packed_mem[R_s_idx * sl * mr], &R_bm[R_s_idx * bm_words],
+                    &S_packed_mem[S_s_idx * sl * nr], &S_bm[S_s_idx * bm_words],
+                    sl, 1, 1, R_s, R_row_idxs, S_s, S_row_idxs, M, N, ret,
+                    sparse_result, nullptr, row_offset
                 );
                 break;
             }
@@ -157,9 +159,16 @@ void dense_dense_matmul(
     const int S_slices_per_agg_tile = div_ceil(tile_size_l2, nr);
 
     const int R_slices_per_l3 = div_ceil(tile_size_l3, mr);
-    const int R_block_size = R_slices_per_l3 * sl * mr;
-    const int R_bm_size = R_slices_per_l3 * div_ceil(sl, BITS);
-    auto R_packed_mem = make_aligned_unique<T>(R_block_size);
+    const int bm_words = div_ceil(sl, BITS);
+    const size_t R_block_size = (size_t) R_slices_per_l3 * sl * mr;
+    const size_t R_bm_size = (size_t) R_slices_per_l3 * bm_words;
+    // The SIMD kernels read past the last packed k row: DS loads 16 lanes
+    // from 12-row R panels (up to 20 extra floats), and the DD kernel reads
+    // one element past the S panel. Keep a zeroed tail after each buffer.
+    constexpr size_t pad_bytes = 128;
+    const size_t pad = pad_bytes / sizeof(T);
+    auto R_packed_mem = make_aligned_unique<T>(R_block_size + pad);
+    std::memset(R_packed_mem.get() + R_block_size, 0, pad_bytes);
     auto R_bm = make_aligned_unique<BIT_DTYPE>(R_bm_size);
 
     auto mem_alloc_end = std::chrono::high_resolution_clock::now();
@@ -173,8 +182,13 @@ void dense_dense_matmul(
 #pragma omp parallel num_threads(threads)
     {
         thread_cores[omp_get_thread_num()] = sched_getcpu();
+        const size_t S_block_size = (size_t) S_slices_per_agg_tile * sl * nr;
         S_packed_mem_threads[omp_get_thread_num()] =
-            make_aligned_unique<T>(S_slices_per_agg_tile * sl * nr);
+            make_aligned_unique<T>(S_block_size + pad);
+        std::memset(
+            S_packed_mem_threads[omp_get_thread_num()].get() + S_block_size, 0,
+            pad_bytes
+        );
         S_bm_threads[omp_get_thread_num()] = make_aligned_unique<BIT_DTYPE>(
             (S_slices_per_agg_tile + 8) * div_ceil(sl, BITS)
         );
@@ -199,8 +213,7 @@ void dense_dense_matmul(
                 for (int R_si = R_si_l3; R_si < R_si_l3_end; R_si++) {
                     const int s_idx = R_si - R_si_l3;
                     memset(
-                        &R_bm[s_idx * sl / BITS], 0,
-                        sizeof(BIT_DTYPE) * div_ceil(sl, BITS)
+                        &R_bm[s_idx * bm_words], 0, sizeof(BIT_DTYPE) * bm_words
                     );
                     memset(
                         &R_packed_mem[s_idx * sl * mr], 0, sizeof(T) * sl * mr
@@ -208,8 +221,7 @@ void dense_dense_matmul(
                     const slice &R_s = R_ssm.s_csc_mat.vals[R_si];
                     pack_slice_new(
                         R_s, R_ssm, k_offset, sl, mr,
-                        &R_packed_mem[s_idx * sl * mr],
-                        &R_bm[(s_idx * sl) / BITS]
+                        &R_packed_mem[s_idx * sl * mr], &R_bm[s_idx * bm_words]
                     );
                 }
 
@@ -262,9 +274,10 @@ void dense_dense_matmul(
     print_time("Total dense MM time: ", mm_end - dense_mm_start);
 }
 
+// packed_mem is the panel itself; keys are made local with k_offset.
 void inline sparse_dense_inner_kernel_iter(
     const subrow &sr, csr<double> &csr_mat, const double *packed_mem,
-    const int nr, __m512d &res0, __m512d &res1
+    const int nr, const int k_offset, __m512d &res0, __m512d &res1
 ) {
     res0 = _mm512_setzero_pd();
     res1 = _mm512_setzero_pd();
@@ -277,28 +290,28 @@ void inline sparse_dense_inner_kernel_iter(
     int k_end = k_idx + iters * unroll_factor;
 
     for (; k_idx < k_end; k_idx += unroll_factor) {
-        int k = csr_mat.col_idxs[k_idx];
+        int k = csr_mat.col_idxs[k_idx] - k_offset;
         __m512d r_val = _mm512_broadcastsd_pd(_mm_set_sd(csr_mat.vals[k_idx]));
         __m512d s_vals0 = _mm512_loadu_pd(&packed_mem[nr * k]);
         __m512d s_vals1 = _mm512_loadu_pd(&packed_mem[nr * k + 8]);
         res0 = _mm512_fmadd_pd(r_val, s_vals0, res0);
         res1 = _mm512_fmadd_pd(r_val, s_vals1, res1);
 
-        k = csr_mat.col_idxs[k_idx + 1];
+        k = csr_mat.col_idxs[k_idx + 1] - k_offset;
         r_val = _mm512_broadcastsd_pd(_mm_set_sd(csr_mat.vals[k_idx + 1]));
         s_vals0 = _mm512_loadu_pd(&packed_mem[nr * k]);
         s_vals1 = _mm512_loadu_pd(&packed_mem[nr * k + 8]);
         res0 = _mm512_fmadd_pd(r_val, s_vals0, res0);
         res1 = _mm512_fmadd_pd(r_val, s_vals1, res1);
 
-        k = csr_mat.col_idxs[k_idx + 2];
+        k = csr_mat.col_idxs[k_idx + 2] - k_offset;
         r_val = _mm512_broadcastsd_pd(_mm_set_sd(csr_mat.vals[k_idx + 2]));
         s_vals0 = _mm512_loadu_pd(&packed_mem[nr * k]);
         s_vals1 = _mm512_loadu_pd(&packed_mem[nr * k + 8]);
         res0 = _mm512_fmadd_pd(r_val, s_vals0, res0);
         res1 = _mm512_fmadd_pd(r_val, s_vals1, res1);
 
-        k = csr_mat.col_idxs[k_idx + 3];
+        k = csr_mat.col_idxs[k_idx + 3] - k_offset;
         r_val = _mm512_broadcastsd_pd(_mm_set_sd(csr_mat.vals[k_idx + 3]));
         s_vals0 = _mm512_loadu_pd(&packed_mem[nr * k]);
         s_vals1 = _mm512_loadu_pd(&packed_mem[nr * k + 8]);
@@ -306,7 +319,7 @@ void inline sparse_dense_inner_kernel_iter(
         res1 = _mm512_fmadd_pd(r_val, s_vals1, res1);
     }
     for (; k_idx < sr_end; k_idx++) {
-        int k = csr_mat.col_idxs[k_idx];
+        int k = csr_mat.col_idxs[k_idx] - k_offset;
         __m512d r_val = _mm512_broadcastsd_pd(_mm_set_sd(csr_mat.vals[k_idx]));
         __m512d s_vals0 = _mm512_loadu_pd(&packed_mem[nr * k]);
         __m512d s_vals1 = _mm512_loadu_pd(&packed_mem[nr * k + 8]);
@@ -317,7 +330,7 @@ void inline sparse_dense_inner_kernel_iter(
 
 void inline sparse_dense_inner_kernel_iter(
     const subrow &sr, csr<float> &csr_mat, const float *packed_mem,
-    const int nr, __m512 &res0, __m512 &res1
+    const int nr, const int k_offset, __m512 &res0, __m512 &res1
 ) {
     res0 = _mm512_setzero_ps();
     res1 = _mm512_setzero_ps();
@@ -330,28 +343,28 @@ void inline sparse_dense_inner_kernel_iter(
     int k_end = k_idx + iters * unroll_factor;
 
     for (; k_idx < k_end; k_idx += unroll_factor) {
-        int k = csr_mat.col_idxs[k_idx];
+        int k = csr_mat.col_idxs[k_idx] - k_offset;
         __m512 r_val = _mm512_broadcastss_ps(_mm_set_ss(csr_mat.vals[k_idx]));
         __m512 s_vals0 = _mm512_loadu_ps(&packed_mem[nr * k]);
         __m512 s_vals1 = _mm512_loadu_ps(&packed_mem[nr * k + 16]);
         res0 = _mm512_fmadd_ps(r_val, s_vals0, res0);
         res1 = _mm512_fmadd_ps(r_val, s_vals1, res1);
 
-        k = csr_mat.col_idxs[k_idx + 1];
+        k = csr_mat.col_idxs[k_idx + 1] - k_offset;
         r_val = _mm512_broadcastss_ps(_mm_set_ss(csr_mat.vals[k_idx + 1]));
         s_vals0 = _mm512_loadu_ps(&packed_mem[nr * k]);
         s_vals1 = _mm512_loadu_ps(&packed_mem[nr * k + 16]);
         res0 = _mm512_fmadd_ps(r_val, s_vals0, res0);
         res1 = _mm512_fmadd_ps(r_val, s_vals1, res1);
 
-        k = csr_mat.col_idxs[k_idx + 2];
+        k = csr_mat.col_idxs[k_idx + 2] - k_offset;
         r_val = _mm512_broadcastss_ps(_mm_set_ss(csr_mat.vals[k_idx + 2]));
         s_vals0 = _mm512_loadu_ps(&packed_mem[nr * k]);
         s_vals1 = _mm512_loadu_ps(&packed_mem[nr * k + 16]);
         res0 = _mm512_fmadd_ps(r_val, s_vals0, res0);
         res1 = _mm512_fmadd_ps(r_val, s_vals1, res1);
 
-        k = csr_mat.col_idxs[k_idx + 3];
+        k = csr_mat.col_idxs[k_idx + 3] - k_offset;
         r_val = _mm512_broadcastss_ps(_mm_set_ss(csr_mat.vals[k_idx + 3]));
         s_vals0 = _mm512_loadu_ps(&packed_mem[nr * k]);
         s_vals1 = _mm512_loadu_ps(&packed_mem[nr * k + 16]);
@@ -359,7 +372,7 @@ void inline sparse_dense_inner_kernel_iter(
         res1 = _mm512_fmadd_ps(r_val, s_vals1, res1);
     }
     for (; k_idx < sr_end; k_idx++) {
-        int k = csr_mat.col_idxs[k_idx];
+        int k = csr_mat.col_idxs[k_idx] - k_offset;
         __m512 r_val = _mm512_broadcastss_ps(_mm_set_ss(csr_mat.vals[k_idx]));
         __m512 s_vals0 = _mm512_loadu_ps(&packed_mem[nr * k]);
         __m512 s_vals1 = _mm512_loadu_ps(&packed_mem[nr * k + 16]);
@@ -372,14 +385,14 @@ template <typename T>
 void dense_left_inner_kernel(
     const slice &R_s, ss_matrix<T> &R_ssm, const slice &S_s,
     const int *S_row_idxs, const int nr, const T *packed_mem, const int M,
-    const int N, T *ret
+    const int N, T *ret, const int k_offset
 );
 
 template <>
 void dense_left_inner_kernel<double>(
     const slice &R_s, ss_matrix<double> &R_ssm, const slice &S_s,
     const int *S_row_idxs, const int nr, const double *packed_mem, const int M,
-    const int N, double *ret
+    const int N, double *ret, const int k_offset
 ) {
     __mmask8 k0 = 0b11111111;
     __mmask8 k1 = 0b11111111;
@@ -396,7 +409,7 @@ void dense_left_inner_kernel<double>(
             N - S_row_idxs[S_s.len - 1] < 1 ? N - S_row_idxs[S_s.len - 1] : 1;
         const int write_length = (S_s.len - 1) + last_write_S;
 
-        int scatter_locations[16];
+        int scatter_locations[16] = {};
         for (int i = 0; i < S_s.len; i++) {
             scatter_locations[i] = S_row_idxs[i];
         }
@@ -420,12 +433,17 @@ void dense_left_inner_kernel<double>(
 
         __m512d res0, res1;
         sparse_dense_inner_kernel_iter(
-            sr, R_ssm.csr_mat, packed_mem, nr, res0, res1
+            sr, R_ssm.csr_mat, packed_mem, nr, k_offset, res0, res1
         );
 
         if (S_s.continuous) {
-            res0 = _mm512_add_pd(res0, _mm512_loadu_pd(&ret[I * N + J]));
-            res1 = _mm512_add_pd(res1, _mm512_loadu_pd(&ret[I * N + J + 8]));
+            // Masked loads: unmasked ones read past the row (and past the
+            // end of ret for the last row) when fewer than 16 columns remain.
+            res0 =
+                _mm512_add_pd(res0, _mm512_maskz_loadu_pd(k0, &ret[I * N + J]));
+            res1 = _mm512_add_pd(
+                res1, _mm512_maskz_loadu_pd(k1, &ret[I * N + J + 8])
+            );
             _mm512_mask_storeu_pd(&ret[I * N + J], k0, res0);
             _mm512_mask_storeu_pd(&ret[I * N + J + 8], k1, res1);
         } else {
@@ -456,7 +474,7 @@ template <>
 void dense_left_inner_kernel<float>(
     const slice &R_s, ss_matrix<float> &R_ssm, const slice &S_s,
     const int *S_row_idxs, const int nr, const float *packed_mem, const int M,
-    const int N, float *ret
+    const int N, float *ret, const int k_offset
 ) {
     __mmask16 k0 = 0b1111111111111111;
     __mmask16 k1 = 0b1111111111111111;
@@ -473,7 +491,7 @@ void dense_left_inner_kernel<float>(
             N - S_row_idxs[S_s.len - 1] < 1 ? N - S_row_idxs[S_s.len - 1] : 1;
         const int write_length = (S_s.len - 1) + last_write_S;
 
-        int scatter_locations[32];
+        int scatter_locations[32] = {};
         for (int i = 0; i < S_s.len; i++) {
             scatter_locations[i] = S_row_idxs[i];
         }
@@ -497,12 +515,16 @@ void dense_left_inner_kernel<float>(
 
         __m512 res0, res1;
         sparse_dense_inner_kernel_iter(
-            sr, R_ssm.csr_mat, packed_mem, nr, res0, res1
+            sr, R_ssm.csr_mat, packed_mem, nr, k_offset, res0, res1
         );
 
         if (S_s.continuous) {
-            res0 = _mm512_add_ps(res0, _mm512_loadu_ps(&ret[I * N + J]));
-            res1 = _mm512_add_ps(res1, _mm512_loadu_ps(&ret[I * N + J + 16]));
+            // Masked loads, as in the double kernel above.
+            res0 =
+                _mm512_add_ps(res0, _mm512_maskz_loadu_ps(k0, &ret[I * N + J]));
+            res1 = _mm512_add_ps(
+                res1, _mm512_maskz_loadu_ps(k1, &ret[I * N + J + 16])
+            );
             _mm512_mask_storeu_ps(&ret[I * N + J], k0, res0);
             _mm512_mask_storeu_ps(&ret[I * N + J + 16], k1, res1);
         } else {
@@ -533,14 +555,14 @@ template <typename T>
 void dense_right_inner_kernel(
     const slice &S_s, ss_matrix<T> &S_ssm, const slice &R_s,
     const int *R_row_idxs, const int mr, const T *packed_mem, const int M,
-    const int N, T *ret, __m512i gather_idx_512
+    const int N, T *ret, __m512i gather_idx_512, const int k_offset
 );
 
 template <>
 void dense_right_inner_kernel<double>(
     const slice &S_s, ss_matrix<double> &S_ssm, const slice &R_s,
     const int *R_row_idxs, const int mr, const double *packed_mem, const int M,
-    const int N, double *ret, __m512i gather_idx_512
+    const int N, double *ret, __m512i gather_idx_512, const int k_offset
 ) {
     __mmask8 k0 = 0b11111111;
     __mmask8 k1 = 0b1111;
@@ -556,7 +578,7 @@ void dense_right_inner_kernel<double>(
             M - R_row_idxs[R_s.len - 1] < 1 ? M - R_row_idxs[R_s.len - 1] : 1;
         const int write_height = (R_s.len - 1) + last_write_R;
 
-        int scatter_locations[16];
+        int scatter_locations[16] = {};
         for (int i = 0; i < R_s.len; i++) {
             scatter_locations[i] = R_row_idxs[i] * N;
         }
@@ -582,7 +604,7 @@ void dense_right_inner_kernel<double>(
 
         __m512d res0, res1;
         sparse_dense_inner_kernel_iter(
-            sr, S_ssm.csr_mat, packed_mem, mr, res0, res1
+            sr, S_ssm.csr_mat, packed_mem, mr, k_offset, res0, res1
         );
 
         if (R_s.continuous) {
@@ -628,7 +650,7 @@ template <>
 void dense_right_inner_kernel<float>(
     const slice &S_s, ss_matrix<float> &S_ssm, const slice &R_s,
     const int *R_row_idxs, const int mr, const float *packed_mem, const int M,
-    const int N, float *ret, __m512i gather_idx
+    const int N, float *ret, __m512i gather_idx, const int k_offset
 ) {
     __mmask16 k0 = 0b111111111111;
     __m512i scatter_idx0;
@@ -641,7 +663,8 @@ void dense_right_inner_kernel<float>(
             M - R_row_idxs[R_s.len - 1] < 1 ? M - R_row_idxs[R_s.len - 1] : 1;
         const int write_height = (R_s.len - 1) + last_write_R;
 
-        int scatter_locations[12];
+        // A 512-bit index load reads 16 ints; [12] was a stack over-read.
+        int scatter_locations[16] = {};
         for (int i = 0; i < R_s.len; i++) {
             scatter_locations[i] = R_row_idxs[i] * N;
         }
@@ -662,7 +685,7 @@ void dense_right_inner_kernel<float>(
 
         __m512 res0, res1;
         sparse_dense_inner_kernel_iter(
-            sr, S_ssm.csr_mat, packed_mem, mr, res0, res1
+            sr, S_ssm.csr_mat, packed_mem, mr, k_offset, res0, res1
         );
 
         if (R_s.continuous) {

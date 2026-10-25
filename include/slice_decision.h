@@ -28,22 +28,27 @@ extern int left_dense_threshold;
 extern unsigned long long dense_mm_threshold;
 extern bool fallback;
 extern bool no_features;
+inline constexpr int DEFAULT_BUCKET_LOG_CURVATURE = 50;
 inline bool use_log_buckets = false;
-inline int bucket_log_curvature = 50; // ~10% of buckets fall below 1% density
+// ~10% of buckets fall below 1% density
+inline int bucket_log_curvature = DEFAULT_BUCKET_LOG_CURVATURE;
 
 // Parse a bucket method string ("linear_N" or "log_N_cC") and set the globals
-// above.  An empty or null string defaults to "linear_100".
-inline void parse_bucket_method(const char *bucket_method) {
+// above.  An empty or null string defaults to "linear_100". Every call sets
+// both globals, so no setting leaks from a previous call. Returns false for an
+// unknown method or a non-positive curvature (log(1 + 0) would divide by 0).
+inline bool parse_bucket_method(const char *bucket_method) {
+    use_log_buckets = false;
+    bucket_log_curvature = DEFAULT_BUCKET_LOG_CURVATURE;
     if (bucket_method == nullptr || bucket_method[0] == '\0' ||
         std::strncmp(bucket_method, "linear", 6) == 0) {
-        use_log_buckets = false;
-    } else if (std::strncmp(bucket_method, "log", 3) == 0) {
-        use_log_buckets = true;
-        const char *c_pos = std::strstr(bucket_method, "_c");
-        if (c_pos != nullptr) {
-            bucket_log_curvature = std::atoi(c_pos + 2);
-        }
+        return true;
     }
+    if (std::strncmp(bucket_method, "log", 3) != 0) return false;
+    use_log_buckets = true;
+    const char *c_pos = std::strstr(bucket_method, "_c");
+    if (c_pos != nullptr) bucket_log_curvature = std::atoi(c_pos + 2);
+    return bucket_log_curvature > 0;
 }
 
 inline int get_bucket(const int nnz, const int slice_ele_num) {

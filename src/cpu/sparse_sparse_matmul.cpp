@@ -190,24 +190,27 @@ void spgemm_rows_dense_result(
                 continue;
             }
             const int *sj_starts = &sj_buckets[0];
-            const int *sj_ends = &sj_buckets[bucket_idx * K];
+            const int *sj_ends = &sj_buckets[(size_t) bucket_idx * K];
             const subrow &sr = R_ssm.sr_csr_mat.vals[si];
             csr_csr_matmul_kernel(
                 sr.start, sr.start + sr.len, R_ssm.csr_mat.col_idxs,
                 R_ssm.csr_mat.vals, s_agg_idxs, sj_starts, sj_ends, s_vals,
-                &ret[ra * N]
+                &ret[(size_t) ra * N]
             );
         }
     }
 }
 
-static std::unique_ptr<int[]> thread_col_offsets;
-
+// Must be called by every thread of one `omp parallel` region, with
+// thread_idx = omp_get_thread_num() and threads = omp_get_num_threads(): it
+// synchronizes with barriers. thread_col_offsets is shared by the team
+// (it used to be a process-global static, unsafe for concurrent calls).
 template <typename T>
 inline void transpose_s_matrix_vanilla(
     const int thread_idx, const int threads, ss_matrix<T> &S_ssm,
     std::unique_ptr<int[]> &s_col_idxs_ref,
-    std::unique_ptr<int[]> &s_agg_idxs_ref, std::unique_ptr<T[]> &s_vals_ref
+    std::unique_ptr<int[]> &s_agg_idxs_ref, std::unique_ptr<T[]> &s_vals_ref,
+    std::unique_ptr<int[]> &thread_col_offsets
 ) {
     csr<T> &S_csr = S_ssm.csr_mat;
     const int N = S_csr.rows;
@@ -226,7 +229,8 @@ inline void transpose_s_matrix_vanilla(
         s_agg_idxs_ref = std::make_unique_for_overwrite<int[]>(nnz);
         s_vals_ref = std::make_unique_for_overwrite<T[]>(nnz);
 
-        thread_col_offsets = std::make_unique_for_overwrite<int[]>(threads * K);
+        thread_col_offsets =
+            std::make_unique_for_overwrite<int[]>((size_t) threads * K);
 
         end = std::chrono::high_resolution_clock::now();
         print_time("Memory allocation time: ", end - start);
@@ -236,7 +240,7 @@ inline void transpose_s_matrix_vanilla(
 
     int *s_col_idxs = s_col_idxs_ref.get();
     int *s_agg_idxs = s_agg_idxs_ref.get();
-    int *thread_col_offset = &thread_col_offsets[K * thread_idx];
+    int *thread_col_offset = &thread_col_offsets[(size_t) K * thread_idx];
     T *s_vals = s_vals_ref.get();
 
     if (thread_idx == 0) {
@@ -249,7 +253,10 @@ inline void transpose_s_matrix_vanilla(
                     s_col_idxs[sk + 1]++;
                 }
             }
-            memcpy(&thread_col_offsets[t * K], &s_col_idxs[1], sizeof(int) * K);
+            memcpy(
+                &thread_col_offsets[(size_t) t * K], &s_col_idxs[1],
+                sizeof(int) * K
+            );
         }
     }
 
@@ -300,7 +307,7 @@ void spgemm_rows_dense_result_vanilla(
         csr_csr_matmul_kernel(
             R_csr.row_ptrs[ra], R_csr.row_ptrs[ra + 1], R_csr.col_idxs,
             R_csr.vals, s_agg_idxs, s_col_idxs, s_col_idxs + 1, s_vals,
-            &ret[ra * N]
+            &ret[(size_t) ra * N]
         );
     }
 }
@@ -322,10 +329,15 @@ void sparse_sparse_matmul(
     std::unique_ptr<T[]> S_T_vals;
 
     if (all_sparse) {
-#pragma omp parallel for num_threads(threads)
-        for (int i = 0; i < threads; i++) {
+        // A parallel region, not a worksharing loop: the transpose uses
+        // barriers, which are invalid inside `omp for` and deadlock or skip
+        // rows when OpenMP gives fewer threads than requested.
+        std::unique_ptr<int[]> thread_col_offsets;
+#pragma omp parallel num_threads(threads)
+        {
             transpose_s_matrix_vanilla(
-                i, threads, S_ssm, S_T_col_idxs, S_T_row_idxs, S_T_vals
+                omp_get_thread_num(), omp_get_num_threads(), S_ssm,
+                S_T_col_idxs, S_T_row_idxs, S_T_vals, thread_col_offsets
             );
         }
         end = std::chrono::high_resolution_clock::now();
@@ -347,9 +359,9 @@ void sparse_sparse_matmul(
 
     auto transpose_start = std::chrono::high_resolution_clock::now();
     const int total_buckets = get_total_sparse_buckets();
-    std::vector<int> sj_buckets_tmp(K * total_buckets + 1);
+    std::vector<int> sj_buckets_tmp((size_t) K * total_buckets + 1);
     S_T_col_idxs =
-        std::make_unique_for_overwrite<int[]>((total_buckets + 1) * K);
+        std::make_unique_for_overwrite<int[]>((size_t) (total_buckets + 1) * K);
 
     int *sj_buckets = S_T_col_idxs.get();
 
@@ -370,7 +382,7 @@ void sparse_sparse_matmul(
                 // Iterate over elements in this subrow
                 for (int k = sr.start; k < sr.start + sr.len; k++) {
                     sj_buckets_tmp
-                        [S_ssm.csr_mat.col_idxs[k] * total_buckets +
+                        [(size_t) S_ssm.csr_mat.col_idxs[k] * total_buckets +
                          bucket_idx + 1]++;
                 }
             }
@@ -380,7 +392,7 @@ void sparse_sparse_matmul(
     start = std::chrono::high_resolution_clock::now();
     int total_nnz = S_ssm.csr_mat.row_ptrs[N];
 
-    for (int sji = 0; sji < K * total_buckets; sji++) {
+    for (size_t sji = 0; sji < (size_t) K * total_buckets; sji++) {
         sj_buckets_tmp[sji + 1] += sj_buckets_tmp[sji];
     }
 
@@ -410,27 +422,29 @@ void sparse_sparse_matmul(
                 for (int k = sr.start; k < sr.start + sr.len; k++) {
                     const int sk = S_ssm.csr_mat.col_idxs[k];
                     const T sval = S_ssm.csr_mat.vals[k];
-                    const int write_idx =
-                        sj_buckets_tmp[sk * total_buckets + bucket_idx];
+                    const int write_idx = sj_buckets_tmp
+                        [(size_t) sk * total_buckets + bucket_idx];
 
                     s_vals[write_idx] = sval;
                     s_agg_idxs[write_idx] = row;
-                    sj_buckets_tmp[sk * total_buckets + bucket_idx]++;
+                    sj_buckets_tmp[(size_t) sk * total_buckets + bucket_idx]++;
                 }
             }
         }
     }
 
     start = std::chrono::high_resolution_clock::now();
-    memcpy(
+    // Overlapping shift by one element: memmove, not memcpy (undefined).
+    memmove(
         &sj_buckets_tmp[1], &sj_buckets_tmp[0],
-        (K * total_buckets) * sizeof(int)
+        ((size_t) K * total_buckets) * sizeof(int)
     );
     sj_buckets_tmp[0] = 0;
 
     for (int b = 0; b < total_buckets + 1; b++) {
         for (int k = 0; k < K; k++) {
-            sj_buckets[b * K + k] = sj_buckets_tmp[k * total_buckets + b];
+            sj_buckets[(size_t) b * K + k] =
+                sj_buckets_tmp[(size_t) k * total_buckets + b];
         }
     }
     end = std::chrono::high_resolution_clock::now();
