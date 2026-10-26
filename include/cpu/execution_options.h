@@ -5,4 +5,7 @@
 struct cpu_execution_options {
     // Drop explicit finite zeros before slicing (key: prune_zeros).
     bool prune_zeros = true;
+    // Keep only join keys used by both inputs and renumber them densely
+    // (key: compact_keys).
+    bool compact_keys = true;
 };

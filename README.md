@@ -71,6 +71,7 @@ are passed as key/value strings:
 | `init_method` | empty (automatic, needs calibrated thresholds), `sparse`, `dense_bm_inner_kernel`, `dense_right_spmm_inner_kernel`, `dense_left_spmm_inner_kernel`, `FORCE_MKL_DENSE`, `FORCE_MKL_SPARSE`, `dense`, `no_fallback`, `no_threshold`, `no_features` |
 | `threads` | OpenMP threads (default 4) |
 | `prune_zeros` | `1` (default) drops explicit zeros when all values are finite; `0` disables it |
+| `compact_keys` | `1` (default) keeps only join keys used by both inputs and renumbers them densely, so every kernel and MKL backend runs on K' <= K; `0` disables it |
 | `bucket_method` | `linear_100` (default) or `log_100_cC` |
 | `slice_length`, `tile_size_l2`, `tile_size_l3` | override `parameters/cpu/<type>/tile_sizes.txt` |
 
@@ -88,7 +89,8 @@ stages overlap, so only totals at the same level may be compared or added.
 | Label | Covers |
 |-------|--------|
 | `[library-initialize]` | argument checks, options, thresholds and tile sizes |
-| `[csr-zero-prepare]` | zero pruning / CSR validation (`[csr-zero-stats]` gives entries before and after) |
+| `[csr-zero-prepare]` | all CSR preparation: zero pruning, key compaction, the compacted copy (`[csr-zero-stats]` gives entries before and after) |
+| `[csr-key-domain]` | marking the keys of both inputs and ranking the common ones (`[csr-key-stats] K=<K>-><K'> <result>`) |
 | `[1-slice-…]`, `[2-slice-…]` | building the slice structures of R (1) and S (2): `subrow-csr`, `subrow-csc`, `csc` (plus `-cumulative`) |
 | `[slice-prepare-total]` | both slice structures |
 | `[mm-select-total]` | cost model over all slice columns |

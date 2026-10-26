@@ -91,11 +91,14 @@ test-preparation:
 	mkdir -p $(TEST_BIN_DIR)
 	$(CXX) $(CPPFLAGS) $(TEST_CXXFLAGS) -Iinclude tests/csr_memory_test.cpp src/slice_decision.cpp $(LDFLAGS) -o $(TEST_BIN_DIR)/csr_memory_test
 	$(CXX) $(CPPFLAGS) $(TEST_CXXFLAGS) -Itests/stubs -Iinclude tests/preparation_dispatch_test.cpp src/slice_decision.cpp $(LDFLAGS) -o $(TEST_BIN_DIR)/preparation_dispatch_test
+	$(CXX) $(CPPFLAGS) $(TEST_CXXFLAGS) -Iinclude tests/key_compaction_test.cpp src/slice_decision.cpp $(LDFLAGS) -o $(TEST_BIN_DIR)/key_compaction_test
 	$(TEST_BIN_DIR)/csr_memory_test
 	$(TEST_BIN_DIR)/preparation_dispatch_test
+	$(TEST_BIN_DIR)/key_compaction_test
 	# A smaller OpenMP team than requested must still process every row.
 	OMP_THREAD_LIMIT=2 $(TEST_BIN_DIR)/csr_memory_test
 	OMP_THREAD_LIMIT=2 $(TEST_BIN_DIR)/preparation_dispatch_test
+	OMP_THREAD_LIMIT=2 $(TEST_BIN_DIR)/key_compaction_test
 
 # Timing-label parser of find_thresholds.py (standard library only).
 test-thresholds:

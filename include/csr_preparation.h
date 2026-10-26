@@ -1,7 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -49,8 +51,148 @@ csr_value_summary summarize_csr_values(
     return summary;
 }
 
-// Borrows the caller's CSR when it has no explicit zeros to remove, and only
-// then allocates a compact copy. The caller's arrays are never modified.
+// Join-key compaction. A key used by only one input matches nothing, so its
+// entries add no product. The keys used by both inputs ("common") are
+// renumbered by rank, the number of common keys below them: rank is monotone,
+// so compacted rows keep their sorted column order, and every kernel and MKL
+// backend then works on K' = |common| <= K keys.
+struct key_domain {
+    int input_keys = 0;  // K
+    int common_keys = 0; // K'
+    // Both inputs use exactly the common keys: compaction drops no entry.
+    bool same_key_sets = false;
+    std::vector<uint64_t> common; // bit k: key k is used by both inputs
+    std::vector<int> word_rank;   // common keys in the words before word w
+
+    bool contains(int key) const {
+        return (common[key >> 6] >> (key & 63)) & 1;
+    }
+    int rank(int key) const {
+        const uint64_t below =
+            common[key >> 6] & ((uint64_t(1) << (key & 63)) - 1);
+        return word_rank[key >> 6] + __builtin_popcountll(below);
+    }
+};
+
+// Bitmaps above this size (K above 512M keys) are not built; the inputs are
+// then used without key compaction.
+inline constexpr size_t KEY_BITMAP_BUDGET_BYTES = size_t(64) << 20;
+// Workers mark keys in private bitmaps while all of them together fit in this
+// budget (K below ~800K keys at 20 threads), and in one shared bitmap with
+// atomic ORs otherwise.
+inline constexpr size_t KEY_PRIVATE_BITMAPS_BUDGET_BYTES = size_t(16) << 20;
+
+// Sets bit k of `bits` for the key k of every entry that takes part (a
+// nonzero one when zeros are being removed). Returns false if a key is
+// outside [0, K); the caller reports it after the parallel regions.
+template <typename T>
+bool mark_keys(
+    const int *row_ptrs, const int *col_idxs, const T *vals, int rows, int K,
+    bool skip_zeros, std::vector<uint64_t> &bits, int threads,
+    size_t private_budget
+) {
+    const size_t words = bits.size();
+    int bad = 0;
+    if (words * sizeof(uint64_t) * threads <= private_budget) {
+        // Small K, typically many entries per key: private bitmaps avoid any
+        // contention; one OR pass over threads * K / 64 words merges them.
+        std::vector<int> ranges;
+        compute_thread_row_ranges(row_ptrs, rows, threads, ranges);
+        std::vector<uint64_t> local(words * threads, 0);
+        // One iteration per range, so a smaller OpenMP team still covers all.
+#pragma omp parallel for num_threads(threads) schedule(static)                 \
+    reduction(| : bad)
+        for (int t = 0; t < threads; ++t) {
+            uint64_t *mine = local.data() + words * t;
+            for (int i = row_ptrs[ranges[t]]; i < row_ptrs[ranges[t + 1]];
+                 ++i) {
+                const int key = col_idxs[i];
+                if (key < 0 || key >= K) {
+                    bad = 1;
+                    continue;
+                }
+                if (skip_zeros && vals[i] == T(0)) continue;
+                mine[key >> 6] |= uint64_t(1) << (key & 63);
+            }
+        }
+#pragma omp parallel for num_threads(threads) schedule(static)
+        for (size_t w = 0; w < words; ++w) {
+            uint64_t merged = 0;
+            for (int t = 0; t < threads; ++t) merged |= local[words * t + w];
+            bits[w] = merged;
+        }
+    } else {
+        // Wide K, few entries per key: shared bitmap. Testing the bit first
+        // keeps repeated keys at a plain load instead of an atomic RMW.
+#pragma omp parallel for num_threads(threads) schedule(dynamic, 256)           \
+    reduction(| : bad)
+        for (int row = 0; row < rows; ++row) {
+            for (int i = row_ptrs[row]; i < row_ptrs[row + 1]; ++i) {
+                const int key = col_idxs[i];
+                if (key < 0 || key >= K) {
+                    bad = 1;
+                    continue;
+                }
+                if (skip_zeros && vals[i] == T(0)) continue;
+                const uint64_t bit = uint64_t(1) << (key & 63);
+                std::atomic_ref<uint64_t> word(bits[key >> 6]);
+                if (!(word.load(std::memory_order_relaxed) & bit))
+                    word.fetch_or(bit, std::memory_order_relaxed);
+            }
+        }
+    }
+    return !bad;
+}
+
+// Builds the common key set of R (rows x K) and S (rows x K). Returns false,
+// leaving `domain` empty, if the bitmaps would exceed `bitmap_budget`.
+// Throws std::invalid_argument for a column index outside [0, K).
+template <typename T>
+bool build_key_domain(
+    key_domain &domain, const int *Ri, const int *Rj, const T *Rv, int M,
+    const int *Si, const int *Sj, const T *Sv, int N, int K, bool skip_zeros,
+    int threads, size_t bitmap_budget = KEY_BITMAP_BUDGET_BYTES,
+    size_t private_budget = KEY_PRIVATE_BITMAPS_BUDGET_BYTES
+) {
+    const size_t words = (static_cast<size_t>(K) + 63) / 64;
+    if (words * sizeof(uint64_t) > bitmap_budget) return false;
+    std::vector<uint64_t> r_keys(words, 0), s_keys(words, 0);
+    const bool valid =
+        mark_keys(
+            Ri, Rj, Rv, M, K, skip_zeros, r_keys, threads, private_budget
+        ) &&
+        mark_keys(
+            Si, Sj, Sv, N, K, skip_zeros, s_keys, threads, private_budget
+        );
+    if (!valid) {
+        throw std::invalid_argument("SPALM CSR column index out of [0, K)");
+    }
+    domain.input_keys = K;
+    domain.common.resize(words);
+    domain.word_rank.resize(words);
+    int different = 0;
+#pragma omp parallel for num_threads(threads) schedule(static)                 \
+    reduction(| : different)
+    for (size_t w = 0; w < words; ++w) {
+        domain.common[w] = r_keys[w] & s_keys[w];
+        domain.word_rank[w] = __builtin_popcountll(domain.common[w]);
+        different |= r_keys[w] != s_keys[w];
+    }
+    int common = 0;
+    for (size_t w = 0; w < words; ++w) {
+        const int count = domain.word_rank[w];
+        domain.word_rank[w] = common;
+        common += count;
+    }
+    domain.common_keys = common;
+    domain.same_key_sets = !different;
+    return true;
+}
+
+// Borrows the caller's CSR when there are no explicit zeros to remove and no
+// key compaction, and only then allocates a compact copy: entries are kept if
+// nonzero (when pruning) and, with `keys`, if their key is common, which is
+// then renumbered to its rank. The caller's arrays are never modified.
 template <typename T> struct prepared_csr {
     csr<T> matrix{};
     std::unique_ptr<int[]> rows, columns;
@@ -58,10 +200,17 @@ template <typename T> struct prepared_csr {
 
     void initialize(
         int *row_ptrs, int *col_idxs, T *vals, int row_count, int col_count,
-        const csr_value_summary &summary, bool prune_zeros, int threads
+        const csr_value_summary &summary, bool prune_zeros, int threads,
+        const key_domain *keys = nullptr
     ) {
         matrix = {row_ptrs, col_idxs, vals, row_count, col_count};
-        if (!prune_zeros || summary.nonzero == summary.stored) return;
+        const bool drop_zeros =
+            prune_zeros && summary.nonzero != summary.stored;
+        if (!drop_zeros && !keys) return;
+        auto keep = [&](int i) {
+            return (!drop_zeros || vals[i] != T(0)) &&
+                   (!keys || keys->contains(col_idxs[i]));
+        };
         rows = std::make_unique_for_overwrite<int[]>(
             static_cast<size_t>(row_count) + 1
         );
@@ -70,23 +219,25 @@ template <typename T> struct prepared_csr {
         for (int row = 0; row < row_count; ++row) {
             int count = 0;
             for (int i = row_ptrs[row]; i < row_ptrs[row + 1]; ++i)
-                count += vals[i] != T(0);
+                count += keep(i);
             rows[row + 1] = count;
         }
         for (int row = 0; row < row_count; ++row) rows[row + 1] += rows[row];
-        columns = std::make_unique_for_overwrite<int[]>(summary.nonzero);
-        values = std::make_unique_for_overwrite<T[]>(summary.nonzero);
+        const int entries = rows[row_count];
+        columns = std::make_unique_for_overwrite<int[]>(entries);
+        values = std::make_unique_for_overwrite<T[]>(entries);
 #pragma omp parallel for num_threads(threads)
         for (int row = 0; row < row_count; ++row) {
             int out = rows[row];
             for (int i = row_ptrs[row]; i < row_ptrs[row + 1]; ++i) {
-                if (vals[i] == T(0)) continue;
-                columns[out] = col_idxs[i];
+                if (!keep(i)) continue;
+                columns[out] = keys ? keys->rank(col_idxs[i]) : col_idxs[i];
                 values[out++] = vals[i];
             }
         }
         matrix = {
-            rows.get(), columns.get(), values.get(), row_count, col_count
+            rows.get(), columns.get(), values.get(), row_count,
+            keys ? keys->common_keys : col_count
         };
     }
 };

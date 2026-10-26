@@ -14,7 +14,7 @@ void sparse_sparse_matmul(
     ss_matrix<T> &, ss_matrix<T> &, T *, bool, int, bool = false
 );
 
-static int backend_calls, seen_r_nnz, seen_s_nnz;
+static int backend_calls, seen_r_nnz, seen_s_nnz, seen_k;
 static void *seen_r_values;
 static void scalar_baseline(
     int, const char *, int *, int *, void *, void *, int *, int *, void *,
@@ -52,6 +52,7 @@ template <class T>
 void dense_dense_matmul(
     ss_matrix<T> &r, ss_matrix<T> &s, int, int, T *output, bool, int
 ) {
+    seen_k = r.csr_mat.cols;
     const auto begin = std::chrono::steady_clock::now();
     scalar_csr(
         r.csr_mat.row_ptrs, r.csr_mat.col_idxs, r.csr_mat.vals,
@@ -69,6 +70,7 @@ template <class T>
 void sparse_sparse_matmul(
     ss_matrix<T> &r, ss_matrix<T> &s, T *output, bool, int, bool
 ) {
+    seen_k = r.csr_mat.cols;
     const auto begin = std::chrono::steady_clock::now();
     scalar_csr(
         r.csr_mat.row_ptrs, r.csr_mat.col_idxs, r.csr_mat.vals,
@@ -87,6 +89,7 @@ void baseline_typed(
     const char *method, int *ri, int *rj, void *rv, void *rd, int *si, int *sj,
     void *sv, void *sd, void *output, int m, int k, int n
 ) {
+    seen_k = k;
     if (std::strcmp(method, "MKL sparse-sparse") == 0) {
         scalar_csr(
             ri, rj, static_cast<T *>(rv), si, sj, static_cast<T *>(sv),
@@ -132,6 +135,9 @@ template <class T> void check_dispatch() {
         auto *old = std::cout.rdbuf(log.rdbuf());
         cpu_execution_options options;
         options.prune_zeros = prune;
+        // These checks are about zero pruning; key compaction is tested in
+        // check_key_compaction.
+        options.compact_keys = false;
         const int status = spalm_matmul(
             type, ri, rj, rv, si, sj, sv, m, k, n, 64, 32, 48, false, output,
             nullptr, nullptr, static_cast<T *>(nullptr), 4, options
@@ -243,6 +249,84 @@ template <class T> void check_dispatch() {
 // End to end through the exported C API: option parsing, forced modes without
 // a thresholds file, malformed input and status codes. Runs from the
 // repository root, where parameters/cpu/*/tile_sizes.txt is found.
+// Keys used by one side only are dropped and the common keys renumbered, for
+// every backend; results equal the uncompacted product.
+template <class T> void check_key_compaction() {
+    constexpr int type = sizeof(T) == sizeof(float) ? 0 : 1;
+    const int K = 1000;
+    // Common keys {3, 5, 64, 500, 999}; 700 (R) and 900 (S) match nothing.
+    int ri[] = {0, 4, 6, 7}, rj[] = {3, 64, 500, 999, 64, 700, 5};
+    T rv[] = {1, 2, 3, 4, 5, 6, 7};
+    int si[] = {0, 3, 6}, sj[] = {3, 64, 900, 5, 500, 999};
+    T sv[] = {8, 9, 10, 11, 12, 13};
+    T reference[6] = {};
+    for (int r = 0; r < 3; ++r)
+        for (int s = 0; s < 2; ++s)
+            for (int p = ri[r]; p < ri[r + 1]; ++p)
+                for (int q = si[s]; q < si[s + 1]; ++q)
+                    if (rj[p] == sj[q]) reference[r * 2 + s] += rv[p] * sv[q];
+    auto run = [&](bool compact, int *s_cols) {
+        T output[6] = {};
+        backend_calls = 0;
+        seen_k = -1;
+        cpu_execution_options options;
+        options.compact_keys = compact;
+        std::ostringstream log;
+        auto *old = std::cout.rdbuf(log.rdbuf());
+        const int status = spalm_matmul(
+            type, ri, rj, rv, si, s_cols, sv, 3, K, 2, 64, 32, 48, false,
+            output, nullptr, nullptr, static_cast<T *>(nullptr), 4, options
+        );
+        std::cout.rdbuf(old);
+        assert(status == SPALM_OK);
+        for (int i = 0; i < 6; ++i)
+            assert(output[i] == (s_cols == sj ? reference[i] : T(0)));
+        return log.str();
+    };
+    for (int mode = 0; mode < 4; ++mode) {
+        assert(init_decision_thresholds(
+            mode == 1 ? "dense_bm_inner_kernel" : "sparse", type, "cpu"
+        ));
+        force_mkl_dense = mode == 2;
+        force_mkl_sparse = mode == 3;
+        auto log = run(true, sj);
+        assert(backend_calls == 1 && seen_k == 5);
+        assert(seen_r_nnz == 6 && seen_s_nnz == 5);
+        assert(
+            log.find("[csr-key-stats] K=1000->5 compacted") != std::string::npos
+        );
+        run(false, sj);
+        assert(backend_calls == 1 && seen_k == K && seen_r_nnz == 7);
+    }
+    // No common key: nothing reaches a backend.
+    int disjoint[] = {1, 2, 4, 6, 7, 8};
+    assert(init_decision_thresholds("sparse", type, "cpu"));
+    auto log = run(true, disjoint);
+    assert(backend_calls == 0);
+    assert(
+        log.find("[backend] zero-work (no common keys)") != std::string::npos
+    );
+    // Every key used by both sides: the caller's arrays are borrowed.
+    int same_r[] = {0, 1, 2, 3}, same_rj[] = {0, 1, 1};
+    int same_s[] = {0, 2, 2}, same_sj[] = {0, 1};
+    T same_out[6] = {};
+    backend_calls = 0;
+    std::ostringstream quiet;
+    auto *old = std::cout.rdbuf(quiet.rdbuf());
+    assert(
+        spalm_matmul(
+            type, same_r, same_rj, rv, same_s, same_sj, sv, 3, 2, 2, 64, 32, 48,
+            false, same_out, nullptr, nullptr, static_cast<T *>(nullptr), 4,
+            cpu_execution_options{}
+        ) == SPALM_OK
+    );
+    std::cout.rdbuf(old);
+    assert(backend_calls == 1 && seen_k == 2 && seen_r_values == rv);
+    assert(
+        quiet.str().find("unchanged (all keys common)") != std::string::npos
+    );
+}
+
 template <class T> void check_c_api() {
     constexpr int type = sizeof(T) == sizeof(float) ? 0 : 1;
     int ri[] = {0, 3, 4}, rj[] = {0, 2, 3, 1};
@@ -286,6 +370,11 @@ template <class T> void check_c_api() {
     backend_calls = 0;
     assert(call("sparse", "1", unsorted, output) == SPALM_INVALID_ARGUMENT);
     assert(backend_calls == 0);
+    // A column index >= K is rejected while building the key domain.
+    int out_of_range[] = {0, 2, 3, 7};
+    backend_calls = 0;
+    assert(call("sparse", "1", out_of_range, output) == SPALM_INVALID_ARGUMENT);
+    assert(backend_calls == 0);
     // Unknown bucket method and an invalid option are rejected up front.
     const char *keys[] = {"init_method", "bucket_method"};
     const char *vals[] = {"sparse", "bogus"};
@@ -301,6 +390,8 @@ template <class T> void check_c_api() {
 int main() {
     check_dispatch<float>();
     check_dispatch<double>();
+    check_key_compaction<float>();
+    check_key_compaction<double>();
     check_c_api<float>();
     check_c_api<double>();
     std::cout

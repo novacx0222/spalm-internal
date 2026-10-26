@@ -128,11 +128,13 @@ int run_mkl_backend(
 template <typename T>
 int spalm_matmul(
     const int type, int *Ri, int *Rj, T *Rv, int *Si, int *Sj, T *Sv,
-    const int M, const int K, const int N, const int slice_length,
+    const int M, const int K_input, const int N, const int slice_length,
     const int tile_size_l2, const int tile_size_l3, bool sparse_result, T *ret,
     int *reti, int *retj, T *retv, const int threads,
     const cpu_execution_options &options
 ) {
+    // The join dimension every later stage uses; key compaction shrinks it.
+    int K = K_input;
     // An empty dimension, or no stored entry on a side, contributes nothing:
     // no CSR copies, slices, packing buffers or MKL call are needed.
     if (M == 0 || N == 0 || K == 0 || Ri[M] == 0 || Si[N] == 0) {
@@ -158,15 +160,63 @@ int spalm_matmul(
         );
         return SPALM_OK;
     }
+    // Join keys used by only one input match nothing: drop their entries and
+    // renumber the common keys densely (key_domain), in the same copy as the
+    // zero pruning. Skipped when every key is common, or when no entry would
+    // be dropped and the number of slice columns would stay the same.
+    key_domain keys;
+    const char *key_result = "disabled";
+    bool compact = false;
+    if (options.compact_keys) {
+        const auto domain_begin = std::chrono::high_resolution_clock::now();
+        const bool built = build_key_domain(
+            keys, Ri, Rj, Rv, M, Si, Sj, Sv, N, K, remove_zeros, threads
+        );
+        print_time(
+            "[csr-key-domain]",
+            std::chrono::high_resolution_clock::now() - domain_begin
+        );
+        if (!built) {
+            key_result = "skipped (bitmap budget)";
+        } else if (keys.common_keys == 0) {
+            std::cout << "[csr-key-stats] K=" << K << "->0 no common keys"
+                      << std::endl;
+            std::cout << "[backend] zero-work (no common keys)" << std::endl;
+            print_time(
+                "[csr-zero-prepare]",
+                std::chrono::high_resolution_clock::now() - prepare_begin
+            );
+            return SPALM_OK;
+        } else if (keys.common_keys == K) {
+            key_result = "unchanged (all keys common)";
+        } else if (
+            keys.same_key_sets && div_ceil(keys.common_keys, slice_length) ==
+                                      div_ceil(K, slice_length)
+        ) {
+            key_result = "unchanged (nothing to drop, same slice columns)";
+        } else {
+            key_result = "compacted";
+            compact = true;
+        }
+    }
     prepared_csr<T> r_input, s_input;
-    r_input.initialize(Ri, Rj, Rv, M, K, r_summary, remove_zeros, threads);
-    s_input.initialize(Si, Sj, Sv, N, K, s_summary, remove_zeros, threads);
+    r_input.initialize(
+        Ri, Rj, Rv, M, K, r_summary, remove_zeros, threads,
+        compact ? &keys : nullptr
+    );
+    s_input.initialize(
+        Si, Sj, Sv, N, K, s_summary, remove_zeros, threads,
+        compact ? &keys : nullptr
+    );
     Ri = r_input.matrix.row_ptrs;
     Rj = r_input.matrix.col_idxs;
     Rv = r_input.matrix.vals;
     Si = s_input.matrix.row_ptrs;
     Sj = s_input.matrix.col_idxs;
     Sv = s_input.matrix.vals;
+    K = r_input.matrix.cols;
+    std::cout << "[csr-key-stats] K=" << K_input << "->" << K << " "
+              << key_result << std::endl;
     std::cout << "[csr-zero-stats] R=" << r_summary.stored << "->" << Ri[M]
               << " S=" << s_summary.stored << "->" << Si[N] << std::endl;
     print_time(
@@ -397,6 +447,7 @@ static int spalm_impl(
     if (threads < 1) return invalid("threads must be at least 1");
     cpu_execution_options options;
     options.prune_zeros = get_int("prune_zeros", 1) != 0;
+    options.compact_keys = get_int("compact_keys", 1) != 0;
 
     std::cout << "SPALM MATMUL" << std::endl;
     std::cout << M << " " << K << " " << N << std::endl;
