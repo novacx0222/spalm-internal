@@ -2,6 +2,7 @@
 #define UTIL
 
 #include <chrono>
+#include <cstdio>
 #include <iomanip>
 #include <iostream>
 #include <vector>
@@ -25,18 +26,18 @@ void coo2dense(
     }
 }
 
+// Prints "<label> <milliseconds> ms" (labels are "[stage-name]", parsed by
+// find_thresholds.py and the experiment scripts) and returns seconds. Any
+// duration type is accepted; six decimals keep sub-microsecond resolution.
+template <class Rep, class Period>
 inline float print_time(
-    std::string msg,
-    std::chrono::duration<long int, std::ratio<1, 1000000000>> time,
+    const std::string &label, std::chrono::duration<Rep, Period> elapsed,
     bool print = true
 ) {
-    auto casted_time =
-        std::chrono::duration_cast<std::chrono::microseconds>(time);
-    if (print) {
-        std::cout << msg << (float) casted_time.count() / 1000000 << "s"
-                  << std::endl;
-    }
-    return (float) casted_time.count() / 1000000;
+    const double ms =
+        std::chrono::duration<double, std::milli>(elapsed).count();
+    if (print) std::printf("%s %.6f ms\n", label.c_str(), ms);
+    return static_cast<float>(ms / 1000.0);
 }
 
 inline int div_ceil(const int N, const int D) { return (N + D - 1) / D; }

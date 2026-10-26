@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "cpu/dense_dense_matmul.h"
+#include "method_dispatch.h"
 #include "mkl.h"
 #include "slice_decision.h"
 #include "cpu/sparse_sparse_matmul.h"
@@ -55,6 +56,68 @@ static run_baseline_fn load_run_baseline() {
     return fn;
 }
 
+// Runs the whole multiplication with an MKL backend (forced or fallback).
+template <typename T>
+int run_mkl_backend(
+    spalm_dispatch::Backend backend, int type, int *Ri, int *Rj, T *Rv, int *Si,
+    int *Sj, T *Sv, int M, int K, int N, T *ret, int threads
+) {
+    const run_baseline_fn baseline = load_run_baseline();
+    if (!baseline) return SPALM_BASELINE_ERROR;
+    if (backend == spalm_dispatch::Backend::MklDense) {
+        std::cout << "Fallback: MKL dense-dense" << std::endl;
+        auto start = std::chrono::high_resolution_clock::now();
+        // Implicit zeros require zero-initialized dense inputs; size_t:
+        // M * K and N * K overflow int for large matrices.
+        auto R = std::make_unique<T[]>((size_t) M * K);
+        auto S = std::make_unique<T[]>((size_t) N * K);
+        auto end = std::chrono::high_resolution_clock::now();
+        print_time("[mkl-dense-input-allocate]", end - start);
+        start = end;
+#pragma omp parallel for num_threads(threads)
+        for (int i = 0; i < M; ++i) {
+            for (int p = Ri[i]; p < Ri[i + 1]; ++p)
+                R[(size_t) i * K + Rj[p]] = Rv[p];
+        }
+#pragma omp parallel for num_threads(threads)
+        for (int i = 0; i < N; ++i) {
+            for (int p = Si[i]; p < Si[i + 1]; ++p)
+                S[(size_t) i * K + Sj[p]] = Sv[p];
+        }
+        end = std::chrono::high_resolution_clock::now();
+        print_time("[mkl-dense-input-fill]", end - start);
+        start = end;
+        baseline(
+            type, "MKL dense-dense", Ri, Rj, (void *) Rv, (void *) R.get(), Si,
+            Sj, (void *) Sv, (void *) S.get(), (void *) ret, M, K, N, threads
+        );
+        end = std::chrono::high_resolution_clock::now();
+        print_time("[mkl-call-total]", end - start);
+        const auto release_begin = end;
+        mkl_free_buffers();
+        R.reset();
+        S.reset();
+        print_time(
+            "[mkl-dense-input-deallocate]",
+            std::chrono::high_resolution_clock::now() - release_begin
+        );
+    } else {
+        std::cout << "Fallback: MKL sparse-sparse" << std::endl;
+        const auto start = std::chrono::high_resolution_clock::now();
+        baseline(
+            type, "MKL sparse-sparse", Ri, Rj, (void *) Rv, nullptr, Si, Sj,
+            (void *) Sv, nullptr, (void *) ret, M, K, N, threads
+        );
+        print_time(
+            "[mkl-call-total]",
+            std::chrono::high_resolution_clock::now() - start
+        );
+    }
+    return SPALM_OK;
+}
+
+// Accumulates R * S^T into the caller's zero-initialized ret. Early exits
+// for zero work leave ret untouched.
 template <typename T>
 int spalm_matmul(
     const int type, int *Ri, int *Rj, T *Rv, int *Si, int *Sj, T *Sv,
@@ -62,6 +125,33 @@ int spalm_matmul(
     const int tile_size_l2, const int tile_size_l3, bool sparse_result, T *ret,
     int *reti, int *retj, T *retv, const int threads
 ) {
+    // An empty dimension, or no stored entry on a side, contributes nothing:
+    // no CSR copies, slices, packing buffers or MKL call are needed.
+    if (M == 0 || N == 0 || K == 0 || Ri[M] == 0 || Si[N] == 0) {
+        std::cout << "[backend] zero-work (empty input)" << std::endl;
+        return SPALM_OK;
+    }
+    // Forced MKL backends need no slices or cost estimate.
+    const auto forced_backend = spalm_dispatch::select(
+        force_mkl_dense, force_mkl_sparse, false, false, false
+    );
+    if (forced_backend != spalm_dispatch::Backend::Internal) {
+        std::cout << "[backend] "
+                  << (forced_backend == spalm_dispatch::Backend::MklDense
+                          ? "mkl-dense"
+                          : "mkl-sparse")
+                  << " (forced)" << std::endl;
+        const auto start = std::chrono::high_resolution_clock::now();
+        const int status = run_mkl_backend(
+            forced_backend, type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, ret, threads
+        );
+        print_time(
+            "[forced-backend-total]",
+            std::chrono::high_resolution_clock::now() - start
+        );
+        return status;
+    }
+
     // type is validated by spalm(): 0 = float, 1 = double.
     const int R_ik_slice_height = 12;
     const int S_ik_slice_height = type == 0 ? 32 : 16;
@@ -73,14 +163,14 @@ int spalm_matmul(
         total_start, e2e_start;
     e2e_start = std::chrono::high_resolution_clock::now();
     csr_to_ss_matrix(
-        Ri, Rj, Rv, M, K, slice_length, R_ik_slice_height, R_ssm, threads
+        Ri, Rj, Rv, M, K, slice_length, R_ik_slice_height, R_ssm, threads, 1
     );
     csr_to_ss_matrix(
-        Si, Sj, Sv, N, K, slice_length, S_ik_slice_height, S_ssm, threads
+        Si, Sj, Sv, N, K, slice_length, S_ik_slice_height, S_ssm, threads, 2
     );
 
     end = std::chrono::high_resolution_clock::now();
-    print_time("Total ss_matrix init time: ", end - e2e_start);
+    print_time("[slice-prepare-total]", end - e2e_start);
 
     total_start = std::chrono::high_resolution_clock::now();
 
@@ -113,7 +203,7 @@ int spalm_matmul(
     std::cout << "SPARSE-DENSE MM cost: " << sparse_dense_mm_cost << std::endl;
     std::cout << "DENSE-SPARSE MM cost: " << dense_sparse_mm_cost << std::endl;
     std::cout << "DENSE-DENSE MM cost: " << dense_dense_mm_cost << std::endl;
-    print_time("MM check time: ", end - total_start);
+    print_time("[mm-select-total]", end - total_start);
 
     if (total_dense_mm_cost) {
         do_dense_mm = true;
@@ -139,62 +229,24 @@ int spalm_matmul(
         fallback = false;
     }
 
-    if (total_dense_mm_cost > (unsigned long long) M * K * N * 0.8 &&
-        fallback) {
-        // Fallback to mkl
-        std::cout << "Fallback: MKL dense-dense" << std::endl;
-        start = std::chrono::high_resolution_clock::now();
-        // size_t: M * K and N * K overflow int for large matrices.
-        auto R = std::make_unique<T[]>((size_t) M * K);
-        auto S = std::make_unique<T[]>((size_t) N * K);
-        end = std::chrono::high_resolution_clock::now();
-        print_time("Mem allocation time for MKL: ", end - start);
-
-        start = std::chrono::high_resolution_clock::now();
-#pragma omp parallel for num_threads(threads)
-        for (int i = 0; i < M; i++) {
-            for (int k = Ri[i]; k < Ri[i + 1]; k++) {
-                R[(size_t) i * K + Rj[k]] = Rv[k];
-            }
-        }
-
-#pragma omp parallel for num_threads(threads)
-        for (int i = 0; i < N; i++) {
-            for (int k = Si[i]; k < Si[i + 1]; k++) {
-                S[(size_t) i * K + Sj[k]] = Sv[k];
-            }
-        }
-
-        const run_baseline_fn run_baseline = load_run_baseline();
-        if (!run_baseline) return SPALM_BASELINE_ERROR;
-
-        end = std::chrono::high_resolution_clock::now();
-        print_time("Matrix initialization for MKL: ", end - start);
-
-        start = std::chrono::high_resolution_clock::now();
-        /*
-    cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0,
-                (double*)R, K, (double*)S, K, 1.0, (double*)ret, N);
-    */
-        run_baseline(
-            type, "MKL dense-dense", Ri, Rj, (void *) Rv, (void *) R.get(), Si,
-            Sj, (void *) Sv, (void *) S.get(), (void *) ret, M, K, N, threads
+    int status = SPALM_OK;
+    const auto backend = spalm_dispatch::select(
+        force_mkl_dense, force_mkl_sparse, fallback,
+        total_dense_mm_cost > (unsigned long long) M * K * N * 0.8,
+        do_sparse_mm && !do_dense_mm
+    );
+    if (backend != spalm_dispatch::Backend::Internal) {
+        std::cout << "[backend] "
+                  << (backend == spalm_dispatch::Backend::MklDense
+                          ? "mkl-dense"
+                          : "mkl-sparse")
+                  << " (fallback)" << std::endl;
+        status = run_mkl_backend(
+            backend, type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, ret, threads
         );
-        end = std::chrono::high_resolution_clock::now();
-        print_time("Fallback MM: ", end - start);
-        mkl_free_buffers();
-    } else if (do_sparse_mm && !do_dense_mm && fallback) {
-        std::cout << "Fallback: MKL sparse-sparse" << std::endl;
-        const run_baseline_fn run_baseline = load_run_baseline();
-        if (!run_baseline) return SPALM_BASELINE_ERROR;
-        start = std::chrono::high_resolution_clock::now();
-        run_baseline(
-            type, "MKL sparse-sparse", Ri, Rj, (void *) Rv, NULL, Si, Sj,
-            (void *) Sv, NULL, (void *) ret, M, K, N, threads
-        );
-        end = std::chrono::high_resolution_clock::now();
-        print_time("Fallback MM: ", end - start);
     } else {
+        std::cout << "[backend] spalm-internal sparse=" << do_sparse_mm
+                  << " dense=" << do_dense_mm << std::endl;
         std::cout << std::endl;
         if (do_sparse_mm) {
             sparse_sparse_matmul(
@@ -212,14 +264,28 @@ int spalm_matmul(
 
     end = std::chrono::high_resolution_clock::now();
     std::cout << std::endl;
-    print_time("Total MM time: ", end - total_start);
-    print_time("E2E MM time: ", end - e2e_start);
-    return SPALM_OK;
+    print_time("[mm-total]", end - total_start);
+    print_time("[slice-mm-total]", end - e2e_start);
+    const auto release_begin = std::chrono::high_resolution_clock::now();
+    R_ssm = ss_matrix<T>{};
+    S_ssm = ss_matrix<T>{};
+    print_time(
+        "[slice-deallocate]",
+        std::chrono::high_resolution_clock::now() - release_begin
+    );
+    return status;
 }
 
 // Frees the process-global decision arrays on every exit path.
 struct bucket_info_guard {
-    ~bucket_info_guard() { free_bucket_info(); }
+    ~bucket_info_guard() {
+        const auto begin = std::chrono::high_resolution_clock::now();
+        free_bucket_info();
+        print_time(
+            "[thresholds-deallocate]",
+            std::chrono::high_resolution_clock::now() - begin
+        );
+    }
 };
 
 static int spalm_impl(
@@ -228,6 +294,7 @@ static int spalm_impl(
     int *reti, int *retj, void *retv, int n, const char **keys,
     const char **vals
 ) {
+    const auto initialize_begin = std::chrono::high_resolution_clock::now();
     auto invalid = [](const char *what) {
         std::cerr << "spalm: " << what << std::endl;
         return SPALM_INVALID_ARGUMENT;
@@ -314,6 +381,10 @@ static int spalm_impl(
         std::cout << "Writing to dense result" << std::endl;
     }
     std::cout << std::endl;
+    print_time(
+        "[library-initialize]",
+        std::chrono::high_resolution_clock::now() - initialize_begin
+    );
 
     if (type == 0) {
         return spalm_matmul(
@@ -346,10 +417,16 @@ extern "C" int spalm(
     // OpenMP regions still terminate the process; this covers the rest
     // (e.g. std::bad_alloc from the slice or MKL input allocations).
     try {
-        return spalm_impl(
+        const auto begin = std::chrono::high_resolution_clock::now();
+        const int status = spalm_impl(
             type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, sparse_result, ret, reti,
             retj, retv, n, keys, vals
         );
+        // Everything inside the library, after the call lock is taken.
+        print_time(
+            "[spalm-total]", std::chrono::high_resolution_clock::now() - begin
+        );
+        return status;
     } catch (const std::exception &e) {
         std::cerr << "spalm: " << e.what() << std::endl;
     } catch (...) {

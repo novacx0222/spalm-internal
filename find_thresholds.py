@@ -32,13 +32,23 @@ from scipy.sparse import random as sparse_random, csr_matrix
 from sklearn.isotonic import IsotonicRegression
 from wurlitzer import STDOUT, pipes
 
+from spalm_timing import DENSE_MM_LABEL, SPARSE_MM_LABEL, parse_time
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 SPALM_BIN = SCRIPT_DIR / "bin"
 
 
 def load_so(lib_name):
     """Load a .so from this package's bin/ (e.g. spalm.so)."""
-    return ctypes.CDLL(str(SPALM_BIN / lib_name))
+    lib = ctypes.CDLL(str(SPALM_BIN / lib_name))
+    if hasattr(lib, "spalm"):
+        # spalm() returns a status code: 0 on success.
+        lib.spalm.restype = ctypes.c_int
+    return lib
+
+
+class BenchmarkError(RuntimeError):
+    """A calibration run failed; no thresholds may be derived from it."""
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +104,7 @@ def call_spalm(lib, A_csr, B_csr, C, init_method, dtype, slice_length,
 
     out = StringIO()
     with pipes(stdout=out, stderr=STDOUT):
-        func(
+        status = func(
             type_num,
             A_csr.indptr.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
             A_csr.indices.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
@@ -108,47 +118,24 @@ def call_spalm(lib, A_csr, B_csr, C, init_method, dtype, slice_length,
             None, None, None,
             n, keys_arr, vals_arr,
         )
-    return out.getvalue()
+    text = out.getvalue()
+    if status != 0:
+        raise BenchmarkError(
+            f"{init_method}: spalm() returned status {status}\n"
+            f"--- native output ---\n{text.strip()}\n--- end ---")
+    return text
 
 
 # ---------------------------------------------------------------------------
 # Timing parsers
 # ---------------------------------------------------------------------------
 
-def parse_time(text, label):
-    """Extract the first timing value (seconds) from a line containing label."""
-    for line in text.split("\n"):
-        if label in line:
-            m = re.search(r"([\d.]+(?:e[+-]?\d+)?)s", line)
-            if m:
-                return float(m.group(1))
-    return None
-
-
-SPARSE_LABELS = [
-    "Sparse MM time:",
-    "SPGEMM sparse-sparse SHM kernel time:",
-    "SPGEMM sparse-sparse warp kernel time:",
-]
-DENSE_LABELS = [
-    "Dense MM time:",
-]
-
-
 def parse_sparse_time(text):
-    for label in SPARSE_LABELS:
-        t = parse_time(text, label)
-        if t is not None:
-            return t
-    return None
+    return parse_time(text, SPARSE_MM_LABEL)
 
 
 def parse_dense_time(text):
-    for label in DENSE_LABELS:
-        t = parse_time(text, label)
-        if t is not None:
-            return t
-    return None
+    return parse_time(text, DENSE_MM_LABEL)
 
 
 # ---------------------------------------------------------------------------
@@ -157,16 +144,29 @@ def parse_dense_time(text):
 
 def benchmark(call_fn, A_csr, B_csr, C, init_method, warmup, trials,
               parse_fn):
-    """Run warmup + trials, return best kernel time."""
+    """Run warmup + trials, return the median kernel time.
+
+    Every run, including warmups, must report exactly one valid kernel timing
+    and must not fall back to MKL; otherwise BenchmarkError is raised with the
+    native output (missing timings usually mean a stale bin/spalm.so or an
+    initialization error), instead of silently scoring the method as inf.
+    """
     results = []
     for t in range(warmup + trials):
         out = call_fn(A_csr=A_csr, B_csr=B_csr, C=C, init_method=init_method)
-        val = parse_fn(out)
-        if val is not None and t >= warmup:
+        try:
+            if re.search(r"(?m)^\s*Fallback:", out):
+                raise ValueError("unexpected MKL fallback in a forced internal mode")
+            val = parse_fn(out)
+            if val is None:
+                raise ValueError(f"no timing found by {parse_fn.__name__}")
+        except ValueError as exc:
+            raise BenchmarkError(
+                f"{init_method}: run {t + 1}/{warmup + trials}: {exc}\n"
+                f"--- native output ---\n{out.strip()}\n--- end ---") from exc
+        if t >= warmup:
             results.append(val)
-    if results:
-        return float(np.median(results))
-    return np.inf
+    return float(np.median(results))
 
 
 def interpolate_thresholds(sampled, num_buckets):

@@ -28,6 +28,9 @@ extern int left_dense_threshold;
 extern unsigned long long dense_mm_threshold;
 extern bool fallback;
 extern bool no_features;
+// Set by the FORCE_MKL_DENSE / FORCE_MKL_SPARSE init methods.
+extern bool force_mkl_dense;
+extern bool force_mkl_sparse;
 inline constexpr int DEFAULT_BUCKET_LOG_CURVATURE = 50;
 inline bool use_log_buckets = false;
 // ~10% of buckets fall below 1% density

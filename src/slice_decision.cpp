@@ -11,6 +11,8 @@ int left_dense_threshold;
 unsigned long long dense_mm_threshold;
 bool fallback = true;
 bool no_features = false;
+bool force_mkl_dense = false;
+bool force_mkl_sparse = false;
 
 int get_total_sparse_buckets() { return ss_upper[0]; }
 
@@ -38,8 +40,28 @@ bool init_decision_thresholds(
     const char *thres_exec_method, const int type, const char *platform
 ) {
     // Reset before the early-return modes too; otherwise a previous
-    // "no_features" call leaks into a later forced-method call.
+    // "no_features" or forced-MKL call leaks into a later call.
     no_features = false;
+    force_mkl_dense = false;
+    force_mkl_sparse = false;
+    // Forced MKL backends skip slicing and the cost model, so they need no
+    // calibrated thresholds; the arrays are only filled to stay well defined.
+    const bool force_dense = strcmp(thres_exec_method, "FORCE_MKL_DENSE") == 0;
+    if (force_dense || strcmp(thres_exec_method, "FORCE_MKL_SPARSE") == 0) {
+        init_arrays(DEFAULT_NUM_BUCKETS);
+        std::fill(
+            ss_upper.get(), ss_upper.get() + num_buckets + 1, (uint8_t) 0
+        );
+        std::fill(
+            ri_upper.get(), ri_upper.get() + num_buckets + 1, (uint8_t) 0
+        );
+        left_dense_threshold = 0;
+        dense_mm_threshold = 0;
+        fallback = true;
+        force_mkl_dense = force_dense;
+        force_mkl_sparse = !force_dense;
+        return true;
+    }
     if (strcmp(thres_exec_method, "sparse") == 0) {
         init_arrays(DEFAULT_NUM_BUCKETS);
         std::fill(

@@ -172,7 +172,9 @@ void dense_dense_matmul(
     auto R_bm = make_aligned_unique<BIT_DTYPE>(R_bm_size);
 
     auto mem_alloc_end = std::chrono::high_resolution_clock::now();
-    print_time("Memory allocation time: ", mem_alloc_end - mem_alloc_start);
+    print_time(
+        "[dense-dense-memory-allocation-time]", mem_alloc_end - mem_alloc_start
+    );
 
     std::vector<aligned_unique_ptr<T>> S_packed_mem_threads(threads);
     std::vector<aligned_unique_ptr<BIT_DTYPE>> S_bm_threads(threads);
@@ -270,8 +272,8 @@ void dense_dense_matmul(
     }
 
     auto mm_end = std::chrono::high_resolution_clock::now();
-    print_time("Dense MM time: ", mm_end - mem_alloc_end);
-    print_time("Total dense MM time: ", mm_end - dense_mm_start);
+    print_time("[dense-dense-dense-mm-time]", mm_end - mem_alloc_end);
+    print_time("[dense-dense-total-dense-mm-time]", mm_end - dense_mm_start);
 }
 
 // packed_mem is the panel itself; keys are made local with k_offset.
