@@ -1,5 +1,5 @@
 # MKL is needed to build the libraries, not to run the portable tests.
-TEST_GOALS := test test-dispatch test-thresholds
+TEST_GOALS := test test-dispatch test-preparation test-thresholds
 ifneq ($(filter-out $(TEST_GOALS),$(or $(MAKECMDGOALS),default)),)
 ifndef ONEAPI_ROOT
 $(error ONEAPI_ROOT is not set. Please 'source set_intel_vars.sh'.)
@@ -60,9 +60,11 @@ clean:
 
 # Header dependencies, so header-only changes rebuild the objects using them.
 $(SPALM_OBJS): include/util.h include/slice_decision.h
-$(BIN_DIR)/spalm.o: include/method_dispatch.h include/cpu/dense_dense_matmul.h \
+$(BIN_DIR)/spalm.o: include/method_dispatch.h include/csr_preparation.h \
+	include/cpu/execution_options.h include/cpu/dense_dense_matmul.h \
 	include/cpu/sparse_sparse_matmul.h
-$(BIN_DIR)/sparse_sparse_matmul.o: include/cpu/sparse_sparse_matmul.h
+$(BIN_DIR)/sparse_sparse_matmul.o: include/csr_preparation.h \
+	include/cpu/sparse_sparse_matmul.h
 $(BIN_DIR)/dense_dense_matmul.o: include/cpu/dense_dense_matmul.h include/cpu/kernel.h
 $(BIN_DIR)/run_baseline.so: include/util.h
 
@@ -71,8 +73,8 @@ $(BIN_DIR)/run_baseline.so: include/util.h
 TEST_CXXFLAGS ?= -std=c++20 -O1 -g -fopenmp -fsanitize=address,undefined -fno-omit-frame-pointer
 TEST_BIN_DIR ?= /tmp/spalm-tests
 PYTHON ?= python3
-.PHONY: test test-dispatch test-thresholds
-test: test-dispatch test-thresholds
+.PHONY: test test-dispatch test-preparation test-thresholds
+test: test-dispatch test-preparation test-thresholds
 
 # Forced methods, backend selection and timing output.
 test-dispatch:
@@ -83,6 +85,17 @@ test-dispatch:
 	$(TEST_BIN_DIR)/timing_dispatch_test
 	$(TEST_BIN_DIR)/slice_timing_test
 	$(TEST_BIN_DIR)/dispatch_test
+
+# CSR preparation: memory bounds, validation, zero pruning, ownership.
+test-preparation:
+	mkdir -p $(TEST_BIN_DIR)
+	$(CXX) $(CPPFLAGS) $(TEST_CXXFLAGS) -Iinclude tests/csr_memory_test.cpp src/slice_decision.cpp $(LDFLAGS) -o $(TEST_BIN_DIR)/csr_memory_test
+	$(CXX) $(CPPFLAGS) $(TEST_CXXFLAGS) -Itests/stubs -Iinclude tests/preparation_dispatch_test.cpp src/slice_decision.cpp $(LDFLAGS) -o $(TEST_BIN_DIR)/preparation_dispatch_test
+	$(TEST_BIN_DIR)/csr_memory_test
+	$(TEST_BIN_DIR)/preparation_dispatch_test
+	# A smaller OpenMP team than requested must still process every row.
+	OMP_THREAD_LIMIT=2 $(TEST_BIN_DIR)/csr_memory_test
+	OMP_THREAD_LIMIT=2 $(TEST_BIN_DIR)/preparation_dispatch_test
 
 # Timing-label parser of find_thresholds.py (standard library only).
 test-thresholds:

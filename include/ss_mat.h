@@ -1,10 +1,16 @@
 #ifndef SS_MAT_CLASS_H
 #define SS_MAT_CLASS_H
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <memory>
 #include <omp.h>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "slice_decision.h"
 #include "util.h"
@@ -60,6 +66,10 @@ public:
     // Mapping from sr_csc index to sr_csr index
     // sr_csc_to_csr_idx[csc_idx] = csr_idx for each subrow
     int *sr_csc_to_csr_idx = nullptr;
+
+    // Size of the temporary subrow tuple buffer (released after building);
+    // diagnostics and tests only.
+    size_t subrow_workspace_bytes = 0;
 
     // Memory ownership: all dynamically allocated arrays are stored here
     std::vector<std::unique_ptr<int[]>> owned_int_arrays;
@@ -126,11 +136,13 @@ static void compute_thread_row_ranges(
 // Each subrow represents a contiguous run of elements within a single slice
 // column range.
 //
-// Optimization: single NNZ scan using per-thread buffers, eliminating the
-// second pass over Rj that the naive two-phase count-then-fill approach requires.
+// Single scan over Rj: each logical thread range counts its subrows and
+// stores (col_idx, start, len) tuples in its part of one shared buffer.
+// The input is validated in the same scan.
 template <typename T>
 void create_subrow_csr(ss_matrix<T> &ssm, const int threads) {
     const int M = ssm.csr_mat.rows;
+    const int K = ssm.csr_mat.cols;
     const int *Ri = ssm.csr_mat.row_ptrs;
     const int *Rj = ssm.csr_mat.col_idxs;
     const int sl_shift = (int) std::log2(ssm.sl);
@@ -143,14 +155,28 @@ void create_subrow_csr(ss_matrix<T> &ssm, const int threads) {
     std::vector<int> trs;
     compute_thread_row_ranges(Ri, M, threads, trs);
 
-    // Per-thread tuple buffers; worst-case size = thread's NNZ count
-    // (every element is its own subrow). Released at function exit.
-    std::vector<std::unique_ptr<sr_tuple[]>> tl_bufs(threads);
-    std::vector<int> tl_counts(threads, 0);
-    for (int t = 0; t < threads; t++) {
-        int sz = Ri[trs[t + 1]] - Ri[trs[t]];
-        if (sz > 0) tl_bufs[t] = std::make_unique_for_overwrite<sr_tuple[]>(sz);
+    // A sorted row has at most one subrow per slice column it spans, so its
+    // tuple capacity is min(entries, span) rather than one tuple per entry
+    // (a dense row of 4096 keys with slice length 512 needs 8, not 4096).
+    // Out-of-range or unsorted keys are reported below, after the scan.
+    std::vector<size_t> tuple_offsets(threads + 1, 0);
+    for (int t = 0; t < threads; ++t) {
+        size_t capacity = 0;
+        for (int row = trs[t]; row < trs[t + 1]; ++row) {
+            const int start = Ri[row], end = Ri[row + 1];
+            if (start == end) continue;
+            const long long span = (long long) (Rj[end - 1] >> sl_shift) -
+                                   (Rj[start] >> sl_shift) + 1;
+            capacity += span < 1 ? 1 : std::min<long long>(end - start, span);
+        }
+        tuple_offsets[t + 1] = tuple_offsets[t] + capacity;
     }
+    ssm.subrow_workspace_bytes = tuple_offsets.back() * sizeof(sr_tuple);
+    auto tuples =
+        std::make_unique_for_overwrite<sr_tuple[]>(tuple_offsets.back());
+    // Per-range error flags; reported after the parallel region.
+    enum : int { KEY_RANGE = 1, UNSORTED = 2, LONG_SUBROW = 4 };
+    std::vector<int> errors(threads, 0);
 
     // Phase 1+3 combined: single pass over Rj per thread.
     // Each thread counts subrows (writes sr_row_ptrs[i+1]) AND stores
@@ -159,8 +185,18 @@ void create_subrow_csr(ss_matrix<T> &ssm, const int threads) {
     // may give a smaller team than requested, and every range must run.
 #pragma omp parallel for num_threads(threads) schedule(static)
     for (int tid = 0; tid < threads; tid++) {
-        sr_tuple *buf = tl_bufs[tid].get();
-        int buf_pos = 0;
+        sr_tuple *buf = tuples.get() + tuple_offsets[tid];
+        const size_t capacity = tuple_offsets[tid + 1] - tuple_offsets[tid];
+        size_t buf_pos = 0;
+        auto append = [&](int col, int start, int length) {
+            if (buf_pos >= capacity) {
+                errors[tid] |= UNSORTED;
+                return;
+            }
+            // Only repeated keys can make a subrow longer than a slice.
+            if (length > UINT16_MAX) errors[tid] |= LONG_SUBROW;
+            buf[buf_pos++] = {col, start, static_cast<uint16_t>(length), 0};
+        };
 
         for (int i = trs[tid]; i < trs[tid + 1]; i++) {
             const int nnz_start = Ri[i], nnz_end = Ri[i + 1];
@@ -168,32 +204,45 @@ void create_subrow_csr(ss_matrix<T> &ssm, const int threads) {
                 sr_row_ptrs[i + 1] = 0;
                 continue;
             }
+            if (Rj[nnz_start] < 0 || Rj[nnz_end - 1] >= K) {
+                errors[tid] |= KEY_RANGE;
+            }
 
             int curr_prefix = Rj[nnz_start] >> sl_shift;
             int subrow_start = nnz_start;
             int cnt = 0;
 
             for (int k = nnz_start + 1; k < nnz_end; k++) {
+                if (Rj[k] < Rj[k - 1]) errors[tid] |= UNSORTED;
                 int next_prefix = Rj[k] >> sl_shift;
                 if (next_prefix != curr_prefix) {
-                    buf[buf_pos++] = {
-                        curr_prefix, subrow_start,
-                        static_cast<uint16_t>(k - subrow_start), 0
-                    };
+                    append(curr_prefix, subrow_start, k - subrow_start);
                     cnt++;
                     subrow_start = k;
                     curr_prefix = next_prefix;
                 }
             }
             // Last subrow in this row
-            buf[buf_pos++] = {
-                curr_prefix, subrow_start,
-                static_cast<uint16_t>(nnz_end - subrow_start), 0
-            };
+            append(curr_prefix, subrow_start, nnz_end - subrow_start);
             cnt++;
             sr_row_ptrs[i + 1] = cnt;
         }
-        tl_counts[tid] = buf_pos;
+    }
+
+    int error = 0;
+    for (int flags : errors) error |= flags;
+    if (error & UNSORTED) {
+        throw std::invalid_argument(
+            "SPALM requires CSR column indices sorted within each row"
+        );
+    }
+    if (error & KEY_RANGE) {
+        throw std::invalid_argument("SPALM CSR column index out of [0, K)");
+    }
+    if (error & LONG_SUBROW) {
+        throw std::invalid_argument(
+            "SPALM subrow longer than 65535 entries (duplicate column indices)"
+        );
     }
 
     // Phase 2: sequential prefix sum (O(M), unchanged)
@@ -208,7 +257,7 @@ void create_subrow_csr(ss_matrix<T> &ssm, const int threads) {
     // O(total_subrows), not O(NNZ) — fast when average subrow length > 1.
 #pragma omp parallel for num_threads(threads) schedule(static)
     for (int tid = 0; tid < threads; tid++) {
-        const sr_tuple *buf = tl_bufs[tid].get();
+        const sr_tuple *buf = tuples.get() + tuple_offsets[tid];
         int buf_pos = 0;
 
         for (int i = trs[tid]; i < trs[tid + 1]; i++) {

@@ -2,9 +2,9 @@
 
 #include <immintrin.h>
 #include <omp.h>
-#include <sched.h> // For sched_setaffinity and CPU_SET macros
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <thread>
@@ -23,14 +23,20 @@ struct AlignedDeleter {
 template <typename T>
 using aligned_unique_ptr = std::unique_ptr<T[], AlignedDeleter>;
 
-// Helper function to allocate aligned memory and return a unique_ptr
+// Aligned allocation; returns nullptr on failure (safe inside OpenMP regions).
+template <typename T>
+aligned_unique_ptr<T> try_make_aligned(size_t count, size_t alignment = 64) {
+    void *ptr = nullptr;
+    if (posix_memalign(&ptr, alignment, sizeof(T) * count) != 0) return nullptr;
+    return aligned_unique_ptr<T>(static_cast<T *>(ptr));
+}
+
+// Aligned allocation that throws std::bad_alloc on failure.
 template <typename T>
 aligned_unique_ptr<T> make_aligned_unique(size_t count, size_t alignment = 64) {
-    void *ptr = nullptr;
-    if (posix_memalign(&ptr, alignment, sizeof(T) * count) != 0) {
-        throw std::bad_alloc();
-    }
-    return aligned_unique_ptr<T>(static_cast<T *>(ptr));
+    auto ptr = try_make_aligned<T>(count, alignment);
+    if (!ptr) throw std::bad_alloc();
+    return ptr;
 }
 
 template <typename T>
@@ -149,16 +155,24 @@ void dense_dense_matmul(
 
     const int num_slice_cols = R_ssm.s_csc_mat.cols;
 
-    int max_slices_in_col_R = 0;
+    // Size the packing buffers by the largest slice columns that take part
+    // (both sides non-empty), not only by the configured tile sizes.
+    int max_slices_in_col_R = 0, max_slices_in_col_S = 0;
     for (int col = 0; col < num_slice_cols; col++) {
-        int slices_in_col =
+        const int r_count =
             R_ssm.s_csc_mat.col_ptrs[col + 1] - R_ssm.s_csc_mat.col_ptrs[col];
-        max_slices_in_col_R = std::max(max_slices_in_col_R, slices_in_col);
+        const int s_count =
+            S_ssm.s_csc_mat.col_ptrs[col + 1] - S_ssm.s_csc_mat.col_ptrs[col];
+        if (!r_count || !s_count) continue;
+        max_slices_in_col_R = std::max(max_slices_in_col_R, r_count);
+        max_slices_in_col_S = std::max(max_slices_in_col_S, s_count);
     }
+    if (!max_slices_in_col_R || !max_slices_in_col_S) return;
 
-    const int S_slices_per_agg_tile = div_ceil(tile_size_l2, nr);
-
-    const int R_slices_per_l3 = div_ceil(tile_size_l3, mr);
+    const int S_slices_per_agg_tile =
+        std::min(div_ceil(tile_size_l2, nr), max_slices_in_col_S);
+    const int R_slices_per_l3 =
+        std::min(div_ceil(tile_size_l3, mr), max_slices_in_col_R);
     const int bm_words = div_ceil(sl, BITS);
     const size_t R_block_size = (size_t) R_slices_per_l3 * sl * mr;
     const size_t R_bm_size = (size_t) R_slices_per_l3 * bm_words;
@@ -176,33 +190,23 @@ void dense_dense_matmul(
         "[dense-dense-memory-allocation-time]", mem_alloc_end - mem_alloc_start
     );
 
+    // Per-worker S packing buffers are allocated on a worker's first task
+    // rather than for every thread up front. An allocation failure inside the
+    // parallel region must not throw (that terminates the process): it is
+    // flagged, remaining tasks are skipped, and std::bad_alloc is thrown after.
+    const size_t S_block_size = (size_t) S_slices_per_agg_tile * sl * nr;
+    const size_t S_bm_size = (size_t) S_slices_per_agg_tile * bm_words;
     std::vector<aligned_unique_ptr<T>> S_packed_mem_threads(threads);
     std::vector<aligned_unique_ptr<BIT_DTYPE>> S_bm_threads(threads);
-    std::vector<int> thread_cores(threads);
+    std::atomic<bool> alloc_failed{false};
 
     omp_set_dynamic(0);
-#pragma omp parallel num_threads(threads)
-    {
-        thread_cores[omp_get_thread_num()] = sched_getcpu();
-        const size_t S_block_size = (size_t) S_slices_per_agg_tile * sl * nr;
-        S_packed_mem_threads[omp_get_thread_num()] =
-            make_aligned_unique<T>(S_block_size + pad);
-        std::memset(
-            S_packed_mem_threads[omp_get_thread_num()].get() + S_block_size, 0,
-            pad_bytes
-        );
-        S_bm_threads[omp_get_thread_num()] = make_aligned_unique<BIT_DTYPE>(
-            (S_slices_per_agg_tile + 8) * div_ceil(sl, BITS)
-        );
-    }
-
 #pragma omp parallel num_threads(threads)
     {
         for (int R_slice_outer_it = 0; R_slice_outer_it < max_slices_in_col_R;
              R_slice_outer_it += R_slices_per_l3) {
             for (int slice_col = 0; slice_col < num_slice_cols; slice_col++) {
                 const int k_offset = slice_col * sl;
-                int row_offset;
 
                 const int R_si_l3 =
                     R_ssm.s_csc_mat.col_ptrs[slice_col] + R_slice_outer_it;
@@ -210,6 +214,13 @@ void dense_dense_matmul(
                     R_si_l3 + R_slices_per_l3,
                     R_ssm.s_csc_mat.col_ptrs[slice_col + 1]
                 );
+                // Skip panels with no R slices left or no S slices: nothing
+                // to pack or multiply. Same decision on every thread.
+                if (R_si_l3 >= R_si_l3_end ||
+                    S_ssm.s_csc_mat.col_ptrs[slice_col] ==
+                        S_ssm.s_csc_mat.col_ptrs[slice_col + 1]) {
+                    continue;
+                }
 
 #pragma omp for schedule(static)
                 for (int R_si = R_si_l3; R_si < R_si_l3_end; R_si++) {
@@ -232,9 +243,6 @@ void dense_dense_matmul(
                         S_ssm.s_csc_mat.col_ptrs[slice_col],
                     S_slices_per_agg_tile
                 );
-                if (task_num == 0) {
-                    continue;
-                }
                 const int R_div = div_ceil(threads, task_num);
                 const int R_slices_per_it =
                     div_ceil(R_si_l3_end - R_si_l3, R_div);
@@ -246,6 +254,9 @@ void dense_dense_matmul(
                     for (int S_si = S_ssm.s_csc_mat.col_ptrs[slice_col];
                          S_si < S_ssm.s_csc_mat.col_ptrs[slice_col + 1];
                          S_si += S_slices_per_agg_tile) {
+                        if (alloc_failed.load(std::memory_order_relaxed)) {
+                            continue;
+                        }
                         const int S_slice_end = std::min(
                             S_si + S_slices_per_agg_tile,
                             S_ssm.s_csc_mat.col_ptrs[slice_col + 1]
@@ -255,21 +266,39 @@ void dense_dense_matmul(
                             R_si_l3_end, R_slice_start_task + R_slices_per_it
                         );
 
-                        T *S_packed_mem_private =
-                            S_packed_mem_threads[omp_get_thread_num()].get();
-                        BIT_DTYPE *S_bm_private =
-                            S_bm_threads[omp_get_thread_num()].get();
+                        const int worker = omp_get_thread_num();
+                        if (!S_packed_mem_threads[worker]) {
+                            S_packed_mem_threads[worker] =
+                                try_make_aligned<T>(S_block_size + pad);
+                            S_bm_threads[worker] =
+                                try_make_aligned<BIT_DTYPE>(S_bm_size);
+                            if (!S_packed_mem_threads[worker] ||
+                                !S_bm_threads[worker]) {
+                                S_packed_mem_threads[worker].reset();
+                                alloc_failed.store(
+                                    true, std::memory_order_relaxed
+                                );
+                                continue;
+                            }
+                            std::memset(
+                                S_packed_mem_threads[worker].get() +
+                                    S_block_size,
+                                0, pad_bytes
+                            );
+                        }
                         dense_dense_matmul_task_shared(
                             slice_col, R_si_l3, R_slice_start_task, R_slice_end,
                             S_si, S_slice_end, R_packed_mem.get(), R_bm.get(),
-                            S_packed_mem_private, S_bm_private, R_ssm, S_ssm,
-                            ret, sparse_result
+                            S_packed_mem_threads[worker].get(),
+                            S_bm_threads[worker].get(), R_ssm, S_ssm, ret,
+                            sparse_result
                         );
                     }
                 }
             }
         }
     }
+    if (alloc_failed.load()) throw std::bad_alloc();
 
     auto mm_end = std::chrono::high_resolution_clock::now();
     print_time("[dense-dense-dense-mm-time]", mm_end - mem_alloc_end);

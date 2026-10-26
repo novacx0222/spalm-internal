@@ -9,9 +9,12 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <vector>
 
 #include "cpu/dense_dense_matmul.h"
+#include "cpu/execution_options.h"
+#include "csr_preparation.h"
 #include "method_dispatch.h"
 #include "mkl.h"
 #include "slice_decision.h"
@@ -38,7 +41,12 @@ using run_baseline_fn = void (*)(
 );
 
 // Returns nullptr (after printing why) if the MKL baseline cannot be loaded.
+// The library stays loaded for the process lifetime (unloading MKL corrupts
+// its thread pool); a successful lookup is cached, a failure is retried.
+// Calls are serialized by spalm(), so the cache needs no further locking.
 static run_baseline_fn load_run_baseline() {
+    static run_baseline_fn cached = nullptr;
+    if (cached) return cached;
     void *handle = dlopen(
         resolve_path_near_lib(
             reinterpret_cast<void *>(&spalm_lib_anchor), "run_baseline.so",
@@ -51,9 +59,9 @@ static run_baseline_fn load_run_baseline() {
         std::cerr << "Cannot open library: " << dlerror() << '\n';
         return nullptr;
     }
-    auto fn = (run_baseline_fn) dlsym(handle, "run_baseline");
-    if (!fn) std::cerr << "Cannot find run_baseline: " << dlerror() << '\n';
-    return fn;
+    cached = (run_baseline_fn) dlsym(handle, "run_baseline");
+    if (!cached) std::cerr << "Cannot find run_baseline: " << dlerror() << '\n';
+    return cached;
 }
 
 // Runs the whole multiplication with an MKL backend (forced or fallback).
@@ -67,10 +75,9 @@ int run_mkl_backend(
     if (backend == spalm_dispatch::Backend::MklDense) {
         std::cout << "Fallback: MKL dense-dense" << std::endl;
         auto start = std::chrono::high_resolution_clock::now();
-        // Implicit zeros require zero-initialized dense inputs; size_t:
-        // M * K and N * K overflow int for large matrices.
-        auto R = std::make_unique<T[]>((size_t) M * K);
-        auto S = std::make_unique<T[]>((size_t) N * K);
+        // Implicit zeros require zero-initialized dense inputs.
+        auto R = std::make_unique<T[]>(checked_matrix_size(M, K));
+        auto S = std::make_unique<T[]>(checked_matrix_size(N, K));
         auto end = std::chrono::high_resolution_clock::now();
         print_time("[mkl-dense-input-allocate]", end - start);
         start = end;
@@ -123,7 +130,8 @@ int spalm_matmul(
     const int type, int *Ri, int *Rj, T *Rv, int *Si, int *Sj, T *Sv,
     const int M, const int K, const int N, const int slice_length,
     const int tile_size_l2, const int tile_size_l3, bool sparse_result, T *ret,
-    int *reti, int *retj, T *retv, const int threads
+    int *reti, int *retj, T *retv, const int threads,
+    const cpu_execution_options &options
 ) {
     // An empty dimension, or no stored entry on a side, contributes nothing:
     // no CSR copies, slices, packing buffers or MKL call are needed.
@@ -131,6 +139,41 @@ int spalm_matmul(
         std::cout << "[backend] zero-work (empty input)" << std::endl;
         return SPALM_OK;
     }
+    const auto prepare_begin = std::chrono::high_resolution_clock::now();
+    csr_value_summary r_summary{Ri[M], Ri[M], true};
+    csr_value_summary s_summary{Si[N], Si[N], true};
+    if (options.prune_zeros) {
+        r_summary = summarize_csr_values(Ri, Rv, M, threads);
+        s_summary = summarize_csr_values(Si, Sv, N, threads);
+    }
+    // Explicit zeros are dropped only when both sides are finite: with NaN or
+    // Inf present, 0 * Inf and 0 * NaN must still produce NaN.
+    const bool remove_zeros =
+        options.prune_zeros && r_summary.finite && s_summary.finite;
+    if (remove_zeros && (!r_summary.nonzero || !s_summary.nonzero)) {
+        std::cout << "[backend] zero-work (all-zero input)" << std::endl;
+        print_time(
+            "[csr-zero-prepare]",
+            std::chrono::high_resolution_clock::now() - prepare_begin
+        );
+        return SPALM_OK;
+    }
+    prepared_csr<T> r_input, s_input;
+    r_input.initialize(Ri, Rj, Rv, M, K, r_summary, remove_zeros, threads);
+    s_input.initialize(Si, Sj, Sv, N, K, s_summary, remove_zeros, threads);
+    Ri = r_input.matrix.row_ptrs;
+    Rj = r_input.matrix.col_idxs;
+    Rv = r_input.matrix.vals;
+    Si = s_input.matrix.row_ptrs;
+    Sj = s_input.matrix.col_idxs;
+    Sv = s_input.matrix.vals;
+    std::cout << "[csr-zero-stats] R=" << r_summary.stored << "->" << Ri[M]
+              << " S=" << s_summary.stored << "->" << Si[N] << std::endl;
+    print_time(
+        "[csr-zero-prepare]",
+        std::chrono::high_resolution_clock::now() - prepare_begin
+    );
+
     // Forced MKL backends need no slices or cost estimate.
     const auto forced_backend = spalm_dispatch::select(
         force_mkl_dense, force_mkl_sparse, false, false, false
@@ -181,7 +224,16 @@ int spalm_matmul(
     unsigned long long dense_sparse_mm_cost = 0;
     unsigned long long dense_dense_mm_cost = 0;
     const int num_slice_cols = R_ssm.s_csc_mat.cols;
+    // Whether any slice column (K range) is non-empty on both sides; if not,
+    // no key matches and the product is zero.
+    bool common_panel = false;
     for (int slice_col = 0; slice_col < num_slice_cols; slice_col++) {
+        if (R_ssm.s_csc_mat.col_ptrs[slice_col] !=
+                R_ssm.s_csc_mat.col_ptrs[slice_col + 1] &&
+            S_ssm.s_csc_mat.col_ptrs[slice_col] !=
+                S_ssm.s_csc_mat.col_ptrs[slice_col + 1]) {
+            common_panel = true;
+        }
         unsigned long long sparse_mm_cost_col = 0;
         unsigned long long sparse_dense_mm_cost_col = 0;
         unsigned long long dense_sparse_mm_cost_col = 0;
@@ -195,6 +247,11 @@ int spalm_matmul(
         sparse_dense_mm_cost += sparse_dense_mm_cost_col;
         dense_sparse_mm_cost += dense_sparse_mm_cost_col;
         dense_dense_mm_cost += dense_dense_mm_cost_col;
+    }
+    if (!common_panel) {
+        std::cout << "[backend] zero-work (disjoint slice columns)"
+                  << std::endl;
+        return SPALM_OK;
     }
     unsigned long long total_dense_mm_cost =
         sparse_dense_mm_cost + dense_sparse_mm_cost + dense_dense_mm_cost;
@@ -241,6 +298,15 @@ int spalm_matmul(
                           ? "mkl-dense"
                           : "mkl-sparse")
                   << " (fallback)" << std::endl;
+        // Neither MKL path uses the slices: release them before MKL
+        // allocates its dense inputs or transpose, instead of holding both.
+        const auto release_begin = std::chrono::high_resolution_clock::now();
+        R_ssm = ss_matrix<T>{};
+        S_ssm = ss_matrix<T>{};
+        print_time(
+            "[fallback-slice-deallocate]",
+            std::chrono::high_resolution_clock::now() - release_begin
+        );
         status = run_mkl_backend(
             backend, type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, ret, threads
         );
@@ -329,6 +395,8 @@ static int spalm_impl(
     const char *bucket_method = get_str("bucket_method", "");
     int threads = get_int("threads", 4);
     if (threads < 1) return invalid("threads must be at least 1");
+    cpu_execution_options options;
+    options.prune_zeros = get_int("prune_zeros", 1) != 0;
 
     std::cout << "SPALM MATMUL" << std::endl;
     std::cout << M << " " << K << " " << N << std::endl;
@@ -390,13 +458,13 @@ static int spalm_impl(
         return spalm_matmul(
             type, Ri, Rj, (float *) Rv, Si, Sj, (float *) Sv, M, K, N,
             slice_length, tile_size_l2, tile_size_l3, sparse_result,
-            (float *) ret, reti, retj, (float *) retv, threads
+            (float *) ret, reti, retj, (float *) retv, threads, options
         );
     }
     return spalm_matmul(
         type, Ri, Rj, (double *) Rv, Si, Sj, (double *) Sv, M, K, N,
         slice_length, tile_size_l2, tile_size_l3, sparse_result, (double *) ret,
-        reti, retj, (double *) retv, threads
+        reti, retj, (double *) retv, threads, options
     );
 }
 
@@ -427,6 +495,11 @@ extern "C" int spalm(
             "[spalm-total]", std::chrono::high_resolution_clock::now() - begin
         );
         return status;
+    } catch (const std::invalid_argument &e) {
+        // Malformed input detected during preparation (e.g. unsorted or
+        // out-of-range CSR column indices).
+        std::cerr << "spalm: " << e.what() << std::endl;
+        return SPALM_INVALID_ARGUMENT;
     } catch (const std::exception &e) {
         std::cerr << "spalm: " << e.what() << std::endl;
     } catch (...) {

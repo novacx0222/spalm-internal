@@ -38,13 +38,6 @@ void spgemm_rows_dense_result(
 );
 
 template <typename T>
-void transpose_s_matrix_vanilla(
-    const int thread_idx, const int threads, ss_matrix<T> &S_ssm,
-    std::unique_ptr<int[]> &s_col_idxs_ref,
-    std::unique_ptr<int[]> &s_agg_idxs_ref, std::unique_ptr<T[]> &s_vals_ref
-);
-
-template <typename T>
 void spgemm_rows_dense_result_vanilla(
     const int N, ss_matrix<T> &R_ssm, int *s_col_idxs, int *s_agg_idxs,
     T *s_vals, T *ret, int threads

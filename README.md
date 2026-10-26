@@ -61,7 +61,8 @@ cd example && ./compile.sh && ./run.sh
 ## Calling `spalm()`
 
 `spalm()` returns `0` on success; the output is valid only then. Other values:
-`1` invalid argument, `2` missing or invalid parameter files, `3` the MKL
+`1` invalid argument (including unsorted or out-of-range CSR column
+indices), `2` missing or invalid parameter files, `3` the MKL
 baseline could not be loaded, `4` internal error (e.g. out of memory). Options
 are passed as key/value strings:
 
@@ -69,6 +70,7 @@ are passed as key/value strings:
 |-----|--------|
 | `init_method` | empty (automatic, needs calibrated thresholds), `sparse`, `dense_bm_inner_kernel`, `dense_right_spmm_inner_kernel`, `dense_left_spmm_inner_kernel`, `FORCE_MKL_DENSE`, `FORCE_MKL_SPARSE`, `dense`, `no_fallback`, `no_threshold`, `no_features` |
 | `threads` | OpenMP threads (default 4) |
+| `prune_zeros` | `1` (default) drops explicit zeros when all values are finite; `0` disables it |
 | `bucket_method` | `linear_100` (default) or `log_100_cC` |
 | `slice_length`, `tile_size_l2`, `tile_size_l3` | override `parameters/cpu/<type>/tile_sizes.txt` |
 
@@ -86,6 +88,7 @@ stages overlap, so only totals at the same level may be compared or added.
 | Label | Covers |
 |-------|--------|
 | `[library-initialize]` | argument checks, options, thresholds and tile sizes |
+| `[csr-zero-prepare]` | zero pruning / CSR validation (`[csr-zero-stats]` gives entries before and after) |
 | `[1-slice-…]`, `[2-slice-…]` | building the slice structures of R (1) and S (2): `subrow-csr`, `subrow-csc`, `csc` (plus `-cumulative`) |
 | `[slice-prepare-total]` | both slice structures |
 | `[mm-select-total]` | cost model over all slice columns |
@@ -93,7 +96,7 @@ stages overlap, so only totals at the same level may be compared or added.
 | `[mm-total]` | cost model + multiplication |
 | `[slice-mm-total]` | slicing + cost model + multiplication |
 | `[forced-backend-total]` | a `FORCE_MKL_*` call; `[mkl-…]` lines break it down |
-| `[slice-deallocate]`, `[thresholds-deallocate]` | releasing slices and decision arrays |
+| `[slice-deallocate]`, `[fallback-slice-deallocate]`, `[thresholds-deallocate]` | releasing slices and decision arrays |
 | `[spalm-total]` | the whole `spalm()` call inside the library |
 
 ## Tests
