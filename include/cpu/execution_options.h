@@ -27,4 +27,8 @@ struct cpu_execution_options {
     // of a slice, so the packed rows DS loads are cache-line aligned (the
     // DD kernel needs 12) (key: ds_aligned_panels).
     bool ds_aligned_panels = true;
+    // Lengthen the slices (up to 2048 keys) while the sparse side's subrows
+    // would hold fewer than 16 entries on average; off when slice_length is
+    // given explicitly (key: auto_slice_length).
+    bool auto_slice_length = true;
 };

@@ -131,6 +131,48 @@ int run_mkl_backend(
 
 // Accumulates R * S^T into the caller's zero-initialized ret. Early exits
 // for zero work leave ret untouched.
+// Slice length for this call. Each nonempty subrow of a sparse side costs a
+// read-modify-write of its packed-panel outputs per opposite slice, so very
+// short subrows (uniform 1%: about 5 entries at 512 keys) are dominated by
+// that overhead; on encoder-1025 SD/DS/DD ran 36-45% faster at 2048 there,
+// while subrows of about 25 entries or full ones ran best at 512. So the
+// configured length is doubled, up to 2048 and at most K, while the
+// average entries per subrow of the sparse side(s) the decision table uses
+// stay below 16: R for SD, S for DS, the sparser of both for DD or mixed
+// tables. Only SS slice pairs: unchanged.
+static int choose_slice_length(
+    const int configured, const int *Ri, const int M, const int *Si,
+    const int N, const int K
+) {
+    bool used[4] = {};
+    for (int left = 0; left <= num_buckets; ++left)
+        for (int right = 0; right <= num_buckets; ++right)
+            used[get_alg(left, right)] = true;
+    const bool r_sparse =
+        used[DENSE_DENSE_LEFT_INNER_KERNEL] || used[DENSE_DENSE];
+    const bool s_sparse =
+        used[DENSE_DENSE_RIGHT_INNER_KERNEL] || used[DENSE_DENSE];
+    if (!r_sparse && !s_sparse) return configured;
+    // Stored entries per key of a nonempty row.
+    auto density = [K](const int *row_ptrs, const int rows) {
+        long long nonempty = 0;
+        for (int r = 0; r < rows; ++r)
+            nonempty += row_ptrs[r + 1] != row_ptrs[r];
+        return nonempty ? double(row_ptrs[rows]) / (double(nonempty) * K) : 1.0;
+    };
+    double d = 1.0;
+    if (r_sparse) d = std::min(d, density(Ri, M));
+    if (s_sparse) d = std::min(d, density(Si, N));
+    int length = configured;
+    while (length < 2048 && length < K && d * std::min(length, K) < 16.0)
+        length *= 2;
+    std::cout << "[slice-length] configured=" << configured
+              << " chosen=" << length
+              << " entries_per_subrow=" << d * std::min(configured, K) << " -> "
+              << d * std::min(length, K) << std::endl;
+    return length;
+}
+
 template <typename T>
 int spalm_matmul(
     const int type, int *Ri, int *Rj, T *Rv, int *Si, int *Sj, T *Sv,
@@ -251,6 +293,10 @@ int spalm_matmul(
         return status;
     }
 
+    const int sl = options.auto_slice_length
+                       ? choose_slice_length(slice_length, Ri, M, Si, N, K)
+                       : slice_length;
+
     // type is validated by spalm(): 0 = float, 1 = double.
     const int R_ik_slice_height = 12;
     const int S_ik_slice_height = type == 0 ? 32 : 16;
@@ -262,10 +308,10 @@ int spalm_matmul(
         total_start, e2e_start;
     e2e_start = std::chrono::high_resolution_clock::now();
     csr_to_ss_matrix(
-        Ri, Rj, Rv, M, K, slice_length, R_ik_slice_height, R_ssm, threads, 1
+        Ri, Rj, Rv, M, K, sl, R_ik_slice_height, R_ssm, threads, 1
     );
     csr_to_ss_matrix(
-        Si, Sj, Sv, N, K, slice_length, S_ik_slice_height, S_ssm, threads, 2
+        Si, Sj, Sv, N, K, sl, S_ik_slice_height, S_ssm, threads, 2
     );
 
     end = std::chrono::high_resolution_clock::now();
@@ -459,6 +505,9 @@ static int spalm_impl(
     options.sd_ds_full_rows = get_int("sd_ds_full_rows", 1) != 0;
     options.ss_column_blocks = get_int("ss_column_blocks", -1);
     options.ds_aligned_panels = get_int("ds_aligned_panels", 1) != 0;
+    // An explicit slice_length is used as given.
+    options.auto_slice_length = get_int("auto_slice_length", 1) != 0 &&
+                                get_str("slice_length", nullptr) == nullptr;
     if (options.ss_column_blocks < -1) {
         return invalid("ss_column_blocks must be -1 (auto), 0, 1 or a count");
     }

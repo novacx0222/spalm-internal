@@ -179,6 +179,14 @@ int main(int argc, char **argv) {
              ),
              make_csr(N, K, [&](int, int) { return u(rng) < 0.05; }, rng)}
         );
+        // Uniform 1%: very short subrows, so the automatic slice length grows.
+        patterns.push_back(
+            {"uniform-1pct",
+             make_csr(
+                 M, K, [&](int, int) { return u(rng) < 0.01; }, rng
+             ),
+             make_csr(N, K, [&](int, int) { return u(rng) < 0.01; }, rng)}
+        );
         // Column pattern: a few full keys, every row has them -> long runs of
         // consecutive output columns in SS, equal subrow lengths in SD/DS.
         std::vector<char> hot(K);
@@ -261,7 +269,7 @@ int main(int argc, char **argv) {
                                 for (const char *contiguous : {"0", "1"}) {
                                     for (const char *threads : {"1", "4"}) {
                                         for (const char *slice :
-                                             {"512", "64"}) {
+                                             {"512", "64", "auto"}) {
                                             std::vector<std::pair<
                                                 std::string, std::string>>
                                                 o = {
@@ -271,9 +279,12 @@ int main(int argc, char **argv) {
                                                     {"sd_ds_full_rows", full},
                                                     {"ss_column_blocks", blocks},
                                                     {"ds_aligned_panels", aligned},
-                                                    {"ss_contiguous", contiguous},
-                                                    {"slice_length", slice}
+                                                    {"ss_contiguous", contiguous}
                                             };
+                                            if (std::string(slice) != "auto")
+                                                o.push_back(
+                                                    {"slice_length", slice}
+                                                );
                                             std::string label =
                                                 std::string(sh.name) + "/" +
                                                 pt.name + "/" + method;
@@ -300,7 +311,8 @@ int main(int argc, char **argv) {
         "%s: %d native kernel cases (SS/SD/DS/DD x DS aligned panels x SS "
         "column blocks x full "
         "rows x selective "
-        "packing x SS contiguous x threads x slice length x float/double), "
+        "packing x SS contiguous x threads x slice length (fixed / automatic) "
+        "x float/double), "
         "%d failed\n",
         failures ? "FAIL" : "PASS", cases, failures
     );
