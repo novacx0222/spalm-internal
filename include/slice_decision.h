@@ -102,4 +102,43 @@ bool read_tile_sizes(
     int &tile_size_l2, int &tile_size_l3
 );
 
+// Machine-specific parameters, measured by find_thresholds.py on the machine
+// that runs the library and saved to
+// parameters/<platform>/<float|double>/machine_params.txt (not in git). The
+// defaults are the values used before the file existed (inner-v11 and
+// outer-v5): without the file, nothing changes.
+struct machine_params {
+    // Override tile_sizes.txt when > 0.
+    int slice_length = 0;
+    int tile_size_l2 = 0;
+    int tile_size_l3 = 0;
+    // Tile sizes of SD, DS and DD (index MACHINE_SD/DS/DD), used instead of
+    // the two above when that algorithm is the only dense-path algorithm of
+    // a call (a forced method); 0: unset (keys tile_size_l2_sd, ...).
+    int method_tile_size_l2[3] = {};
+    int method_tile_size_l3[3] = {};
+    // Automatic slice length: double the configured length, up to
+    // slice_length_max keys, while the sparse side's subrows would hold
+    // fewer than slice_target_entries entries on average.
+    int slice_target_entries = 16;
+    int slice_length_max = 2048;
+    // Bytes past a 2 MiB boundary where the caller starts a huge-page dense
+    // result, for the sparse-output backends (SS, MKL sparse) and the rest.
+    int result_base_offset_sparse = 16;
+    int result_base_offset_dense = 0;
+    // The file that was read, "" when the defaults are used.
+    std::string path;
+};
+
+enum { MACHINE_SD = 0, MACHINE_DS = 1, MACHINE_DD = 2 };
+
+// "key: value" lines, '#' comments. A missing file leaves the defaults and
+// returns true; an unreadable value, an unknown key or a value out of range
+// returns false.
+bool parse_machine_params(const std::string &path, machine_params &params);
+
+bool read_machine_params(
+    const int type, const char *platform, machine_params &params
+);
+
 #endif

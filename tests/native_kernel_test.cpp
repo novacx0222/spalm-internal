@@ -142,6 +142,22 @@ int main(int argc, char **argv) {
     }
     auto spalm = reinterpret_cast<spalm_fn>(dlsym(handle, "spalm"));
     assert(spalm);
+    // Result offset for the caller: machine_params.txt or the defaults.
+    auto offset = reinterpret_cast<int (*)(int, int)>(
+        dlsym(handle, "spalm_result_base_offset")
+    );
+    assert(offset);
+    for (int type : {0, 1}) {
+        for (int sparse_output : {0, 1}) {
+            const int bytes = offset(type, sparse_output);
+            assert(bytes >= 0 && bytes < 4096 && bytes % 8 == 0);
+            std::printf(
+                "result_base_offset(type=%d, sparse_output=%d) = %d\n", type,
+                sparse_output, bytes
+            );
+        }
+    }
+    assert(offset(2, 0) == -1);
 
     std::mt19937 rng(20261027);
     std::uniform_real_distribution<double> u(0, 1);
@@ -269,7 +285,8 @@ int main(int argc, char **argv) {
                                 for (const char *contiguous : {"0", "1"}) {
                                     for (const char *threads : {"1", "4"}) {
                                         for (const char *slice :
-                                             {"512", "64", "auto"}) {
+                                             {"512", "64", "auto",
+                                              "auto-wide"}) {
                                             std::vector<std::pair<
                                                 std::string, std::string>>
                                                 o = {
@@ -281,10 +298,32 @@ int main(int argc, char **argv) {
                                                     {"ds_aligned_panels", aligned},
                                                     {"ss_contiguous", contiguous}
                                             };
-                                            if (std::string(slice) != "auto")
+                                            // auto-wide: the automatic
+                                            // length grows to K, with small
+                                            // tiles (machine_params keys).
+                                            if (std::string(slice) ==
+                                                "auto-wide") {
+                                                o.push_back(
+                                                    {"slice_target_entries",
+                                                     "1024"}
+                                                );
+                                                o.push_back(
+                                                    {"slice_length_max",
+                                                     "32768"}
+                                                );
+                                                o.push_back(
+                                                    {"tile_size_l2", "32"}
+                                                );
+                                                o.push_back(
+                                                    {"tile_size_l3", "24"}
+                                                );
+                                            } else if (
+                                                std::string(slice) != "auto"
+                                            ) {
                                                 o.push_back(
                                                     {"slice_length", slice}
                                                 );
+                                            }
                                             std::string label =
                                                 std::string(sh.name) + "/" +
                                                 pt.name + "/" + method;
@@ -311,7 +350,8 @@ int main(int argc, char **argv) {
         "%s: %d native kernel cases (SS/SD/DS/DD x DS aligned panels x SS "
         "column blocks x full "
         "rows x selective "
-        "packing x SS contiguous x threads x slice length (fixed / automatic) "
+        "packing x SS contiguous x threads x slice length (fixed / automatic / "
+        "automatic with wide limits and small tiles) "
         "x float/double), "
         "%d failed\n",
         failures ? "FAIL" : "PASS", cases, failures

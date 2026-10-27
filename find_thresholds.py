@@ -14,7 +14,16 @@ Key optimisations over a naive BxB sweep:
     if a non-SS algorithm wins for --early-stop consecutive right buckets,
     the first of those buckets becomes the threshold and the row is done.
 
+Before the thresholds, step 0 measures the machine parameters (dense-path
+tile sizes, the base slice length and the automatic slice length rule, the
+huge-page result offset) on
+synthetic uniform matrices and writes them to
+parameters/<platform>/<type>/machine_params.txt, which the library reads; the
+threshold measurements then use them. --machine-params use skips step 0.
+
 Produces:
+  - machine_params.txt       (machine parameters, step 0)
+  - machine_params.csv       (step 0 timings)
   - decision_thresholds.txt  (threshold file for spalm)
   - algorithm_map.csv        (detailed timings)
   - algorithm_map.png        (heatmap visualization)
@@ -23,7 +32,11 @@ Produces:
 import argparse
 import ctypes
 import math
+import mmap
+import os
+import platform as host_platform
 import re
+import time
 from io import StringIO
 from pathlib import Path
 
@@ -32,6 +45,7 @@ from scipy.sparse import random as sparse_random, csr_matrix
 from sklearn.isotonic import IsotonicRegression
 from wurlitzer import STDOUT, pipes
 
+import machine_tuning
 from spalm_timing import DENSE_MM_LABEL, SPARSE_MM_LABEL, parse_time
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -86,8 +100,12 @@ def _make_kv_params(d):
 
 
 def call_spalm(lib, A_csr, B_csr, C, init_method, dtype, slice_length,
-               threads=4):
-    """Call spalm with a given init_method, return captured stdout."""
+               threads=4, extra=None):
+    """Call spalm with a given init_method, return captured stdout.
+
+    slice_length None leaves it to the library (tile_sizes.txt, then the
+    automatic length), as at run time. `extra` adds key/value options.
+    """
     M, K = A_csr.shape
     N, _ = B_csr.shape
     C.fill(0)
@@ -95,11 +113,10 @@ def call_spalm(lib, A_csr, B_csr, C, init_method, dtype, slice_length,
     type_num = 0 if dtype == np.float32 else 1
 
     func = lib.spalm
-    params = {
-        "init_method": init_method,
-        "slice_length": slice_length,
-        "threads": threads,
-    }
+    params = {"init_method": init_method, "threads": threads}
+    if slice_length is not None:
+        params["slice_length"] = slice_length
+    params.update(extra or {})
     n, keys_arr, vals_arr = _make_kv_params(params)
 
     out = StringIO()
@@ -143,19 +160,20 @@ def parse_dense_time(text):
 # ---------------------------------------------------------------------------
 
 def benchmark(call_fn, A_csr, B_csr, C, init_method, warmup, trials,
-              parse_fn):
+              parse_fn, allow_fallback=False):
     """Run warmup + trials, return the median kernel time.
 
     Every run, including warmups, must report exactly one valid kernel timing
-    and must not fall back to MKL; otherwise BenchmarkError is raised with the
-    native output (missing timings usually mean a stale bin/spalm.so or an
-    initialization error), instead of silently scoring the method as inf.
+    and must not fall back to MKL (unless allow_fallback: the forced MKL
+    methods); otherwise BenchmarkError is raised with the native output
+    (missing timings usually mean a stale bin/spalm.so or an initialization
+    error), instead of silently scoring the method as inf.
     """
     results = []
     for t in range(warmup + trials):
         out = call_fn(A_csr=A_csr, B_csr=B_csr, C=C, init_method=init_method)
         try:
-            if re.search(r"(?m)^\s*Fallback:", out):
+            if not allow_fallback and re.search(r"(?m)^\s*Fallback:", out):
                 raise ValueError("unexpected MKL fallback in a forced internal mode")
             val = parse_fn(out)
             if val is None:
@@ -231,6 +249,257 @@ def print_smoothing_summary(name, keys, before_vals, after_vals,
 
 
 # ---------------------------------------------------------------------------
+# Step 0: machine parameters
+# ---------------------------------------------------------------------------
+
+HUGE_PAGE_BYTES = 2 << 20
+TOTAL_LABEL = "[spalm-total]"
+DENSE_METHODS = {"SD": "dense_left_spmm_inner_kernel",
+                 "DS": "dense_right_spmm_inner_kernel",
+                 "DD": "dense_bm_inner_kernel"}
+SPARSE_OUTPUT_METHODS = {"SS": "sparse", "MKL-S": "FORCE_MKL_SPARSE"}
+# Candidates. The tile sizes are R rows (L3, shared packed R block) and S rows
+# (L2, per-thread packed S block) per slice column.
+TILE_L2_CANDIDATES = (32, 64, 128, 256)
+TILE_L3_CANDIDATES = (288, 576, 1152, 2304, 4608, 9216)
+TILE_DENSITIES = (0.05, 0.25)
+# Average entries per subrow at the configured slice length: SD, DS and DD
+# (automatic length), and SS (always the base length).
+SLICE_ENTRIES = (2, 4, 8, 16, 32, 64, 128)
+SS_SLICE_ENTRIES = (4, 32)
+SLICE_BASES = (256, 512, 1024)
+SLICE_TARGETS = (1, 2, 4, 8, 16, 32, 64, 128)
+SLICE_MAXIMA = (512, 1024, 2048, 4096)
+OFFSETS = (0, 16, 32, 64)
+OFFSET_DENSITY = 0.05
+# The offset effect is small next to run-to-run noise: every offset is
+# measured in each of OFFSET_ROUNDS rounds, in rotated order, and the
+# median of the round medians is used.
+OFFSET_ROUNDS = 5
+# A candidate must beat the default by more than this to replace it.
+TOLERANCE = 0.01
+OFFSET_TOLERANCE = 0.02
+
+
+def huge_page_array(count, dtype, offset):
+    """A 1-D array starting `offset` bytes past a 2 MiB boundary of an
+    anonymous mapping marked MADV_HUGEPAGE, placed as the DuckDB extension
+    places its dense result (AllocateDenseResult in result_storage.hpp).
+    Returns (array, mapping, advised); keep the mapping while the array is used.
+    """
+    itemsize = np.dtype(dtype).itemsize
+    length = ((count * itemsize + offset + HUGE_PAGE_BYTES - 1)
+              // HUGE_PAGE_BYTES + 1) * HUGE_PAGE_BYTES
+    mapping = mmap.mmap(-1, length, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+    view = ctypes.c_char.from_buffer(mapping)
+    start = -ctypes.addressof(view) % HUGE_PAGE_BYTES
+    del view
+    advised = False
+    if hasattr(mmap, "MADV_HUGEPAGE"):
+        try:
+            mapping.madvise(mmap.MADV_HUGEPAGE, start, length - start)
+            advised = True
+        except OSError:
+            pass
+    array = np.frombuffer(mapping, dtype=dtype, count=count,
+                          offset=start + offset)
+    return array, mapping, advised
+
+
+def configured_slice_length(platform, type_name):
+    """slice_length of parameters/<platform>/<type>/tile_sizes.txt."""
+    path = SCRIPT_DIR / "parameters" / platform / type_name / "tile_sizes.txt"
+    for line in path.read_text().splitlines():
+        key, _, value = line.partition(":")
+        if key.strip() == "slice_length":
+            return int(value)
+    raise BenchmarkError(f"no slice_length in {path}")
+
+
+def cpu_model():
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("model name"):
+                return line.partition(":")[2].strip()
+    except OSError:
+        pass
+    return host_platform.processor() or "unknown"
+
+
+def tune_machine_params(lib, args, dtype, platform, type_name, params_path):
+    """Measure and write machine_params.txt; return the parameters.
+
+    Every call passes the parameters it depends on explicitly, so an existing
+    machine_params.txt does not influence the measurements. Synthetic uniform
+    size x size matrices, the threshold run's threads and dtype.
+    """
+    size = args.tune_size
+    configured = configured_slice_length(platform, type_name)
+    defaults = machine_tuning.DEFAULTS
+    csv_rows = []
+
+    def measure(stage, A, B, C, name, method, label, candidate, slice_length,
+                extra, case):
+        def parse(text):
+            return parse_time(text, label)
+
+        def call_fn(*, A_csr, B_csr, C, init_method):
+            return call_spalm(lib, A_csr, B_csr, C, init_method, dtype,
+                              slice_length, threads=args.threads, extra=extra)
+
+        t = benchmark(call_fn, A, B, C, method, args.warmup, args.trials,
+                      parse, allow_fallback=method.startswith("FORCE_MKL"))
+        csv_rows.append((stage, name, case, candidate, t))
+        print(f"  {stage} {name} {case} {candidate}: {t:.6f}s")
+        return t
+
+    def uniform_pair(density, seed):
+        return (generate_uniform_csr(size, size, density, dtype, seed),
+                generate_uniform_csr(size, size, density, dtype, seed + 1))
+
+    print(f"[0/4] Machine parameters: {size}x{size} uniform matrices, "
+          f"configured slice length {configured}")
+    C = np.zeros(size * size, dtype=dtype)
+
+    # -- Tile sizes: SD, DS, DD at the configured slice length ---------------
+    tile_pairs = {d: uniform_pair(d, 1000 + i)
+                  for i, d in enumerate(TILE_DENSITIES)}
+    tile_table = {}
+    for l2 in TILE_L2_CANDIDATES:
+        for l3 in TILE_L3_CANDIDATES:
+            extra = {"tile_size_l2": l2, "tile_size_l3": l3}
+            times = {}
+            for name, method in DENSE_METHODS.items():
+                for d in TILE_DENSITIES:
+                    times[(name, d)] = measure(
+                        "tiles", *tile_pairs[d], C, name, method,
+                        DENSE_MM_LABEL, f"l2={l2} l3={l3}", configured,
+                        extra, f"density={d}")
+            tile_table[(l2, l3)] = times
+    # One pair for calls mixing SD, DS and DD, and one per algorithm (they
+    # differ: SD prefers small S tiles, DS larger ones).
+    default_tiles = (defaults["tile_size_l2"], defaults["tile_size_l3"])
+    tile_params = {}
+    method_tiles = {}
+    for suffix, names in [("", tuple(DENSE_METHODS))] + [
+            (f"_{name.lower()}", (name,)) for name in DENSE_METHODS]:
+        table = {candidate: {case: t for case, t in times.items()
+                             if case[0] in names}
+                 for candidate, times in tile_table.items()}
+        (l2, l3), costs = machine_tuning.pick_candidate(
+            table, prefer=default_tiles, tolerance=TOLERANCE)
+        print(f"  tiles{suffix or ' (all)'}: l2={l2} l3={l3} (relative cost "
+              f"{costs[(l2, l3)]:.3f}, default "
+              f"{costs.get(default_tiles, math.nan):.3f})")
+        tile_params[f"tile_size_l2{suffix}"] = l2
+        tile_params[f"tile_size_l3{suffix}"] = l3
+        if len(names) == 1:
+            method_tiles[names[0]] = {"tile_size_l2": l2, "tile_size_l3": l3}
+    # SS ignores them.
+    method_tiles["SS"] = method_tiles["MKL-S"] = {}
+
+    # -- Slice lengths: base length and automatic rule ------------------------
+    # SD, DS and DD over slice lengths at several densities (they follow the
+    # automatic rule), SS at two (it always runs at the base length).
+    lengths = [min(SLICE_BASES)]
+    while lengths[-1] * 2 <= min(max(SLICE_MAXIMA), size):
+        lengths.append(lengths[-1] * 2)
+    slice_times = {}
+    methods = [(name, method, SLICE_ENTRIES, True)
+               for name, method in DENSE_METHODS.items()]
+    methods.append(("SS", SPARSE_OUTPUT_METHODS["SS"], SS_SLICE_ENTRIES, False))
+    pairs = {}
+    for i, entries in enumerate(sorted(set(SLICE_ENTRIES + SS_SLICE_ENTRIES))):
+        pairs[entries] = uniform_pair(entries / configured, 2000 + 2 * i)
+    for name, method, entry_list, automatic in methods:
+        label = DENSE_MM_LABEL if automatic else SPARSE_MM_LABEL
+        for entries in entry_list:
+            A, B = pairs[entries]
+            density = min(A.nnz / (size * size), B.nnz / (size * size))
+            measured = {}
+            for length in lengths:
+                measured[length] = measure(
+                    "slice", A, B, C, name, method, label, f"length={length}",
+                    length, method_tiles[name], f"entries={entries}")
+            slice_times[(name, entries)] = (density, measured, automatic)
+    bases = [b for b in SLICE_BASES if b in lengths]
+    maxima = [m for m in SLICE_MAXIMA if m <= lengths[-1]]
+    (base, target, max_length), costs = machine_tuning.fit_slice_rule(
+        slice_times, size, bases, SLICE_TARGETS, maxima)
+    default_rule = (configured, defaults["slice_target_entries"],
+                    defaults["slice_length_max"])
+    if (default_rule in costs and costs[default_rule]
+            <= costs[(base, target, max_length)] * (1 + TOLERANCE)):
+        base, target, max_length = default_rule
+    print(f"  slice rule: base={base} target={target} max={max_length} "
+          f"(relative cost {costs[(base, target, max_length)]:.3f}, default "
+          f"{costs.get(default_rule, math.nan):.3f})")
+    rule = {"slice_length": base, "slice_target_entries": target,
+            "slice_length_max": max_length}
+    del C
+
+    # -- Result offset on huge pages, whole library call ----------------------
+    A, B = tile_pairs[OFFSET_DENSITY] if OFFSET_DENSITY in tile_pairs else \
+        uniform_pair(OFFSET_DENSITY, 3000)
+    # The slice length the library would choose with the parameters above
+    # (an explicit slice_length key turns the automatic rule off).
+    density = min(A.nnz / (size * size), B.nnz / (size * size))
+    run_length = {"sparse": base, "FORCE_MKL_SPARSE": base}
+    for method in DENSE_METHODS.values():
+        run_length[method] = machine_tuning.auto_slice_length(
+            base, density, size, target, max_length)
+    offsets = {}
+    advised_all = True
+    for key, methods in (("result_base_offset_sparse", SPARSE_OUTPUT_METHODS),
+                         ("result_base_offset_dense", DENSE_METHODS)):
+        buffers = {}
+        for offset in OFFSETS:
+            buffers[offset] = huge_page_array(size * size, dtype, offset)
+            advised_all = advised_all and buffers[offset][2]
+        rounds = {offset: {name: [] for name in methods} for offset in OFFSETS}
+        for r in range(OFFSET_ROUNDS):
+            order = OFFSETS[r % len(OFFSETS):] + OFFSETS[:r % len(OFFSETS)]
+            for offset in order:
+                for name, method in methods.items():
+                    rounds[offset][name].append(measure(
+                        "offset", A, B, buffers[offset][0], name, method,
+                        TOTAL_LABEL, f"offset={offset} round={r + 1}",
+                        run_length[method], method_tiles[name],
+                        f"density={OFFSET_DENSITY}"))
+        del buffers
+        table = {offset: {name: float(np.median(ts))
+                          for name, ts in times.items()}
+                 for offset, times in rounds.items()}
+        offsets[key], costs = machine_tuning.pick_candidate(
+            table, prefer=defaults[key], tolerance=OFFSET_TOLERANCE)
+        print(f"  {key}={offsets[key]} (relative cost "
+              f"{costs[offsets[key]]:.3f}, default {costs[defaults[key]]:.3f})")
+    if not advised_all:
+        print("  warning: MADV_HUGEPAGE failed; offsets measured on ordinary pages")
+
+    params = {**tile_params, **rule, **offsets}
+    comments = [
+        "Measured by find_thresholds.py (step 0); read by the library.",
+        f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
+        f"cpu={cpu_model()}",
+        f"threads={args.threads} dtype={args.dtype} size={size} "
+        f"warmup={args.warmup} trials={args.trials} "
+        f"configured_slice_length={configured} huge_pages={int(advised_all)}",
+    ]
+    params_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = params_path.with_suffix(".txt.tmp")
+    tmp.write_text(machine_tuning.format_machine_params(params, comments))
+    os.replace(tmp, params_path)
+    csv_path = params_path.with_suffix(".csv")
+    with open(csv_path, "w") as f:
+        f.write("stage,method,case,candidate,seconds\n")
+        for row in csv_rows:
+            f.write(",".join(str(v) for v in row[:4]) + f",{row[4]:.8f}\n")
+    print(f"  Saved {params_path} and {csv_path}\n")
+    return params
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -243,8 +512,10 @@ def main():
                         help="Bucket step size for sampling (default: 5)")
     parser.add_argument("--dtype", choices=["float32", "float64"],
                         default="float32")
-    parser.add_argument("--slice-length", type=int, default=1024,
-                        help="Slice length / BK (default: 1024)")
+    parser.add_argument("--slice-length", type=int, default=None,
+                        help="Fixed slice length for the threshold runs "
+                             "(default: the library's, as at run time: "
+                             "tile_sizes.txt and the automatic length)")
     parser.add_argument("--num-buckets", type=int, default=100)
     parser.add_argument("--platform", choices=["cpu"], default="cpu",
                         help="Target platform (default: cpu)")
@@ -254,8 +525,20 @@ def main():
                         help="Warmup runs before timing (default: 1)")
     parser.add_argument("--trials", type=int, default=3,
                         help="Timed runs, keep best (default: 3)")
-    parser.add_argument("--threads", type=int, default=4,
-                        help="CPU threads (default: 4, CPU platform only)")
+    parser.add_argument("--threads", type=int,
+                        default=len(os.sched_getaffinity(0))
+                        if hasattr(os, "sched_getaffinity") else os.cpu_count(),
+                        help="CPU threads; use the count the library will run "
+                             "with (default: all available CPUs)")
+    parser.add_argument("--machine-params", choices=["tune", "use"],
+                        default="tune",
+                        help="tune: measure and write machine_params.txt "
+                             "first (step 0); use: keep the existing file "
+                             "(or the defaults without one)")
+    parser.add_argument("--machine-params-only", action="store_true",
+                        help="Stop after step 0")
+    parser.add_argument("--tune-size", type=int, default=6000,
+                        help="Matrix dimension for step 0 (default: 6000)")
     parser.add_argument("--early-stop", type=int, default=3,
                         help="Consecutive non-winner tests to stop a row "
                              "(default: 3)")
@@ -274,10 +557,12 @@ def main():
     platform = args.platform
     es = args.early_stop
 
+    type_name = "float" if dtype == np.float32 else "double"
+    if args.machine_params_only and args.machine_params != "tune":
+        parser.error("--machine-params-only needs --machine-params tune")
     if args.output_dir:
         output_dir = Path(args.output_dir)
     else:
-        type_name = "float" if dtype == np.float32 else "double"
         if args.log_buckets:
             bucket_dir = f"log_{num_buckets}_c{args.curvature}"
         else:
@@ -293,12 +578,23 @@ def main():
     # -- Load library and build a platform-specific call closure ---------------
     lib = load_so("spalm.so")
 
+    params_path = (SCRIPT_DIR / "parameters" / platform / type_name /
+                   "machine_params.txt")
+    if args.machine_params == "tune":
+        tune_machine_params(lib, args, dtype, platform, type_name, params_path)
+        if args.machine_params_only:
+            return
+    else:
+        print(f"Machine parameters: "
+              f"{params_path if params_path.exists() else 'defaults (no file)'}")
+
     def call_fn(*, A_csr, B_csr, C, init_method):
         return call_spalm(lib, A_csr, B_csr, C, init_method,
                           dtype, BK, threads=args.threads)
 
-    print(f"Config: {M}x{K} matrices, platform={platform}, BK={BK}, "
-          f"{args.dtype}")
+    print(f"Config: {M}x{K} matrices, platform={platform}, "
+          f"BK={BK if BK is not None else 'library default'}, "
+          f"{args.dtype}, threads={args.threads}")
     print(f"Sampling {n} density levels: {buckets}")
     print(f"Trials: {args.warmup} warmup + {args.trials} timed, "
           f"early stop={es}")

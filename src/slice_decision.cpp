@@ -271,3 +271,88 @@ bool read_tile_sizes(
     file.close();
     return true;
 }
+
+bool parse_machine_params(const std::string &path, machine_params &params) {
+    std::ifstream file(path);
+    if (!file.is_open()) return true;
+    auto error = [&](const std::string &what) {
+        std::cerr << "Error: invalid machine parameter file " << path << ": "
+                  << what << std::endl;
+        return false;
+    };
+    auto power_of_two = [](long long v) { return v > 0 && (v & (v - 1)) == 0; };
+    std::string line;
+    while (std::getline(file, line)) {
+        const size_t start = line.find_first_not_of(" \t\r");
+        if (start == std::string::npos || line[start] == '#') continue;
+        const size_t colon = line.find(':');
+        if (colon == std::string::npos) return error("expected key: value");
+        std::string key = line.substr(start, colon - start);
+        key.erase(key.find_last_not_of(" \t") + 1);
+        std::istringstream iss(line.substr(colon + 1));
+        long long value;
+        std::string rest;
+        if (!(iss >> value) || (iss >> rest)) {
+            return error("'" + key + "' needs one integer");
+        }
+        int *tile = nullptr;
+        if (key == "tile_size_l2") tile = &params.tile_size_l2;
+        if (key == "tile_size_l3") tile = &params.tile_size_l3;
+        const char *methods[3] = {"sd", "ds", "dd"};
+        for (int m = 0; m < 3; ++m) {
+            if (key == std::string("tile_size_l2_") + methods[m])
+                tile = &params.method_tile_size_l2[m];
+            if (key == std::string("tile_size_l3_") + methods[m])
+                tile = &params.method_tile_size_l3[m];
+        }
+        if (tile) {
+            if (value < 1 || value > INT_MAX)
+                return error(key + " must be positive");
+            *tile = static_cast<int>(value);
+        } else if (key == "slice_target_entries") {
+            if (value < 1 || value > 32768) {
+                return error(key + " must be in [1, 32768]");
+            }
+            params.slice_target_entries = static_cast<int>(value);
+        } else if (key == "slice_length") {
+            if (!power_of_two(value) || value > 32768) {
+                return error(key + " must be a power of 2 in [1, 32768]");
+            }
+            params.slice_length = static_cast<int>(value);
+        } else if (key == "slice_length_max") {
+            if (!power_of_two(value) || value > 32768) {
+                return error(key + " must be a power of 2 in [1, 32768]");
+            }
+            params.slice_length_max = static_cast<int>(value);
+        } else if (
+            key == "result_base_offset_sparse" ||
+            key == "result_base_offset_dense"
+        ) {
+            // The caller's allocation accepts offsets below 4096 that are a
+            // multiple of the value size; 8 covers float and double.
+            if (value < 0 || value >= 4096 || value % 8 != 0) {
+                return error(key + " must be a multiple of 8 in [0, 4096)");
+            }
+            (key == "result_base_offset_sparse"
+                 ? params.result_base_offset_sparse
+                 : params.result_base_offset_dense) = static_cast<int>(value);
+        } else {
+            return error("unknown key '" + key + "'");
+        }
+    }
+    params.path = path;
+    return true;
+}
+
+bool read_machine_params(
+    const int type, const char *platform, machine_params &params
+) {
+    const std::string params_base = resolve_path_near_lib(
+        reinterpret_cast<void *>(&read_machine_params), "../parameters",
+        "parameters"
+    );
+    const std::string type_dir = (type == 0) ? "/float" : "/double";
+    return parse_machine_params(
+        params_base + "/" + platform + type_dir + "/machine_params.txt", params
+    );
+}

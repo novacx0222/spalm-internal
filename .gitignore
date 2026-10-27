@@ -3,6 +3,8 @@
 *.csv
 *.png
 decision_thresholds.txt
+machine_params.txt
+machine_params.txt.tmp
 OpenBLAS-0.3.30*
 example/bin/
 

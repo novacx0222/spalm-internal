@@ -140,9 +140,24 @@ int run_mkl_backend(
 // average entries per subrow of the sparse side(s) the decision table uses
 // stay below 16: R for SD, S for DS, the sparser of both for DD or mixed
 // tables. Only SS slice pairs: unchanged.
+// MACHINE_SD, MACHINE_DS or MACHINE_DD when that is the only dense-path
+// algorithm the decision table uses (SS may be used too), else -1.
+static int only_dense_path_method() {
+    bool used[4] = {};
+    for (int left = 0; left <= num_buckets; ++left)
+        for (int right = 0; right <= num_buckets; ++right)
+            used[get_alg(left, right)] = true;
+    const int count = used[DENSE_DENSE_LEFT_INNER_KERNEL] +
+                      used[DENSE_DENSE_RIGHT_INNER_KERNEL] + used[DENSE_DENSE];
+    if (count != 1) return -1;
+    if (used[DENSE_DENSE_LEFT_INNER_KERNEL]) return MACHINE_SD;
+    if (used[DENSE_DENSE_RIGHT_INNER_KERNEL]) return MACHINE_DS;
+    return MACHINE_DD;
+}
+
 static int choose_slice_length(
     const int configured, const int *Ri, const int M, const int *Si,
-    const int N, const int K
+    const int N, const int K, const int target_entries, const int max_length
 ) {
     bool used[4] = {};
     for (int left = 0; left <= num_buckets; ++left)
@@ -164,7 +179,8 @@ static int choose_slice_length(
     if (r_sparse) d = std::min(d, density(Ri, M));
     if (s_sparse) d = std::min(d, density(Si, N));
     int length = configured;
-    while (length < 2048 && length < K && d * std::min(length, K) < 16.0)
+    while (length < max_length && length < K &&
+           d * std::min(length, K) < target_entries)
         length *= 2;
     std::cout << "[slice-length] configured=" << configured
               << " chosen=" << length
@@ -293,9 +309,13 @@ int spalm_matmul(
         return status;
     }
 
-    const int sl = options.auto_slice_length
-                       ? choose_slice_length(slice_length, Ri, M, Si, N, K)
-                       : slice_length;
+    const int sl =
+        options.auto_slice_length
+            ? choose_slice_length(
+                  slice_length, Ri, M, Si, N, K, options.slice_target_entries,
+                  options.slice_length_max
+              )
+            : slice_length;
 
     // type is validated by spalm(): 0 = float, 1 = double.
     const int R_ik_slice_height = 12;
@@ -540,9 +560,44 @@ static int spalm_impl(
         std::cerr << "Initialize tile sizes." << std::endl;
         return SPALM_CONFIG_ERROR;
     }
+    // Measured on this machine by find_thresholds.py, if it was run here;
+    // explicit keys override both files.
+    machine_params machine;
+    if (!read_machine_params(type, "cpu", machine)) {
+        return SPALM_CONFIG_ERROR;
+    }
+    if (machine.slice_length > 0) slice_length = machine.slice_length;
+    if (machine.tile_size_l2 > 0) tile_size_l2 = machine.tile_size_l2;
+    if (machine.tile_size_l3 > 0) tile_size_l3 = machine.tile_size_l3;
+    const int dense_method = only_dense_path_method();
+    if (dense_method >= 0) {
+        if (machine.method_tile_size_l2[dense_method] > 0)
+            tile_size_l2 = machine.method_tile_size_l2[dense_method];
+        if (machine.method_tile_size_l3[dense_method] > 0)
+            tile_size_l3 = machine.method_tile_size_l3[dense_method];
+    }
     slice_length = get_int("slice_length", slice_length);
     tile_size_l2 = get_int("tile_size_l2", tile_size_l2);
     tile_size_l3 = get_int("tile_size_l3", tile_size_l3);
+    options.slice_target_entries =
+        get_int("slice_target_entries", machine.slice_target_entries);
+    options.slice_length_max =
+        get_int("slice_length_max", machine.slice_length_max);
+    if (options.slice_target_entries < 1 ||
+        options.slice_target_entries > 32768) {
+        return invalid("slice_target_entries must be in [1, 32768]");
+    }
+    if (options.slice_length_max < 1 || options.slice_length_max > 32768 ||
+        (options.slice_length_max & (options.slice_length_max - 1)) != 0) {
+        return invalid("slice_length_max must be a power of 2 in [1, 32768]");
+    }
+    std::cout << "[machine-params] file="
+              << (machine.path.empty() ? "none" : machine.path)
+              << " slice_length=" << slice_length
+              << " tile_size_l2=" << tile_size_l2
+              << " tile_size_l3=" << tile_size_l3
+              << " slice_target_entries=" << options.slice_target_entries
+              << " slice_length_max=" << options.slice_length_max << std::endl;
 
     std::cout << "Slice length: " << slice_length << std::endl;
     // Subrow and slice lengths are uint16_t; 0 used to pass the power-of-2
@@ -620,4 +675,23 @@ extern "C" int spalm(
         std::cerr << "spalm: unknown exception" << std::endl;
     }
     return SPALM_INTERNAL_ERROR;
+}
+
+// Where the caller should start a dense result on 2 MiB huge pages, in bytes
+// past the page boundary, for the sparse-output backends (SS, MKL sparse:
+// sparse_output != 0) or the others. From machine_params.txt, else the
+// defaults (16 and 0). Returns -1 for a bad type or parameter file.
+extern "C" int spalm_result_base_offset(int type, int sparse_output) {
+    if (type != 0 && type != 1) return -1;
+    try {
+        machine_params machine;
+        if (!read_machine_params(type, "cpu", machine)) return -1;
+        return sparse_output ? machine.result_base_offset_sparse
+                             : machine.result_base_offset_dense;
+    } catch (const std::exception &e) {
+        std::cerr << "spalm: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "spalm: unknown exception" << std::endl;
+    }
+    return -1;
 }
