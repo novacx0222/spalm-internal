@@ -456,6 +456,7 @@ static int spalm_impl(
     options.compact_keys = get_int("compact_keys", 1) != 0;
     options.selective_packing = get_int("selective_packing", 1) != 0;
     options.ss_contiguous = get_int("ss_contiguous", 1) != 0;
+    options.sd_ds_full_rows = get_int("sd_ds_full_rows", 1) != 0;
 
     std::cout << "SPALM MATMUL" << std::endl;
     std::cout << M << " " << K << " " << N << std::endl;

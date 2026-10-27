@@ -71,6 +71,11 @@ public:
     // diagnostics and tests only.
     size_t subrow_workspace_bytes = 0;
 
+    // No row repeats a key (the subrow scan checks every adjacent pair).
+    // Then a subrow is full, one entry per key of its slice column in key
+    // order, exactly when its length is the column's key count.
+    bool keys_strictly_increasing = false;
+
     // Memory ownership: all dynamically allocated arrays are stored here
     std::vector<std::unique_ptr<int[]>> owned_int_arrays;
     std::vector<std::unique_ptr<subrow[]>> owned_subrow_arrays;
@@ -175,7 +180,7 @@ void create_subrow_csr(ss_matrix<T> &ssm, const int threads) {
     auto tuples =
         std::make_unique_for_overwrite<sr_tuple[]>(tuple_offsets.back());
     // Per-range error flags; reported after the parallel region.
-    enum : int { KEY_RANGE = 1, UNSORTED = 2, LONG_SUBROW = 4 };
+    enum : int { KEY_RANGE = 1, UNSORTED = 2, LONG_SUBROW = 4, REPEATED = 8 };
     std::vector<int> errors(threads, 0);
 
     // Phase 1+3 combined: single pass over Rj per thread.
@@ -214,6 +219,7 @@ void create_subrow_csr(ss_matrix<T> &ssm, const int threads) {
 
             for (int k = nnz_start + 1; k < nnz_end; k++) {
                 if (Rj[k] < Rj[k - 1]) errors[tid] |= UNSORTED;
+                if (Rj[k] == Rj[k - 1]) errors[tid] |= REPEATED;
                 int next_prefix = Rj[k] >> sl_shift;
                 if (next_prefix != curr_prefix) {
                     append(curr_prefix, subrow_start, k - subrow_start);
@@ -244,6 +250,9 @@ void create_subrow_csr(ss_matrix<T> &ssm, const int threads) {
             "SPALM subrow longer than 65535 entries (duplicate column indices)"
         );
     }
+    // Repeated keys are accepted (not an error); they only disable the
+    // full-subrow fast path of SD/DS.
+    ssm.keys_strictly_increasing = !(error & REPEATED);
 
     // Phase 2: sequential prefix sum (O(M), unchanged)
     for (int i = 0; i < M; i++) sr_row_ptrs[i + 1] += sr_row_ptrs[i];

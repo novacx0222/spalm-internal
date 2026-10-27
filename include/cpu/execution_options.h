@@ -14,4 +14,8 @@ struct cpu_execution_options {
     // SS: blocks of 8 consecutive output columns use plain vector loads and
     // stores instead of gather/scatter (key: ss_contiguous).
     bool ss_contiguous = true;
+    // SD/DS: full sparse subrows (one value per key of the slice column) are
+    // multiplied four at a time, sharing every packed-row load
+    // (key: sd_ds_full_rows).
+    bool sd_ds_full_rows = true;
 };

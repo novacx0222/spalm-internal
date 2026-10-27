@@ -45,14 +45,15 @@ template <typename T>
 void dense_left_inner_kernel(
     const slice &R_s, ss_matrix<T> &R_ssm, const slice &S_s,
     const int *S_row_idxs, const int nr, const T *packed_mem, const int M,
-    const int N, T *ret, const int k_offset
+    const int N, T *ret, const int k_offset, const bool full_rows
 );
 
 template <typename T>
 void dense_right_inner_kernel(
     const slice &S_s, ss_matrix<T> &S_ssm, const slice &R_s,
     const int *R_row_idxs, const int mr, const T *packed_mem, const int M,
-    const int N, T *ret, __m512i gather_idx_512, const int k_offset
+    const int N, T *ret, __m512i gather_idx_512, const int k_offset,
+    const bool full_rows
 );
 
 // Which packed representations the dense-path algorithms of this call read:
@@ -94,7 +95,7 @@ void inline dense_dense_matmul_task_shared(
     const int R_slice_end, const int S_slice_start, const int S_slice_end,
     T *R_packed_mem, BIT_DTYPE *R_bm, T *S_packed_mem, BIT_DTYPE *S_bm,
     ss_matrix<T> &R_ssm, ss_matrix<T> &S_ssm, T *ret, bool sparse_result,
-    const dense_packing_policy &policy
+    const dense_packing_policy &policy, const bool full_rows
 ) {
     const int M = R_ssm.csr_mat.rows;
     const int K = R_ssm.csr_mat.cols;
@@ -159,13 +160,14 @@ void inline dense_dense_matmul_task_shared(
                 dense_right_inner_kernel(
                     S_s, S_ssm, R_s, R_row_idxs, mr,
                     &R_packed_mem[R_s_idx * sl * mr], M, N, ret, gather_idx,
-                    k_offset
+                    k_offset, full_rows
                 );
                 break;
             case DENSE_DENSE_LEFT_INNER_KERNEL:
                 dense_left_inner_kernel(
                     R_s, R_ssm, S_s, S_row_idxs, nr,
-                    &S_packed_mem[S_s_idx * sl * nr], M, N, ret, k_offset
+                    &S_packed_mem[S_s_idx * sl * nr], M, N, ret, k_offset,
+                    full_rows
                 );
                 break;
             case DENSE_DENSE:
@@ -243,9 +245,11 @@ void dense_dense_matmul(
     const size_t pad = pad_bytes / sizeof(T);
     const dense_packing_policy policy =
         get_dense_packing_policy(options.selective_packing);
+    const bool full_rows = options.sd_ds_full_rows;
     std::cout << "[dense-packing-policy] pack_r=" << policy.pack_r
               << " pack_s=" << policy.pack_s << " bitmaps=" << policy.bitmaps
-              << " fixed_alg=" << policy.fixed_alg << std::endl;
+              << " fixed_alg=" << policy.fixed_alg
+              << " sd_ds_full_rows=" << full_rows << std::endl;
     aligned_unique_ptr<T> R_packed_mem;
     if (policy.pack_r) {
         R_packed_mem = make_aligned_unique<T>(R_block_size + pad);
@@ -380,7 +384,7 @@ void dense_dense_matmul(
                                 R_packed_mem.get(), R_bm.get(),
                                 S_packed_mem_threads[worker].get(),
                                 S_bm_threads[worker].get(), R_ssm, S_ssm, ret,
-                                sparse_result, policy
+                                sparse_result, policy, full_rows
                             );
                         };
                         switch (policy.fixed_alg) {
@@ -521,11 +525,111 @@ void inline sparse_dense_inner_kernel_iter(
     }
 }
 
+// SIMD operations of the full-subrow helper below.
+template <typename T> struct packed_simd;
+
+template <> struct packed_simd<double> {
+    using reg = __m512d;
+    static constexpr int lanes = 8;
+    static inline reg zero() { return _mm512_setzero_pd(); }
+    static inline reg broadcast(const double *v) { return _mm512_set1_pd(*v); }
+    static inline reg load(const double *p) { return _mm512_loadu_pd(p); }
+    static inline reg fmadd(reg a, reg b, reg c) {
+        return _mm512_fmadd_pd(a, b, c);
+    }
+};
+
+template <> struct packed_simd<float> {
+    using reg = __m512;
+    static constexpr int lanes = 16;
+    static inline reg zero() { return _mm512_setzero_ps(); }
+    static inline reg broadcast(const float *v) { return _mm512_set1_ps(*v); }
+    static inline reg load(const float *p) { return _mm512_loadu_ps(p); }
+    static inline reg fmadd(reg a, reg b, reg c) {
+        return _mm512_fmadd_ps(a, b, c);
+    }
+};
+
+// Keys of this slice column, or 0 when full subrows cannot be recognized
+// (path disabled or a row repeats a key). A subrow of that length holds every
+// key of the column once, in order: its k-th value belongs to packed row k.
+template <typename T>
+static inline int full_subrow_keys(
+    const ss_matrix<T> &sparse, const int k_offset, const bool enabled
+) {
+    if (!enabled || !sparse.keys_strictly_increasing) return 0;
+    return std::max(0, std::min(sparse.sl, sparse.csr_mat.cols - k_offset));
+}
+
+// Rows full subrows at once: each packed row (one or two vectors) is loaded
+// once and multiplied with every subrow's value for that key, instead of once
+// per subrow; SD/DS are bound by these loads from L2. Every output still
+// adds its entries in key order, so results are unchanged.
+template <typename T, bool Two, int Rows>
+static inline __attribute__((always_inline)) void packed_spmm_full_rows(
+    const T *const *values, const int keys, const T *packed, const int stride,
+    typename packed_simd<T>::reg *acc0, typename packed_simd<T>::reg *acc1
+) {
+    using S = packed_simd<T>;
+    for (int k = 0; k < keys; ++k) {
+        const T *row = packed + stride * k;
+        const auto p0 = S::load(row);
+        typename S::reg p1;
+        if constexpr (Two) p1 = S::load(row + S::lanes);
+#pragma GCC unroll 4
+        for (int r = 0; r < Rows; ++r) {
+            const auto v = S::broadcast(values[r] + k);
+            acc0[r] = S::fmadd(v, p0, acc0[r]);
+            if constexpr (Two) acc1[r] = S::fmadd(v, p1, acc1[r]);
+        }
+    }
+}
+
+// Multiplies the full subrows of a sparse slice with the packed panel, four
+// (then two, then one) at a time, and passes each result to
+// write(subrow index, acc0, acc1). Returns whether any subrow was full.
+template <typename T, bool Two, typename Write>
+static inline __attribute__((always_inline)) bool packed_spmm_full_subrows(
+    const slice &sparse, const ss_matrix<T> &ssm, const T *packed,
+    const int stride, const int keys, Write &&write
+) {
+    using S = packed_simd<T>;
+    using reg = typename S::reg;
+    if (keys == 0) return false;
+    const subrow *subrows = &ssm.sr_csc_mat.vals[sparse.start];
+    int full[32];
+    int count = 0;
+    for (int si = 0; si < sparse.len; si++)
+        if (subrows[si].len == keys) full[count++] = si;
+    int i = 0;
+    auto group = [&](auto rows) __attribute__((always_inline)) {
+        constexpr int Rows = decltype(rows)::value;
+        const T *values[Rows];
+        reg acc0[Rows], acc1[Rows];
+#pragma GCC unroll 4
+        for (int r = 0; r < Rows; ++r) {
+            values[r] = ssm.csr_mat.vals + subrows[full[i + r]].start;
+            acc0[r] = S::zero();
+            acc1[r] = S::zero();
+        }
+        packed_spmm_full_rows<T, Two, Rows>(
+            values, keys, packed, stride, acc0, acc1
+        );
+#pragma GCC unroll 4
+        for (int r = 0; r < Rows; ++r) write(full[i + r], acc0[r], acc1[r]);
+        i += Rows;
+    };
+    for (; i + 4 <= count;) group(std::integral_constant<int, 4>{});
+    if (i + 2 <= count) group(std::integral_constant<int, 2>{});
+    if (i < count) group(std::integral_constant<int, 1>{});
+    return count > 0;
+}
+
 template <>
 void dense_left_inner_kernel<double>(
     const slice &R_s, ss_matrix<double> &R_ssm, const slice &S_s,
     const int *S_row_idxs, const int nr, const double *packed_mem, const int M,
-    const int N, double *ret, const int k_offset
+    const int N, double *ret, const int k_offset, const bool full_rows
 ) {
     __mmask8 k0 = 0b11111111;
     __mmask8 k1 = 0b11111111;
@@ -557,18 +661,9 @@ void dense_left_inner_kernel<double>(
 
     const int J = S_row_idxs[0];
 
-    for (int si = 0; si < R_s.len; si++) {
-        const subrow &sr = R_ssm.sr_csc_mat.vals[R_s.start + si];
+    auto write = [&](const int si, __m512d res0,
+                     __m512d res1) __attribute__((always_inline)) {
         const int I = R_ssm.sr_csc_mat.row_idxs[R_s.start + si];
-        if (sr.len == 0) {
-            continue;
-        }
-
-        __m512d res0, res1;
-        sparse_dense_inner_kernel_iter(
-            sr, R_ssm.csr_mat, packed_mem, nr, k_offset, res0, res1
-        );
-
         if (S_s.continuous) {
             // Masked loads: unmasked ones read past the row (and past the
             // end of ret for the last row) when fewer than 16 columns remain.
@@ -600,6 +695,23 @@ void dense_left_inner_kernel<double>(
                 8
             );
         }
+    };
+    // Full subrows first, four at a time with shared packed loads.
+    const int keys = full_subrow_keys(R_ssm, k_offset, full_rows);
+    packed_spmm_full_subrows<double, true>(
+        R_s, R_ssm, packed_mem, nr, keys, write
+    );
+    for (int si = 0; si < R_s.len; si++) {
+        const subrow &sr = R_ssm.sr_csc_mat.vals[R_s.start + si];
+        if (sr.len == 0 || sr.len == keys) {
+            continue;
+        }
+
+        __m512d res0, res1;
+        sparse_dense_inner_kernel_iter(
+            sr, R_ssm.csr_mat, packed_mem, nr, k_offset, res0, res1
+        );
+        write(si, res0, res1);
     }
 }
 
@@ -607,7 +719,7 @@ template <>
 void dense_left_inner_kernel<float>(
     const slice &R_s, ss_matrix<float> &R_ssm, const slice &S_s,
     const int *S_row_idxs, const int nr, const float *packed_mem, const int M,
-    const int N, float *ret, const int k_offset
+    const int N, float *ret, const int k_offset, const bool full_rows
 ) {
     __mmask16 k0 = 0b1111111111111111;
     __mmask16 k1 = 0b1111111111111111;
@@ -639,18 +751,9 @@ void dense_left_inner_kernel<float>(
 
     const int J = S_row_idxs[0];
 
-    for (int si = 0; si < R_s.len; si++) {
-        const subrow &sr = R_ssm.sr_csc_mat.vals[R_s.start + si];
+    auto write = [&](const int si, __m512 res0,
+                     __m512 res1) __attribute__((always_inline)) {
         const int I = R_ssm.sr_csc_mat.row_idxs[R_s.start + si];
-        if (sr.len == 0) {
-            continue;
-        }
-
-        __m512 res0, res1;
-        sparse_dense_inner_kernel_iter(
-            sr, R_ssm.csr_mat, packed_mem, nr, k_offset, res0, res1
-        );
-
         if (S_s.continuous) {
             // Masked loads, as in the double kernel above.
             res0 =
@@ -681,6 +784,23 @@ void dense_left_inner_kernel<float>(
                 4
             );
         }
+    };
+    // Full subrows first, four at a time with shared packed loads.
+    const int keys = full_subrow_keys(R_ssm, k_offset, full_rows);
+    packed_spmm_full_subrows<float, true>(
+        R_s, R_ssm, packed_mem, nr, keys, write
+    );
+    for (int si = 0; si < R_s.len; si++) {
+        const subrow &sr = R_ssm.sr_csc_mat.vals[R_s.start + si];
+        if (sr.len == 0 || sr.len == keys) {
+            continue;
+        }
+
+        __m512 res0, res1;
+        sparse_dense_inner_kernel_iter(
+            sr, R_ssm.csr_mat, packed_mem, nr, k_offset, res0, res1
+        );
+        write(si, res0, res1);
     }
 }
 
@@ -688,7 +808,8 @@ template <>
 void dense_right_inner_kernel<double>(
     const slice &S_s, ss_matrix<double> &S_ssm, const slice &R_s,
     const int *R_row_idxs, const int mr, const double *packed_mem, const int M,
-    const int N, double *ret, __m512i gather_idx_512, const int k_offset
+    const int N, double *ret, __m512i gather_idx_512, const int k_offset,
+    const bool full_rows
 ) {
     __mmask8 k0 = 0b11111111;
     __mmask8 k1 = 0b1111;
@@ -721,18 +842,9 @@ void dense_right_inner_kernel<double>(
 
     __m256i gather_idx = _mm512_castsi512_si256(gather_idx_512);
 
-    for (int si = 0; si < S_s.len; si++) {
-        const subrow &sr = S_ssm.sr_csc_mat.vals[S_s.start + si];
+    auto write = [&](const int si, __m512d res0,
+                     __m512d res1) __attribute__((always_inline)) {
         const int J = S_ssm.sr_csc_mat.row_idxs[S_s.start + si];
-        if (sr.len == 0) {
-            continue;
-        }
-
-        __m512d res0, res1;
-        sparse_dense_inner_kernel_iter(
-            sr, S_ssm.csr_mat, packed_mem, mr, k_offset, res0, res1
-        );
-
         if (R_s.continuous) {
             res0 = _mm512_add_pd(
                 res0, _mm512_mask_i32gather_pd(
@@ -769,6 +881,23 @@ void dense_right_inner_kernel<double>(
                 8
             );
         }
+    };
+    // Full subrows first, four at a time with shared packed loads.
+    const int keys = full_subrow_keys(S_ssm, k_offset, full_rows);
+    packed_spmm_full_subrows<double, true>(
+        S_s, S_ssm, packed_mem, mr, keys, write
+    );
+    for (int si = 0; si < S_s.len; si++) {
+        const subrow &sr = S_ssm.sr_csc_mat.vals[S_s.start + si];
+        if (sr.len == 0 || sr.len == keys) {
+            continue;
+        }
+
+        __m512d res0, res1;
+        sparse_dense_inner_kernel_iter(
+            sr, S_ssm.csr_mat, packed_mem, mr, k_offset, res0, res1
+        );
+        write(si, res0, res1);
     }
 }
 
@@ -776,7 +905,8 @@ template <>
 void dense_right_inner_kernel<float>(
     const slice &S_s, ss_matrix<float> &S_ssm, const slice &R_s,
     const int *R_row_idxs, const int mr, const float *packed_mem, const int M,
-    const int N, float *ret, __m512i gather_idx, const int k_offset
+    const int N, float *ret, __m512i gather_idx, const int k_offset,
+    const bool full_rows
 ) {
     __mmask16 k0 = 0b111111111111;
     __m512i scatter_idx0;
@@ -802,18 +932,9 @@ void dense_right_inner_kernel<float>(
 
     const int I = R_row_idxs[0];
 
-    for (int si = 0; si < S_s.len; si++) {
-        const subrow &sr = S_ssm.sr_csc_mat.vals[S_s.start + si];
+    auto write = [&](const int si, __m512 res0,
+                     __m512 res1) __attribute__((always_inline)) {
         const int J = S_ssm.sr_csc_mat.row_idxs[S_s.start + si];
-        if (sr.len == 0) {
-            continue;
-        }
-
-        __m512 res0, res1;
-        sparse_dense_inner_kernel_iter(
-            sr, S_ssm.csr_mat, packed_mem, mr, k_offset, res0, res1
-        );
-
         if (R_s.continuous) {
             res0 = _mm512_add_ps(
                 res0, _mm512_mask_i32gather_ps(
@@ -833,6 +954,23 @@ void dense_right_inner_kernel<float>(
                 4
             );
         }
+    };
+    // Full subrows first, four at a time with shared packed loads.
+    const int keys = full_subrow_keys(S_ssm, k_offset, full_rows);
+    packed_spmm_full_subrows<float, false>(
+        S_s, S_ssm, packed_mem, mr, keys, write
+    );
+    for (int si = 0; si < S_s.len; si++) {
+        const subrow &sr = S_ssm.sr_csc_mat.vals[S_s.start + si];
+        if (sr.len == 0 || sr.len == keys) {
+            continue;
+        }
+
+        __m512 res0, res1;
+        sparse_dense_inner_kernel_iter(
+            sr, S_ssm.csr_mat, packed_mem, mr, k_offset, res0, res1
+        );
+        write(si, res0, res1);
     }
 }
 

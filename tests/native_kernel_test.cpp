@@ -44,13 +44,35 @@ static csr make_csr(int rows, int K, Pick pick, std::mt19937 &rng) {
     return m;
 }
 
+// Rows with the hot keys except the second, and the first one twice: as many
+// entries as the hot keys, but not every key (a full-row proof by length
+// alone would be wrong).
+static csr
+make_repeated(int rows, const std::vector<int> &hot, std::mt19937 &rng) {
+    csr m;
+    m.rows = rows;
+    for (int r = 0; r < rows; ++r) {
+        for (size_t h = 0; h < hot.size(); ++h) {
+            if (h == 1) continue;
+            const int copies = h == 0 ? 2 : 1;
+            for (int c = 0; c < copies; ++c) {
+                m.col.push_back(hot[h]);
+                int v = int(rng() % 7) - 3;
+                m.val.push_back(v ? v : 4);
+            }
+        }
+        m.ptr.push_back(int(m.col.size()));
+    }
+    return m;
+}
+
 template <typename T>
 static std::vector<T> reference(const csr &R, const csr &S, int K) {
     std::vector<T> out(size_t(R.rows) * S.rows, T(0));
     std::vector<double> row(K);
     for (int i = 0; i < R.rows; ++i) {
         std::fill(row.begin(), row.end(), 0.0);
-        for (int p = R.ptr[i]; p < R.ptr[i + 1]; ++p) row[R.col[p]] = R.val[p];
+        for (int p = R.ptr[i]; p < R.ptr[i + 1]; ++p) row[R.col[p]] += R.val[p];
         for (int j = 0; j < S.rows; ++j) {
             double acc = 0;
             for (int q = S.ptr[j]; q < S.ptr[j + 1]; ++q)
@@ -136,6 +158,12 @@ int main(int argc, char **argv) {
         struct pattern {
             const char *name;
             csr R, S;
+            // Methods whose packed side has no repeated key (packing keeps
+            // only the last of repeated entries: an old, separate issue).
+            std::vector<const char *> methods = {
+                "sparse", "dense_left_spmm_inner_kernel",
+                "dense_right_spmm_inner_kernel", "dense_bm_inner_kernel"
+            };
         };
         std::vector<pattern> patterns;
         // Uniform 5%: uneven subrow lengths and scattered output columns.
@@ -159,6 +187,45 @@ int main(int argc, char **argv) {
                  N, K, [&](int r, int k) { return hot[k] && r % 7 != 3; }, rng
              )}
         );
+        // Some subrows full (every key of the slice column), others not.
+        patterns.push_back(
+            {"full-mixed",
+             make_csr(
+                 M, K,
+                 [&](int r, int k) {
+                     return hot[k] && (r % 3 == 0 || u(rng) < 0.5);
+                 },
+                 rng
+             ),
+             make_csr(
+                 N, K,
+                 [&](int r, int k) {
+                     return hot[k] && (r % 2 == 0 || u(rng) < 0.4);
+                 },
+                 rng
+             )}
+        );
+        // A repeated key on the sparse side: subrows as long as a full one
+        // that miss a key must take the general path.
+        std::vector<int> hot_keys;
+        for (int k = 0; k < K; ++k)
+            if (hot[k]) hot_keys.push_back(k);
+        const csr all_hot_R =
+            make_csr(M, K, [&](int, int k) { return hot[k]; }, rng);
+        const csr all_hot_S =
+            make_csr(N, K, [&](int, int k) { return hot[k]; }, rng);
+        patterns.push_back(
+            {"repeat-R",
+             make_repeated(M, hot_keys, rng),
+             all_hot_S,
+             {"sparse", "dense_left_spmm_inner_kernel"}}
+        );
+        patterns.push_back(
+            {"repeat-S",
+             all_hot_R,
+             make_repeated(N, hot_keys, rng),
+             {"dense_right_spmm_inner_kernel"}}
+        );
         // Row pattern with empty rows on both sides.
         patterns.push_back(
             {"row",
@@ -172,30 +239,31 @@ int main(int argc, char **argv) {
              )}
         );
         for (auto &pt : patterns) {
-            for (const char *method :
-                 {"sparse", "dense_left_spmm_inner_kernel",
-                  "dense_right_spmm_inner_kernel", "dense_bm_inner_kernel"}) {
-                for (const char *selective : {"0", "1"}) {
-                    for (const char *contiguous : {"0", "1"}) {
-                        for (const char *threads : {"1", "4"}) {
-                            for (const char *slice : {"512", "64"}) {
-                                std::vector<std::pair<std::string, std::string>>
-                                    o = {
-                                        {"init_method", method},
-                                        {"threads", threads},
-                                        {"selective_packing", selective},
-                                        {"ss_contiguous", contiguous},
-                                        {"slice_length", slice}
-                                };
-                                std::string label = std::string(sh.name) + "/" +
-                                                    pt.name + "/" + method;
-                                failures += !run_case<double>(
-                                    spalm, label.c_str(), pt.R, pt.S, K, o
-                                );
-                                failures += !run_case<float>(
-                                    spalm, label.c_str(), pt.R, pt.S, K, o
-                                );
-                                cases += 2;
+            for (const char *method : pt.methods) {
+                for (const char *full : {"0", "1"}) {
+                    for (const char *selective : {"0", "1"}) {
+                        for (const char *contiguous : {"0", "1"}) {
+                            for (const char *threads : {"1", "4"}) {
+                                for (const char *slice : {"512", "64"}) {
+                                    std::vector<
+                                        std::pair<std::string, std::string>>
+                                        o = {{"init_method", method},
+                                             {"threads", threads},
+                                             {"selective_packing", selective},
+                                             {"sd_ds_full_rows", full},
+                                             {"ss_contiguous", contiguous},
+                                             {"slice_length", slice}};
+                                    std::string label = std::string(sh.name) +
+                                                        "/" + pt.name + "/" +
+                                                        method;
+                                    failures += !run_case<double>(
+                                        spalm, label.c_str(), pt.R, pt.S, K, o
+                                    );
+                                    failures += !run_case<float>(
+                                        spalm, label.c_str(), pt.R, pt.S, K, o
+                                    );
+                                    cases += 2;
+                                }
                             }
                         }
                     }
@@ -204,7 +272,7 @@ int main(int argc, char **argv) {
         }
     }
     std::printf(
-        "%s: %d native kernel cases (SS/SD/DS/DD x selective "
+        "%s: %d native kernel cases (SS/SD/DS/DD x full rows x selective "
         "packing x SS contiguous x threads x slice length x float/double), "
         "%d failed\n",
         failures ? "FAIL" : "PASS", cases, failures
