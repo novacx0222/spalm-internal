@@ -23,4 +23,8 @@ struct cpu_execution_options {
     // -1: from the data size and the shared (L3) cache size, read at run
     // time; 0 or 1: off; n > 1: n blocks (key: ss_column_blocks).
     int ss_column_blocks = -1;
+    // DS without DD: pack R with 16 values per key instead of the 12 R rows
+    // of a slice, so the packed rows DS loads are cache-line aligned (the
+    // DD kernel needs 12) (key: ds_aligned_panels).
+    bool ds_aligned_panels = true;
 };

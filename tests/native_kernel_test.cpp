@@ -249,35 +249,44 @@ int main(int argc, char **argv) {
                 const std::vector<const char *> column_blocks =
                     ss ? std::vector<const char *>{"-1", "1", "3"}
                        : std::vector<const char *>{"-1"};
-                for (const char *blocks : column_blocks) {
-                    for (const char *full : {"0", "1"}) {
-                        for (const char *selective : {"0", "1"}) {
-                            for (const char *contiguous : {"0", "1"}) {
-                                for (const char *threads : {"1", "4"}) {
-                                    for (const char *slice : {"512", "64"}) {
-                                        std::vector<
-                                            std::pair<std::string, std::string>>
-                                            o = {
-                                                {"init_method", method},
-                                                {"threads", threads},
-                                                {"selective_packing", selective},
-                                                {"sd_ds_full_rows", full},
-                                                {"ss_column_blocks", blocks},
-                                                {"ss_contiguous", contiguous},
-                                                {"slice_length", slice}
-                                        };
-                                        std::string label =
-                                            std::string(sh.name) + "/" +
-                                            pt.name + "/" + method;
-                                        failures += !run_case<double>(
-                                            spalm, label.c_str(), pt.R, pt.S, K,
-                                            o
-                                        );
-                                        failures += !run_case<float>(
-                                            spalm, label.c_str(), pt.R, pt.S, K,
-                                            o
-                                        );
-                                        cases += 2;
+                const bool ds =
+                    std::string(method) == "dense_right_spmm_inner_kernel";
+                const std::vector<const char *> aligned_panels =
+                    ds ? std::vector<const char *>{"0", "1"}
+                       : std::vector<const char *>{"1"};
+                for (const char *aligned : aligned_panels) {
+                    for (const char *blocks : column_blocks) {
+                        for (const char *full : {"0", "1"}) {
+                            for (const char *selective : {"0", "1"}) {
+                                for (const char *contiguous : {"0", "1"}) {
+                                    for (const char *threads : {"1", "4"}) {
+                                        for (const char *slice :
+                                             {"512", "64"}) {
+                                            std::vector<std::pair<
+                                                std::string, std::string>>
+                                                o = {
+                                                    {"init_method", method},
+                                                    {"threads", threads},
+                                                    {"selective_packing", selective},
+                                                    {"sd_ds_full_rows", full},
+                                                    {"ss_column_blocks", blocks},
+                                                    {"ds_aligned_panels", aligned},
+                                                    {"ss_contiguous", contiguous},
+                                                    {"slice_length", slice}
+                                            };
+                                            std::string label =
+                                                std::string(sh.name) + "/" +
+                                                pt.name + "/" + method;
+                                            failures += !run_case<double>(
+                                                spalm, label.c_str(), pt.R,
+                                                pt.S, K, o
+                                            );
+                                            failures += !run_case<float>(
+                                                spalm, label.c_str(), pt.R,
+                                                pt.S, K, o
+                                            );
+                                            cases += 2;
+                                        }
                                     }
                                 }
                             }
@@ -288,7 +297,8 @@ int main(int argc, char **argv) {
         }
     }
     std::printf(
-        "%s: %d native kernel cases (SS/SD/DS/DD x SS column blocks x full "
+        "%s: %d native kernel cases (SS/SD/DS/DD x DS aligned panels x SS "
+        "column blocks x full "
         "rows x selective "
         "packing x SS contiguous x threads x slice length x float/double), "
         "%d failed\n",

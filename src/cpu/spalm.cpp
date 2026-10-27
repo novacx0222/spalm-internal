@@ -458,6 +458,7 @@ static int spalm_impl(
     options.ss_contiguous = get_int("ss_contiguous", 1) != 0;
     options.sd_ds_full_rows = get_int("sd_ds_full_rows", 1) != 0;
     options.ss_column_blocks = get_int("ss_column_blocks", -1);
+    options.ds_aligned_panels = get_int("ds_aligned_panels", 1) != 0;
     if (options.ss_column_blocks < -1) {
         return invalid("ss_column_blocks must be -1 (auto), 0, 1 or a count");
     }

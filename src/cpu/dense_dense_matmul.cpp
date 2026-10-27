@@ -66,6 +66,10 @@ struct dense_packing_policy {
     bool bitmaps = true;
     // The one algorithm of every slice pair (no SS pairs), or -1 (mixed).
     int fixed_alg = -1;
+    // Values per key in packed R: the slice height (12, what DD needs), or
+    // 16 when only DS reads it, so each packed row is 128 bytes and the two
+    // 64-byte loads per key are cache-line aligned in double.
+    int r_stride = 0;
 };
 
 static dense_packing_policy get_dense_packing_policy(bool selective) {
@@ -101,7 +105,7 @@ void inline dense_dense_matmul_task_shared(
     const int K = R_ssm.csr_mat.cols;
     const int N = S_ssm.csr_mat.rows;
 
-    const int mr = R_ssm.sh;
+    const int mr = policy.r_stride;
     const int nr = S_ssm.sh;
 
     const int sl = R_ssm.sl;
@@ -236,20 +240,24 @@ void dense_dense_matmul(
     const int R_slices_per_l3 =
         std::min(div_ceil(tile_size_l3, mr), max_slices_in_col_R);
     const int bm_words = div_ceil(sl, BITS);
-    const size_t R_block_size = (size_t) R_slices_per_l3 * sl * mr;
+    dense_packing_policy policy =
+        get_dense_packing_policy(options.selective_packing);
+    policy.r_stride =
+        options.ds_aligned_panels && policy.pack_r && !policy.bitmaps ? 16 : mr;
+    const int r_stride = policy.r_stride;
+    const size_t R_block_size = (size_t) R_slices_per_l3 * sl * r_stride;
     const size_t R_bm_size = (size_t) R_slices_per_l3 * bm_words;
     // The SIMD kernels read past the last packed k row: DS loads 16 lanes
     // from 12-row R panels (up to 20 extra floats), and the DD kernel reads
     // one element past the S panel. Keep a zeroed tail after each buffer.
     constexpr size_t pad_bytes = 128;
     const size_t pad = pad_bytes / sizeof(T);
-    const dense_packing_policy policy =
-        get_dense_packing_policy(options.selective_packing);
     const bool full_rows = options.sd_ds_full_rows;
     std::cout << "[dense-packing-policy] pack_r=" << policy.pack_r
               << " pack_s=" << policy.pack_s << " bitmaps=" << policy.bitmaps
               << " fixed_alg=" << policy.fixed_alg
-              << " sd_ds_full_rows=" << full_rows << std::endl;
+              << " sd_ds_full_rows=" << full_rows << " r_stride=" << r_stride
+              << std::endl;
     aligned_unique_ptr<T> R_packed_mem;
     if (policy.pack_r) {
         R_packed_mem = make_aligned_unique<T>(R_block_size + pad);
@@ -303,8 +311,8 @@ void dense_dense_matmul(
                     for (int R_si = R_si_l3; R_si < R_si_l3_end; R_si++) {
                         const int s_idx = R_si - R_si_l3;
                         memset(
-                            &R_packed_mem[s_idx * sl * mr], 0,
-                            sizeof(T) * sl * mr
+                            &R_packed_mem[s_idx * sl * r_stride], 0,
+                            sizeof(T) * sl * r_stride
                         );
                         const slice &R_s = R_ssm.s_csc_mat.vals[R_si];
                         if (policy.bitmaps) {
@@ -313,14 +321,14 @@ void dense_dense_matmul(
                                 sizeof(BIT_DTYPE) * bm_words
                             );
                             pack_slice_new(
-                                R_s, R_ssm, k_offset, sl, mr,
-                                &R_packed_mem[s_idx * sl * mr],
+                                R_s, R_ssm, k_offset, sl, r_stride,
+                                &R_packed_mem[s_idx * sl * r_stride],
                                 &R_bm[s_idx * bm_words]
                             );
                         } else {
                             pack_slice_new<T, false>(
-                                R_s, R_ssm, k_offset, sl, mr,
-                                &R_packed_mem[s_idx * sl * mr], nullptr
+                                R_s, R_ssm, k_offset, sl, r_stride,
+                                &R_packed_mem[s_idx * sl * r_stride], nullptr
                             );
                         }
                     }
