@@ -75,23 +75,29 @@ int run_mkl_backend(
     if (backend == spalm_dispatch::Backend::MklDense) {
         std::cout << "Fallback: MKL dense-dense" << std::endl;
         auto start = std::chrono::high_resolution_clock::now();
-        // Implicit zeros require zero-initialized dense inputs.
-        auto R = std::make_unique<T[]>(checked_matrix_size(M, K));
-        auto S = std::make_unique<T[]>(checked_matrix_size(N, K));
+        // make_unique<T[]> value-initialized both inputs on one thread (about
+        // 1.85 s for two 16000 x 16000 doubles). Allocate them uninitialized;
+        // the fill loop zeroes each row (implicit zeros) before scattering
+        // its entries, so the first touch is spread over the threads too.
+        auto R = std::make_unique_for_overwrite<T[]>(checked_matrix_size(M, K));
+        auto S = std::make_unique_for_overwrite<T[]>(checked_matrix_size(N, K));
         auto end = std::chrono::high_resolution_clock::now();
         print_time("[mkl-dense-input-allocate]", end - start);
         start = end;
 #pragma omp parallel for num_threads(threads)
         for (int i = 0; i < M; ++i) {
-            for (int p = Ri[i]; p < Ri[i + 1]; ++p)
-                R[(size_t) i * K + Rj[p]] = Rv[p];
+            T *row = &R[(size_t) i * K];
+            std::fill(row, row + K, T(0));
+            for (int p = Ri[i]; p < Ri[i + 1]; ++p) row[Rj[p]] = Rv[p];
         }
 #pragma omp parallel for num_threads(threads)
         for (int i = 0; i < N; ++i) {
-            for (int p = Si[i]; p < Si[i + 1]; ++p)
-                S[(size_t) i * K + Sj[p]] = Sv[p];
+            T *row = &S[(size_t) i * K];
+            std::fill(row, row + K, T(0));
+            for (int p = Si[i]; p < Si[i + 1]; ++p) row[Sj[p]] = Sv[p];
         }
         end = std::chrono::high_resolution_clock::now();
+        // Zeroing included since inner-v6.
         print_time("[mkl-dense-input-fill]", end - start);
         start = end;
         baseline(

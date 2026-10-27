@@ -387,6 +387,37 @@ template <class T> void check_c_api() {
 }
 
 #ifndef SPALM_THRESHOLD_TEST_LIBRARY
+// FORCE_MKL_DENSE builds its dense inputs from uninitialized memory: every
+// implicit zero, including whole empty rows, must be written by the fill.
+// (ASan fills fresh allocations with garbage, so a missed zero shows here.)
+template <class T> void check_mkl_dense_inputs() {
+    constexpr int type = sizeof(T) == sizeof(float) ? 0 : 1;
+    const int m = 5, k = 7, n = 4;
+    int ri[] = {0, 0, 3, 3, 5, 5}, rj[] = {0, 3, 6, 1, 3};
+    T rv[] = {2, -1, 4, 3, 5};
+    int si[] = {0, 2, 2, 5, 6}, sj[] = {3, 6, 0, 1, 3, 6};
+    T sv[] = {7, 1, 2, -3, 4, 6};
+    T expected[m * n] = {};
+    for (int r = 0; r < m; ++r)
+        for (int c = 0; c < n; ++c)
+            for (int p = ri[r]; p < ri[r + 1]; ++p)
+                for (int q = si[c]; q < si[c + 1]; ++q)
+                    if (rj[p] == sj[q]) expected[r * n + c] += rv[p] * sv[q];
+    const char *keys[] = {"init_method", "threads"};
+    const char *vals[] = {"FORCE_MKL_DENSE", "4"};
+    T output[m * n] = {};
+    backend_calls = 0;
+    std::ostringstream log;
+    auto *old = std::cout.rdbuf(log.rdbuf());
+    const int status = spalm(
+        type, ri, rj, rv, si, sj, sv, m, k, n, false, output, nullptr, nullptr,
+        nullptr, 2, keys, vals
+    );
+    std::cout.rdbuf(old);
+    assert(status == SPALM_OK && backend_calls == 1);
+    for (int i = 0; i < m * n; ++i) assert(output[i] == expected[i]);
+}
+
 int main() {
     check_dispatch<float>();
     check_dispatch<double>();
@@ -394,9 +425,12 @@ int main() {
     check_key_compaction<double>();
     check_c_api<float>();
     check_c_api<double>();
+    check_mkl_dense_inputs<float>();
+    check_mkl_dense_inputs<double>();
     std::cout
         << "PASS: actual wrapper zero/empty exits, CSR ownership, "
            "scalar-checked dispatch, forced slice bypass, Inf semantics, C API "
-           "status codes and options; SIMD/MKL backends are test doubles\n";
+           "status codes and options, MKL dense input fill; SIMD/MKL backends are "
+           "test doubles\n";
 }
 #endif
