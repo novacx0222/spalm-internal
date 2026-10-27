@@ -151,7 +151,12 @@ int main(int argc, char **argv) {
     };
     // Tails: M not a multiple of 12, N not a multiple of 16/32, K over
     // several 512-key slices plus a partial one.
-    const shape shapes[] = {{"small", 37, 45, 1100}, {"tall", 157, 23, 700}};
+    const shape shapes[] = {
+        {"small", 37, 45, 1100},
+        {"tall", 157, 23, 700},
+        // Wide output: room for SS output-column blocks (>= 256 columns each).
+        {"wide", 29, 1100, 600}
+    };
     int failures = 0, cases = 0;
     for (const shape &sh : shapes) {
         const int M = sh.M, N = sh.N, K = sh.K;
@@ -240,29 +245,40 @@ int main(int argc, char **argv) {
         );
         for (auto &pt : patterns) {
             for (const char *method : pt.methods) {
-                for (const char *full : {"0", "1"}) {
-                    for (const char *selective : {"0", "1"}) {
-                        for (const char *contiguous : {"0", "1"}) {
-                            for (const char *threads : {"1", "4"}) {
-                                for (const char *slice : {"512", "64"}) {
-                                    std::vector<
-                                        std::pair<std::string, std::string>>
-                                        o = {{"init_method", method},
-                                             {"threads", threads},
-                                             {"selective_packing", selective},
-                                             {"sd_ds_full_rows", full},
-                                             {"ss_contiguous", contiguous},
-                                             {"slice_length", slice}};
-                                    std::string label = std::string(sh.name) +
-                                                        "/" + pt.name + "/" +
-                                                        method;
-                                    failures += !run_case<double>(
-                                        spalm, label.c_str(), pt.R, pt.S, K, o
-                                    );
-                                    failures += !run_case<float>(
-                                        spalm, label.c_str(), pt.R, pt.S, K, o
-                                    );
-                                    cases += 2;
+                const bool ss = std::string(method) == "sparse";
+                const std::vector<const char *> column_blocks =
+                    ss ? std::vector<const char *>{"-1", "1", "3"}
+                       : std::vector<const char *>{"-1"};
+                for (const char *blocks : column_blocks) {
+                    for (const char *full : {"0", "1"}) {
+                        for (const char *selective : {"0", "1"}) {
+                            for (const char *contiguous : {"0", "1"}) {
+                                for (const char *threads : {"1", "4"}) {
+                                    for (const char *slice : {"512", "64"}) {
+                                        std::vector<
+                                            std::pair<std::string, std::string>>
+                                            o = {
+                                                {"init_method", method},
+                                                {"threads", threads},
+                                                {"selective_packing", selective},
+                                                {"sd_ds_full_rows", full},
+                                                {"ss_column_blocks", blocks},
+                                                {"ss_contiguous", contiguous},
+                                                {"slice_length", slice}
+                                        };
+                                        std::string label =
+                                            std::string(sh.name) + "/" +
+                                            pt.name + "/" + method;
+                                        failures += !run_case<double>(
+                                            spalm, label.c_str(), pt.R, pt.S, K,
+                                            o
+                                        );
+                                        failures += !run_case<float>(
+                                            spalm, label.c_str(), pt.R, pt.S, K,
+                                            o
+                                        );
+                                        cases += 2;
+                                    }
                                 }
                             }
                         }
@@ -272,7 +288,8 @@ int main(int argc, char **argv) {
         }
     }
     std::printf(
-        "%s: %d native kernel cases (SS/SD/DS/DD x full rows x selective "
+        "%s: %d native kernel cases (SS/SD/DS/DD x SS column blocks x full "
+        "rows x selective "
         "packing x SS contiguous x threads x slice length x float/double), "
         "%d failed\n",
         failures ? "FAIL" : "PASS", cases, failures

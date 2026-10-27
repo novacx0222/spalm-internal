@@ -457,6 +457,10 @@ static int spalm_impl(
     options.selective_packing = get_int("selective_packing", 1) != 0;
     options.ss_contiguous = get_int("ss_contiguous", 1) != 0;
     options.sd_ds_full_rows = get_int("sd_ds_full_rows", 1) != 0;
+    options.ss_column_blocks = get_int("ss_column_blocks", -1);
+    if (options.ss_column_blocks < -1) {
+        return invalid("ss_column_blocks must be -1 (auto), 0, 1 or a count");
+    }
 
     std::cout << "SPALM MATMUL" << std::endl;
     std::cout << M << " " << K << " " << N << std::endl;

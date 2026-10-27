@@ -18,4 +18,9 @@ struct cpu_execution_options {
     // multiplied four at a time, sharing every packed-row load
     // (key: sd_ds_full_rows).
     bool sd_ds_full_rows = true;
+    // SS without dense slices: output-column blocks, so one block of the
+    // transposed S stays in the shared cache while all R rows use it.
+    // -1: from the data size and the shared (L3) cache size, read at run
+    // time; 0 or 1: off; n > 1: n blocks (key: ss_column_blocks).
+    int ss_column_blocks = -1;
 };

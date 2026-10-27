@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <type_traits>
+#include <unistd.h>
 #include <vector>
 
 #include "csr_preparation.h"
@@ -237,13 +238,94 @@ void spgemm_rows_dense_result(
     }
 }
 
+// Size of the cache shared by all cores (bytes), 0 if unknown.
+static size_t shared_cache_bytes() {
+#ifdef _SC_LEVEL3_CACHE_SIZE
+    const long bytes = sysconf(_SC_LEVEL3_CACHE_SIZE);
+    if (bytes > 0) return static_cast<size_t>(bytes);
+#endif
+    return 0;
+}
+
+// Output-column blocks for the full SS path. Without them every R row
+// streams the whole transposed S (for random_col 5%: about 160 MB, more than
+// the shared cache) from memory. With b blocks, one block's part of S^T,
+// about total / b, is reused by all R rows while it is cached. Blocks only
+// pay off when that part does stay cached: otherwise one sequential stream
+// becomes many short jumps. Automatic: none when S^T already fits the
+// shared cache; else the fewest blocks whose part fits a third of it (the
+// rest holds the streamed R rows and output rows), at least 256 columns
+// each, and none when that is impossible.
+static int ss_column_block_count(
+    const int requested, const size_t entries, const size_t entry_bytes,
+    const int N
+) {
+    const int max_blocks = std::max(1, N / 256);
+    if (requested >= 0) return std::max(1, std::min(requested, max_blocks));
+    const size_t cache = shared_cache_bytes();
+    if (cache == 0) return 1;
+    const size_t total = entries * entry_bytes;
+    if (total <= cache) return 1;
+    const size_t target = cache / 3;
+    const size_t blocks = (total + target - 1) / target;
+    return blocks <= static_cast<size_t>(max_blocks) ? static_cast<int>(blocks)
+                                                     : 1;
+}
+
+// starts[b * K + k], b = 0..blocks: the first entry of key k's row list
+// with row >= b * width (row blocks: the list end), so block b of key k is
+// [starts[b * K + k], starts[(b + 1) * K + k]). Returns false when a list is
+// not in ascending row order, which the blocks rely on.
+static bool ss_column_block_starts(
+    const int *offsets, const int *rows, const int K, const int blocks,
+    const int width, std::vector<int> &starts, const int threads
+) {
+    starts.resize(static_cast<size_t>(blocks + 1) * K);
+    bool ascending = true;
+#pragma omp parallel for num_threads(threads) schedule(static)                 \
+    reduction(&& : ascending)
+    for (int k = 0; k < K; ++k) {
+        const int begin = offsets[k], end = offsets[k + 1];
+        for (int p = begin + 1; p < end; ++p)
+            if (rows[p] < rows[p - 1]) ascending = false;
+        int p = begin;
+        for (int b = 0; b < blocks; ++b) {
+            const long long bound = static_cast<long long>(b) * width;
+            while (p < end && rows[p] < bound) ++p;
+            starts[static_cast<size_t>(b) * K + k] = p;
+        }
+        starts[static_cast<size_t>(blocks) * K + k] = end;
+    }
+    return ascending;
+}
+
 template <typename T>
 void spgemm_rows_dense_result_vanilla(
     const int N, ss_matrix<T> &R_ssm, int *s_col_idxs, int *s_agg_idxs,
-    T *s_vals, T *ret, int threads, bool contiguous
+    T *s_vals, T *ret, int threads, bool contiguous, const int *block_starts,
+    const int blocks
 ) {
     const int M = R_ssm.csr_mat.rows;
     csr<T> &R_csr = R_ssm.csr_mat;
+    if (block_starts && blocks > 1) {
+        // Blocks in order, each over all R rows: same updates per output
+        // element, in the same order, so results are unchanged.
+        const size_t K = static_cast<size_t>(R_csr.cols);
+#pragma omp parallel num_threads(threads)
+        for (int b = 0; b < blocks; ++b) {
+            const int *first = block_starts + b * K;
+            const int *last = block_starts + (b + 1) * K;
+#pragma omp for schedule(dynamic, 4)
+            for (int ra = 0; ra < M; ra++) {
+                csr_csr_matmul_rows(
+                    R_csr.row_ptrs[ra], R_csr.row_ptrs[ra + 1], R_csr.col_idxs,
+                    R_csr.vals, s_agg_idxs, first, last, s_vals,
+                    &ret[(size_t) ra * N], contiguous
+                );
+            }
+        }
+        return;
+    }
 
 #pragma omp parallel for num_threads(threads) schedule(dynamic, 4)
     for (int ra = 0; ra < M; ra++) {
@@ -274,9 +356,30 @@ void sparse_sparse_matmul(
             "[sparse-sparse-s-transpose-time]", end - sparse_matmul_start
         );
         start = std::chrono::high_resolution_clock::now();
+        const int K = R_ssm.csr_mat.cols;
+        int blocks = ss_column_block_count(
+            options.ss_column_blocks, static_cast<size_t>(transposed.entries),
+            sizeof(int) + sizeof(T), N
+        );
+        std::vector<int> block_starts;
+        if (blocks > 1 &&
+            !ss_column_block_starts(
+                transposed.offsets.get(), transposed.row_idxs.get(), K, blocks,
+                div_ceil(N, blocks), block_starts, threads
+            )) {
+            blocks = 1;
+        }
+        end = std::chrono::high_resolution_clock::now();
+        std::cout << "[ss-column-blocks] blocks=" << blocks
+                  << " width=" << div_ceil(N, blocks)
+                  << " shared_cache_bytes=" << shared_cache_bytes()
+                  << std::endl;
+        print_time("[sparse-sparse-column-blocks-prepare]", end - start);
+        start = std::chrono::high_resolution_clock::now();
         spgemm_rows_dense_result_vanilla(
             N, R_ssm, transposed.offsets.get(), transposed.row_idxs.get(),
-            transposed.values.get(), ret, threads, options.ss_contiguous
+            transposed.values.get(), ret, threads, options.ss_contiguous,
+            blocks > 1 ? block_starts.data() : nullptr, blocks
         );
         end = std::chrono::high_resolution_clock::now();
         print_time("[sparse-sparse-sparse-mm-time]", end - start);

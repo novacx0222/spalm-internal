@@ -42,7 +42,8 @@ void spgemm_rows_dense_result(
 template <typename T>
 void spgemm_rows_dense_result_vanilla(
     const int N, ss_matrix<T> &R_ssm, int *s_col_idxs, int *s_agg_idxs,
-    T *s_vals, T *ret, int threads, bool contiguous = true
+    T *s_vals, T *ret, int threads, bool contiguous = true,
+    const int *block_starts = nullptr, const int blocks = 1
 );
 
 template <typename T>
