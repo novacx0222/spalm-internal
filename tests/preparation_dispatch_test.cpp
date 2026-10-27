@@ -8,10 +8,12 @@
 #include <sstream>
 
 // Skip the x86-only low-level declarations; keep the exact high-level signature.
+#include "cpu/execution_options.h"
 #define SPARSE_SPARSE_MATMUL_H
 template <typename T>
 void sparse_sparse_matmul(
-    ss_matrix<T> &, ss_matrix<T> &, T *, bool, int, bool = false
+    ss_matrix<T> &, ss_matrix<T> &, T *, bool, int, bool = false,
+    const cpu_execution_options & = cpu_execution_options()
 );
 
 static int backend_calls, seen_r_nnz, seen_s_nnz, seen_k;
@@ -50,7 +52,8 @@ void scalar_csr(
 
 template <class T>
 void dense_dense_matmul(
-    ss_matrix<T> &r, ss_matrix<T> &s, int, int, T *output, bool, int
+    ss_matrix<T> &r, ss_matrix<T> &s, int, int, T *output, bool, int,
+    const cpu_execution_options &
 ) {
     seen_k = r.csr_mat.cols;
     const auto begin = std::chrono::steady_clock::now();
@@ -68,7 +71,8 @@ void dense_dense_matmul(
 }
 template <class T>
 void sparse_sparse_matmul(
-    ss_matrix<T> &r, ss_matrix<T> &s, T *output, bool, int, bool
+    ss_matrix<T> &r, ss_matrix<T> &s, T *output, bool, int, bool,
+    const cpu_execution_options &
 ) {
     seen_k = r.csr_mat.cols;
     const auto begin = std::chrono::steady_clock::now();
@@ -430,7 +434,8 @@ int main() {
     std::cout
         << "PASS: actual wrapper zero/empty exits, CSR ownership, "
            "scalar-checked dispatch, forced slice bypass, Inf semantics, C API "
-           "status codes and options, MKL dense input fill; SIMD/MKL backends are "
+           "status codes and options, MKL dense input fill; SIMD/MKL backends "
+           "are "
            "test doubles\n";
 }
 #endif

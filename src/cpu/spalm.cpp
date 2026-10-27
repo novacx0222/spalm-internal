@@ -372,14 +372,14 @@ int spalm_matmul(
         std::cout << std::endl;
         if (do_sparse_mm) {
             sparse_sparse_matmul(
-                R_ssm, S_ssm, ret, sparse_result, threads, !do_dense_mm
+                R_ssm, S_ssm, ret, sparse_result, threads, !do_dense_mm, options
             );
         }
 
         if (do_dense_mm) {
             dense_dense_matmul(
                 R_ssm, S_ssm, tile_size_l2, tile_size_l3, ret, sparse_result,
-                threads
+                threads, options
             );
         }
     }
@@ -454,6 +454,8 @@ static int spalm_impl(
     cpu_execution_options options;
     options.prune_zeros = get_int("prune_zeros", 1) != 0;
     options.compact_keys = get_int("compact_keys", 1) != 0;
+    options.selective_packing = get_int("selective_packing", 1) != 0;
+    options.ss_contiguous = get_int("ss_contiguous", 1) != 0;
 
     std::cout << "SPALM MATMUL" << std::endl;
     std::cout << M << " " << K << " " << N << std::endl;

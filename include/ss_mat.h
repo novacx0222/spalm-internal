@@ -563,7 +563,9 @@ void mm_check(
 // Keys are made panel-local (k - join_idx) instead of offsetting the buffer
 // pointers backwards: that formed pointers outside the allocations, and for
 // slice lengths below 64 it set bits outside this slice's bitmap words.
-template <typename T>
+// WithBitmap = false: only the values are packed (SD/DS read no bitmap) and
+// bm_original may be null.
+template <typename T, bool WithBitmap = true>
 void pack_slice_new(
     const slice &s, ss_matrix<T> &ssm, const int join_idx, const int sl,
     const int ik, T *packed_mem_original, BIT_DTYPE *bm_original
@@ -584,29 +586,29 @@ void pack_slice_new(
             T v;
             k = ssm.csr_mat.col_idxs[k_idx] - join_idx;
             v = ssm.csr_mat.vals[k_idx];
-            set_bit(bm, k);
+            if constexpr (WithBitmap) set_bit(bm, k);
             packed_mem[ik * k] = v;
 
             k = ssm.csr_mat.col_idxs[k_idx + 1] - join_idx;
             v = ssm.csr_mat.vals[k_idx + 1];
-            set_bit(bm, k);
+            if constexpr (WithBitmap) set_bit(bm, k);
             packed_mem[ik * k] = v;
 
             k = ssm.csr_mat.col_idxs[k_idx + 2] - join_idx;
             v = ssm.csr_mat.vals[k_idx + 2];
-            set_bit(bm, k);
+            if constexpr (WithBitmap) set_bit(bm, k);
             packed_mem[ik * k] = v;
 
             k = ssm.csr_mat.col_idxs[k_idx + 3] - join_idx;
             v = ssm.csr_mat.vals[k_idx + 3];
-            set_bit(bm, k);
+            if constexpr (WithBitmap) set_bit(bm, k);
             packed_mem[ik * k] = v;
         }
 
         for (; k_idx < sr_end; k_idx++) {
             int k = ssm.csr_mat.col_idxs[k_idx] - join_idx;
             T v = ssm.csr_mat.vals[k_idx];
-            set_bit(bm, k);
+            if constexpr (WithBitmap) set_bit(bm, k);
             packed_mem[ik * k] = v;
         }
     }

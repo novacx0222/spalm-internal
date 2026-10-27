@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <iostream>
+#include <type_traits>
 #include <cmath>
 #include <cstring>
 #include <thread>
@@ -40,11 +42,59 @@ aligned_unique_ptr<T> make_aligned_unique(size_t count, size_t alignment = 64) {
 }
 
 template <typename T>
+void dense_left_inner_kernel(
+    const slice &R_s, ss_matrix<T> &R_ssm, const slice &S_s,
+    const int *S_row_idxs, const int nr, const T *packed_mem, const int M,
+    const int N, T *ret, const int k_offset
+);
+
+template <typename T>
+void dense_right_inner_kernel(
+    const slice &S_s, ss_matrix<T> &S_ssm, const slice &R_s,
+    const int *R_row_idxs, const int mr, const T *packed_mem, const int M,
+    const int N, T *ret, __m512i gather_idx_512, const int k_offset
+);
+
+// Which packed representations the dense-path algorithms of this call read:
+// SD (left inner kernel) reads packed S, DS (right inner kernel) packed R,
+// DD both plus their bitmaps. Without selective packing, everything is
+// packed as before.
+struct dense_packing_policy {
+    bool pack_r = true;
+    bool pack_s = true;
+    bool bitmaps = true;
+    // The one algorithm of every slice pair (no SS pairs), or -1 (mixed).
+    int fixed_alg = -1;
+};
+
+static dense_packing_policy get_dense_packing_policy(bool selective) {
+    dense_packing_policy policy;
+    bool used[4] = {};
+    for (int left = 0; left <= num_buckets; ++left)
+        for (int right = 0; right <= num_buckets; ++right)
+            used[get_alg(left, right)] = true;
+    const int algorithms = used[SPARSE_SPARSE] + used[DENSE_DENSE] +
+                           used[DENSE_DENSE_LEFT_INNER_KERNEL] +
+                           used[DENSE_DENSE_RIGHT_INNER_KERNEL];
+    if (algorithms == 1)
+        for (int alg = 0; alg < 4; ++alg)
+            if (used[alg]) policy.fixed_alg = alg;
+    if (!selective) return policy;
+    policy.pack_r = used[DENSE_DENSE] || used[DENSE_DENSE_RIGHT_INNER_KERNEL];
+    policy.pack_s = used[DENSE_DENSE] || used[DENSE_DENSE_LEFT_INNER_KERNEL];
+    policy.bitmaps = used[DENSE_DENSE];
+    return policy;
+}
+
+// FixedAlg >= 0: the algorithm is known for every slice pair, so the
+// per-pair get_alg switch is resolved at compile time.
+template <typename T, int FixedAlg>
 void inline dense_dense_matmul_task_shared(
     const int slice_col, const int R_slice_start, const int R_slice_start_task,
     const int R_slice_end, const int S_slice_start, const int S_slice_end,
     T *R_packed_mem, BIT_DTYPE *R_bm, T *S_packed_mem, BIT_DTYPE *S_bm,
-    ss_matrix<T> &R_ssm, ss_matrix<T> &S_ssm, T *ret, bool sparse_result
+    ss_matrix<T> &R_ssm, ss_matrix<T> &S_ssm, T *ret, bool sparse_result,
+    const dense_packing_policy &policy
 ) {
     const int M = R_ssm.csr_mat.rows;
     const int K = R_ssm.csr_mat.cols;
@@ -66,20 +116,28 @@ void inline dense_dense_matmul_task_shared(
         N * 3, N * 2, N, 0
     );
 
-    if (S_slice_end > S_slice_start) {
-        memset(
-            S_bm, 0,
-            sizeof(BIT_DTYPE) * (S_slice_end - S_slice_start) *
-                div_ceil(sl, BITS)
-        );
+    if (policy.pack_s && S_slice_end > S_slice_start) {
+        if (policy.bitmaps) {
+            memset(
+                S_bm, 0,
+                sizeof(BIT_DTYPE) * (S_slice_end - S_slice_start) * bm_words
+            );
+        }
         for (int S_si = S_slice_start; S_si < S_slice_end; S_si++) {
             const int s_idx = S_si - S_slice_start;
             memset(&S_packed_mem[s_idx * sl * nr], 0, sizeof(T) * sl * nr);
             const slice &S_s = S_ssm.s_csc_mat.vals[S_si];
-            pack_slice_new(
-                S_s, S_ssm, k_offset, sl, nr, &S_packed_mem[s_idx * sl * nr],
-                &S_bm[s_idx * bm_words]
-            );
+            if (policy.bitmaps) {
+                pack_slice_new(
+                    S_s, S_ssm, k_offset, sl, nr,
+                    &S_packed_mem[s_idx * sl * nr], &S_bm[s_idx * bm_words]
+                );
+            } else {
+                pack_slice_new<T, false>(
+                    S_s, S_ssm, k_offset, sl, nr,
+                    &S_packed_mem[s_idx * sl * nr], nullptr
+                );
+            }
         }
     }
 
@@ -91,7 +149,8 @@ void inline dense_dense_matmul_task_shared(
             const int S_s_idx = S_si - S_slice_start;
             const slice &S_s = S_ssm.s_csc_mat.vals[S_si];
             const int *S_row_idxs = &S_ssm.sr_csc_mat.row_idxs[S_s.start];
-            switch (get_alg(R_s.b, S_s.b)) {
+            const int alg = FixedAlg >= 0 ? FixedAlg : get_alg(R_s.b, S_s.b);
+            switch (alg) {
             case SPARSE_SPARSE:
                 break;
             case DENSE_DENSE_RIGHT_INNER_KERNEL:
@@ -137,7 +196,8 @@ static const int divide_rule[][2] = {
 template <typename T>
 void dense_dense_matmul(
     ss_matrix<T> &R_ssm, ss_matrix<T> &S_ssm, const int tile_size_l2,
-    const int tile_size_l3, T *ret, bool sparse_result, const int threads
+    const int tile_size_l3, T *ret, bool sparse_result, const int threads,
+    const cpu_execution_options &options
 ) {
     std::chrono::time_point<std::chrono::high_resolution_clock> start, end;
     auto dense_mm_start = std::chrono::high_resolution_clock::now();
@@ -181,9 +241,18 @@ void dense_dense_matmul(
     // one element past the S panel. Keep a zeroed tail after each buffer.
     constexpr size_t pad_bytes = 128;
     const size_t pad = pad_bytes / sizeof(T);
-    auto R_packed_mem = make_aligned_unique<T>(R_block_size + pad);
-    std::memset(R_packed_mem.get() + R_block_size, 0, pad_bytes);
-    auto R_bm = make_aligned_unique<BIT_DTYPE>(R_bm_size);
+    const dense_packing_policy policy =
+        get_dense_packing_policy(options.selective_packing);
+    std::cout << "[dense-packing-policy] pack_r=" << policy.pack_r
+              << " pack_s=" << policy.pack_s << " bitmaps=" << policy.bitmaps
+              << " fixed_alg=" << policy.fixed_alg << std::endl;
+    aligned_unique_ptr<T> R_packed_mem;
+    if (policy.pack_r) {
+        R_packed_mem = make_aligned_unique<T>(R_block_size + pad);
+        std::memset(R_packed_mem.get() + R_block_size, 0, pad_bytes);
+    }
+    aligned_unique_ptr<BIT_DTYPE> R_bm;
+    if (policy.bitmaps) R_bm = make_aligned_unique<BIT_DTYPE>(R_bm_size);
 
     auto mem_alloc_end = std::chrono::high_resolution_clock::now();
     print_time(
@@ -222,20 +291,35 @@ void dense_dense_matmul(
                     continue;
                 }
 
+                // Packed R is read only by DS and DD (the same decision on
+                // every thread, so the loop and its barrier are skipped
+                // together).
+                if (policy.pack_r) {
 #pragma omp for schedule(static)
-                for (int R_si = R_si_l3; R_si < R_si_l3_end; R_si++) {
-                    const int s_idx = R_si - R_si_l3;
-                    memset(
-                        &R_bm[s_idx * bm_words], 0, sizeof(BIT_DTYPE) * bm_words
-                    );
-                    memset(
-                        &R_packed_mem[s_idx * sl * mr], 0, sizeof(T) * sl * mr
-                    );
-                    const slice &R_s = R_ssm.s_csc_mat.vals[R_si];
-                    pack_slice_new(
-                        R_s, R_ssm, k_offset, sl, mr,
-                        &R_packed_mem[s_idx * sl * mr], &R_bm[s_idx * bm_words]
-                    );
+                    for (int R_si = R_si_l3; R_si < R_si_l3_end; R_si++) {
+                        const int s_idx = R_si - R_si_l3;
+                        memset(
+                            &R_packed_mem[s_idx * sl * mr], 0,
+                            sizeof(T) * sl * mr
+                        );
+                        const slice &R_s = R_ssm.s_csc_mat.vals[R_si];
+                        if (policy.bitmaps) {
+                            memset(
+                                &R_bm[s_idx * bm_words], 0,
+                                sizeof(BIT_DTYPE) * bm_words
+                            );
+                            pack_slice_new(
+                                R_s, R_ssm, k_offset, sl, mr,
+                                &R_packed_mem[s_idx * sl * mr],
+                                &R_bm[s_idx * bm_words]
+                            );
+                        } else {
+                            pack_slice_new<T, false>(
+                                R_s, R_ssm, k_offset, sl, mr,
+                                &R_packed_mem[s_idx * sl * mr], nullptr
+                            );
+                        }
+                    }
                 }
 
                 const int task_num = div_ceil(
@@ -267,13 +351,15 @@ void dense_dense_matmul(
                         );
 
                         const int worker = omp_get_thread_num();
-                        if (!S_packed_mem_threads[worker]) {
+                        if (policy.pack_s && !S_packed_mem_threads[worker]) {
                             S_packed_mem_threads[worker] =
                                 try_make_aligned<T>(S_block_size + pad);
-                            S_bm_threads[worker] =
-                                try_make_aligned<BIT_DTYPE>(S_bm_size);
+                            if (policy.bitmaps) {
+                                S_bm_threads[worker] =
+                                    try_make_aligned<BIT_DTYPE>(S_bm_size);
+                            }
                             if (!S_packed_mem_threads[worker] ||
-                                !S_bm_threads[worker]) {
+                                (policy.bitmaps && !S_bm_threads[worker])) {
                                 S_packed_mem_threads[worker].reset();
                                 alloc_failed.store(
                                     true, std::memory_order_relaxed
@@ -286,13 +372,36 @@ void dense_dense_matmul(
                                 0, pad_bytes
                             );
                         }
-                        dense_dense_matmul_task_shared(
-                            slice_col, R_si_l3, R_slice_start_task, R_slice_end,
-                            S_si, S_slice_end, R_packed_mem.get(), R_bm.get(),
-                            S_packed_mem_threads[worker].get(),
-                            S_bm_threads[worker].get(), R_ssm, S_ssm, ret,
-                            sparse_result
-                        );
+                        auto task = [&](auto fixed) {
+                            dense_dense_matmul_task_shared<
+                                T, decltype(fixed)::value>(
+                                slice_col, R_si_l3, R_slice_start_task,
+                                R_slice_end, S_si, S_slice_end,
+                                R_packed_mem.get(), R_bm.get(),
+                                S_packed_mem_threads[worker].get(),
+                                S_bm_threads[worker].get(), R_ssm, S_ssm, ret,
+                                sparse_result, policy
+                            );
+                        };
+                        switch (policy.fixed_alg) {
+                        case DENSE_DENSE:
+                            task(std::integral_constant<int, DENSE_DENSE>{});
+                            break;
+                        case DENSE_DENSE_LEFT_INNER_KERNEL:
+                            task(
+                                std::integral_constant<
+                                    int, DENSE_DENSE_LEFT_INNER_KERNEL>{}
+                            );
+                            break;
+                        case DENSE_DENSE_RIGHT_INNER_KERNEL:
+                            task(
+                                std::integral_constant<
+                                    int, DENSE_DENSE_RIGHT_INNER_KERNEL>{}
+                            );
+                            break;
+                        default:
+                            task(std::integral_constant<int, -1>{});
+                        }
                     }
                 }
             }
@@ -411,13 +520,6 @@ void inline sparse_dense_inner_kernel_iter(
         res1 = _mm512_fmadd_ps(r_val, s_vals1, res1);
     }
 }
-
-template <typename T>
-void dense_left_inner_kernel(
-    const slice &R_s, ss_matrix<T> &R_ssm, const slice &S_s,
-    const int *S_row_idxs, const int nr, const T *packed_mem, const int M,
-    const int N, T *ret, const int k_offset
-);
 
 template <>
 void dense_left_inner_kernel<double>(
@@ -582,13 +684,6 @@ void dense_left_inner_kernel<float>(
     }
 }
 
-template <typename T>
-void dense_right_inner_kernel(
-    const slice &S_s, ss_matrix<T> &S_ssm, const slice &R_s,
-    const int *R_row_idxs, const int mr, const T *packed_mem, const int M,
-    const int N, T *ret, __m512i gather_idx_512, const int k_offset
-);
-
 template <>
 void dense_right_inner_kernel<double>(
     const slice &S_s, ss_matrix<double> &S_ssm, const slice &R_s,
@@ -741,22 +836,6 @@ void dense_right_inner_kernel<float>(
     }
 }
 
-template void dense_dense_matmul_task_shared<float>(
-    const int slice_col, const int R_slice_start, const int R_slice_start_task,
-    const int R_slice_end, const int S_slice_start, const int S_slice_end,
-    float *R_packed_mem, BIT_DTYPE *R_bm, float *S_packed_mem, BIT_DTYPE *S_bm,
-    ss_matrix<float> &R_ssm, ss_matrix<float> &S_ssm, float *ret,
-    bool sparse_result
-);
-
-template void dense_dense_matmul_task_shared<double>(
-    const int slice_col, const int R_slice_start, const int R_slice_start_task,
-    const int R_slice_end, const int S_slice_start, const int S_slice_end,
-    double *R_packed_mem, BIT_DTYPE *R_bm, double *S_packed_mem,
-    BIT_DTYPE *S_bm, ss_matrix<double> &R_ssm, ss_matrix<double> &S_ssm,
-    double *ret, bool sparse_result
-);
-
 template void pack_slice_new<float>(
     const slice &s, ss_matrix<float> &ssm, const int join_idx, const int sl,
     const int ik, float *packed_mem_original, BIT_DTYPE *bm_original
@@ -769,10 +848,12 @@ template void pack_slice_new<double>(
 
 template void dense_dense_matmul<float>(
     ss_matrix<float> &R_ssm, ss_matrix<float> &S_ssm, const int tile_size_l2,
-    const int tile_size_l3, float *ret, bool sparse_result, const int threads
+    const int tile_size_l3, float *ret, bool sparse_result, const int threads,
+    const cpu_execution_options &options
 );
 
 template void dense_dense_matmul<double>(
     ss_matrix<double> &R_ssm, ss_matrix<double> &S_ssm, const int tile_size_l2,
-    const int tile_size_l3, double *ret, bool sparse_result, const int threads
+    const int tile_size_l3, double *ret, bool sparse_result, const int threads,
+    const cpu_execution_options &options
 );

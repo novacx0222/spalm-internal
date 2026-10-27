@@ -1,5 +1,5 @@
 # MKL is needed to build the libraries, not to run the portable tests.
-TEST_GOALS := test test-dispatch test-preparation test-thresholds
+TEST_GOALS := test test-dispatch test-preparation test-thresholds test-kernels-native
 ifneq ($(filter-out $(TEST_GOALS),$(or $(MAKECMDGOALS),default)),)
 ifndef ONEAPI_ROOT
 $(error ONEAPI_ROOT is not set. Please 'source set_intel_vars.sh'.)
@@ -85,6 +85,14 @@ test-dispatch:
 	$(TEST_BIN_DIR)/timing_dispatch_test
 	$(TEST_BIN_DIR)/slice_timing_test
 	$(TEST_BIN_DIR)/dispatch_test
+
+# Actual AVX-512 kernels of bin/spalm.so (build-libs first) against a scalar
+# reference, for every forced SPALM method and execution switch. x86 only.
+.PHONY: test-kernels-native
+test-kernels-native:
+	mkdir -p $(TEST_BIN_DIR)
+	$(CXX) -std=c++20 -O1 -g tests/native_kernel_test.cpp -ldl -o $(TEST_BIN_DIR)/native_kernel_test
+	$(TEST_BIN_DIR)/native_kernel_test $(BIN_DIR)/spalm.so
 
 # CSR preparation: memory bounds, validation, zero pruning, ownership.
 test-preparation:
