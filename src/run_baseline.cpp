@@ -6,6 +6,9 @@
 #include "mkl.h"
 #include "util.h"
 
+// Writes C = R * S^T into ret, overwriting it: the GEMM and sparse x dense
+// calls use beta = 0 and mkl_sparse_?_spmmd computes C := A * B, so ret
+// need not be zeroed.
 extern "C" void run_baseline(
     int type, const char *baseline_name, int *Ri, int *Rj, void *Rv, void *R,
     int *Si, int *Sj, void *Sv, void *S, void *ret, const int M, const int K,
@@ -178,7 +181,7 @@ extern "C" void run_baseline(
             start = std::chrono::high_resolution_clock::now();
             mkl_sparse_d_mm(
                 SPARSE_OPERATION_NON_TRANSPOSE, 1, R_csr, R_descr,
-                SPARSE_LAYOUT_ROW_MAJOR, (double *) S, N, N, 1, (double *) ret,
+                SPARSE_LAYOUT_ROW_MAJOR, (double *) S, N, N, 0, (double *) ret,
                 N
             );
             end = std::chrono::high_resolution_clock::now();
@@ -210,7 +213,7 @@ extern "C" void run_baseline(
             start = std::chrono::high_resolution_clock::now();
             mkl_sparse_s_mm(
                 SPARSE_OPERATION_NON_TRANSPOSE, 1, R_csr, R_descr,
-                SPARSE_LAYOUT_ROW_MAJOR, (float *) S, N, N, 1, (float *) ret, N
+                SPARSE_LAYOUT_ROW_MAJOR, (float *) S, N, N, 0, (float *) ret, N
             );
             end = std::chrono::high_resolution_clock::now();
             print_time("[mkl-sparse-dense-mm-time]", end - start);
@@ -252,12 +255,12 @@ extern "C" void run_baseline(
         if (type == 0) {
             cblas_sgemm_openblas(
                 CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0,
-                (float *) R, K, (float *) S, K, 1.0, (float *) ret, N
+                (float *) R, K, (float *) S, K, 0.0, (float *) ret, N
             );
         } else if (type == 1) {
             cblas_dgemm_openblas(
                 CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0,
-                (double *) R, K, (double *) S, K, 1.0, (double *) ret, N
+                (double *) R, K, (double *) S, K, 0.0, (double *) ret, N
             );
         }
         end = std::chrono::high_resolution_clock::now();
@@ -270,12 +273,12 @@ extern "C" void run_baseline(
         if (type == 0) {
             cblas_sgemm(
                 CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0,
-                (float *) R, K, (float *) S, K, 1.0, (float *) ret, N
+                (float *) R, K, (float *) S, K, 0.0, (float *) ret, N
             );
         } else {
             cblas_dgemm(
                 CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0,
-                (double *) R, K, (double *) S, K, 1.0, (double *) ret, N
+                (double *) R, K, (double *) S, K, 0.0, (double *) ret, N
             );
         }
         end = std::chrono::high_resolution_clock::now();

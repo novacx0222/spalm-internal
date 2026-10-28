@@ -31,4 +31,9 @@ struct cpu_execution_options {
     // would hold fewer than 16 entries on average; off when slice_length is
     // given explicitly (key: auto_slice_length).
     bool auto_slice_length = true;
+    // The caller zeroed the result (key: result_zeroed, default 1). With 0
+    // it holds garbage and the library writes every element: the forced MKL
+    // backends overwrite it (GEMM with beta = 0, spmmd), every other path,
+    // the zero-work exits included, zeroes it first.
+    bool result_zeroed = true;
 };

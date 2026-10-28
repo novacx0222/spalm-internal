@@ -32,6 +32,25 @@ enum spalm_status : int {
     SPALM_INTERNAL_ERROR = 4,   // exception, e.g. out of memory
 };
 
+// Zeroes `bytes` bytes of a result the caller left uninitialized
+// (result_zeroed = 0), in 256 KiB blocks over the threads.
+static void zero_result(void *ret, size_t bytes, int threads) {
+    const auto begin = std::chrono::high_resolution_clock::now();
+    constexpr size_t block = 256 * 1024;
+    const long long blocks = (long long) ((bytes + block - 1) / block);
+#pragma omp parallel for num_threads(threads) schedule(static)
+    for (long long b = 0; b < blocks; ++b) {
+        const size_t start = (size_t) b * block;
+        std::memset(
+            static_cast<char *>(ret) + start, 0, std::min(block, bytes - start)
+        );
+    }
+    print_time(
+        "[library-result-zero]",
+        std::chrono::high_resolution_clock::now() - begin
+    );
+}
+
 // Used only as a dladdr anchor to locate this .so at runtime.
 static void spalm_lib_anchor() {}
 
@@ -129,8 +148,6 @@ int run_mkl_backend(
     return SPALM_OK;
 }
 
-// Accumulates R * S^T into the caller's zero-initialized ret. Early exits
-// for zero work leave ret untouched.
 // Slice length for this call. Each nonempty subrow of a sparse side costs a
 // read-modify-write of its packed-panel outputs per opposite slice, so very
 // short subrows (uniform 1%: about 5 entries at 512 keys) are dominated by
@@ -173,6 +190,9 @@ static int choose_slice_length(
     return length;
 }
 
+// Accumulates R * S^T into the caller's zero-initialized ret; with
+// options.result_zeroed false, ret holds garbage and every element is written
+// (see cpu_execution_options).
 template <typename T>
 int spalm_matmul(
     const int type, int *Ri, int *Rj, T *Rv, int *Si, int *Sj, T *Sv,
@@ -183,10 +203,24 @@ int spalm_matmul(
 ) {
     // The join dimension every later stage uses; key compaction shrinks it.
     int K = K_input;
+    // An uninitialized result (result_zeroed = 0) is overwritten by the
+    // forced MKL backends; every other path accumulates into it, so it is
+    // zeroed here, and the zero-work exits zero it for the MKL backends.
+    const bool forced_mkl = force_mkl_dense || force_mkl_sparse;
+    const size_t result_bytes = (size_t) M * N * sizeof(T);
+    if (!options.result_zeroed && !forced_mkl) {
+        zero_result(ret, result_bytes, threads);
+    }
+    auto zero_work = [&](const char *why) {
+        if (!options.result_zeroed && forced_mkl) {
+            zero_result(ret, result_bytes, threads);
+        }
+        std::cout << "[backend] zero-work (" << why << ")" << std::endl;
+    };
     // An empty dimension, or no stored entry on a side, contributes nothing:
     // no CSR copies, slices, packing buffers or MKL call are needed.
     if (M == 0 || N == 0 || K == 0 || Ri[M] == 0 || Si[N] == 0) {
-        std::cout << "[backend] zero-work (empty input)" << std::endl;
+        zero_work("empty input");
         return SPALM_OK;
     }
     const auto prepare_begin = std::chrono::high_resolution_clock::now();
@@ -201,7 +235,7 @@ int spalm_matmul(
     const bool remove_zeros =
         options.prune_zeros && r_summary.finite && s_summary.finite;
     if (remove_zeros && (!r_summary.nonzero || !s_summary.nonzero)) {
-        std::cout << "[backend] zero-work (all-zero input)" << std::endl;
+        zero_work("all-zero input");
         print_time(
             "[csr-zero-prepare]",
             std::chrono::high_resolution_clock::now() - prepare_begin
@@ -229,7 +263,7 @@ int spalm_matmul(
         } else if (keys.common_keys == 0) {
             std::cout << "[csr-key-stats] K=" << K << "->0 no common keys"
                       << std::endl;
-            std::cout << "[backend] zero-work (no common keys)" << std::endl;
+            zero_work("no common keys");
             print_time(
                 "[csr-zero-prepare]",
                 std::chrono::high_resolution_clock::now() - prepare_begin
@@ -472,8 +506,21 @@ static int spalm_impl(
     if (n < 0 || (n > 0 && (!keys || !vals))) {
         return invalid("invalid key/value options");
     }
-    // A zero-sized product leaves the caller's (initialized) output as is.
-    if (M == 0 || K == 0 || N == 0) return SPALM_OK;
+    // A product with K = 0 is all zeros: an uninitialized result
+    // (result_zeroed = 0) is zeroed, an initialized one left as is.
+    if (M == 0 || K == 0 || N == 0) {
+        bool zeroed = true;
+        for (int i = 0; i < n; i++)
+            if (strcmp(keys[i], "result_zeroed") == 0) zeroed = atoi(vals[i]);
+        if (!zeroed && M > 0 && N > 0) {
+            if (!ret) return invalid("null result pointer");
+            zero_result(
+                ret,
+                (size_t) M * N * (type == 0 ? sizeof(float) : sizeof(double)), 1
+            );
+        }
+        return SPALM_OK;
+    }
     if (!Ri || !Rj || !Rv || !Si || !Sj || !Sv || !ret) {
         return invalid("null matrix or result pointer");
     }
@@ -506,6 +553,7 @@ static int spalm_impl(
     options.ss_column_blocks = get_int("ss_column_blocks", -1);
     options.ds_aligned_panels = get_int("ds_aligned_panels", 1) != 0;
     // An explicit slice_length is used as given.
+    options.result_zeroed = get_int("result_zeroed", 1) != 0;
     options.auto_slice_length = get_int("auto_slice_length", 1) != 0 &&
                                 get_str("slice_length", nullptr) == nullptr;
     if (options.ss_column_blocks < -1) {
@@ -621,3 +669,7 @@ extern "C" int spalm(
     }
     return SPALM_INTERNAL_ERROR;
 }
+
+// Present when spalm() accepts result_zeroed = 0 (an uninitialized result,
+// every element of which it then writes); the caller looks the symbol up.
+extern "C" int spalm_accepts_unzeroed_result() { return 1; }

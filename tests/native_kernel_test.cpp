@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
@@ -83,17 +84,24 @@ static std::vector<T> reference(const csr &R, const csr &S, int K) {
     return out;
 }
 
+// unzeroed: the output starts as NaN and is passed with result_zeroed = 0,
+// so every element must be written; otherwise it starts at 1 and the
+// kernels must add to it.
 template <typename T>
 static bool run_case(
     spalm_fn spalm, const char *label, const csr &R, const csr &S, int K,
-    const std::vector<std::pair<std::string, std::string>> &options
+    std::vector<std::pair<std::string, std::string>> options,
+    bool unzeroed = false
 ) {
     constexpr int type = sizeof(T) == sizeof(float) ? 0 : 1;
     std::vector<T> rv(R.val.begin(), R.val.end()),
         sv(S.val.begin(), S.val.end());
     std::vector<int> ri = R.ptr, rj = R.col, si = S.ptr, sj = S.col;
-    // Pre-filled output: the kernels must add to it, not overwrite it.
-    std::vector<T> out(size_t(R.rows) * S.rows, T(1));
+    // Non-null data() for inputs without entries, as from the operator.
+    rv.reserve(1), sv.reserve(1), rj.reserve(1), sj.reserve(1);
+    const T base = unzeroed ? T(NAN) : T(1);
+    if (unzeroed) options.push_back({"result_zeroed", "0"});
+    std::vector<T> out(size_t(R.rows) * S.rows, base);
     std::vector<const char *> keys, vals;
     for (auto &kv : options) {
         keys.push_back(kv.first.c_str());
@@ -114,7 +122,7 @@ static bool run_case(
     const auto expected = reference<T>(R, S, K);
     size_t bad = 0, first = 0;
     for (size_t i = 0; i < out.size(); ++i) {
-        if (out[i] != expected[i] + T(1)) {
+        if (!(out[i] == expected[i] + (unzeroed ? T(0) : T(1)))) {
             if (!bad) first = i;
             ++bad;
         }
@@ -126,7 +134,8 @@ static bool run_case(
             "FAIL %s %s status=%d mismatches=%zu first=%zu got=%g want=%g%s\n",
             label, type ? "double" : "float", status, bad, first,
             bad ? double(out[first]) : 0.0,
-            bad ? double(expected[first] + T(1)) : 0.0, opts.c_str()
+            bad ? double(expected[first] + (unzeroed ? T(0) : T(1))) : 0.0,
+            opts.c_str()
         );
         return false;
     }
@@ -142,6 +151,8 @@ int main(int argc, char **argv) {
     }
     auto spalm = reinterpret_cast<spalm_fn>(dlsym(handle, "spalm"));
     assert(spalm);
+    // The DuckDB extension skips zeroing for MKL only when this is exported.
+    assert(dlsym(handle, "spalm_accepts_unzeroed_result"));
 
     std::mt19937 rng(20261027);
     std::uniform_real_distribution<double> u(0, 1);
@@ -307,12 +318,63 @@ int main(int argc, char **argv) {
             }
         }
     }
+    // result_zeroed = 0: the MKL backends overwrite the result, the SPALM
+    // kernels and every zero-work exit get it zeroed by the library.
+    {
+        const int M = 40, N = 36, K = 300;
+        const csr R =
+            make_csr(M, K, [&](int, int) { return u(rng) < 0.2; }, rng);
+        const csr S =
+            make_csr(N, K, [&](int, int) { return u(rng) < 0.2; }, rng);
+        csr zeros = R;
+        for (double &v : zeros.val) v = 0.0;
+        const csr empty = make_csr(M, K, [](int, int) { return false; }, rng);
+        const csr low = make_csr(
+            M, K, [&](int, int k) { return k < K / 2 && u(rng) < 0.2; }, rng
+        );
+        const csr high = make_csr(
+            N, K, [&](int, int k) { return k >= K / 2 && u(rng) < 0.2; }, rng
+        );
+        const csr no_keys_R =
+            make_csr(M, 0, [](int, int) { return true; }, rng);
+        const csr no_keys_S =
+            make_csr(N, 0, [](int, int) { return true; }, rng);
+        struct unzeroed_case {
+            const char *name;
+            const csr &R, &S;
+            int K;
+        } unzeroed_cases[] = {
+            {"unzeroed/random", R, S, K},
+            {"unzeroed/empty-R", empty, S, K},
+            {"unzeroed/all-zero-R", zeros, S, K},
+            {"unzeroed/no-common-keys", low, high, K},
+            {"unzeroed/K=0", no_keys_R, no_keys_S, 0},
+        };
+        for (const auto &c : unzeroed_cases) {
+            for (const char *method :
+                 {"FORCE_MKL_DENSE", "FORCE_MKL_SPARSE", "sparse",
+                  "dense_bm_inner_kernel", "dense_left_spmm_inner_kernel",
+                  "dense_right_spmm_inner_kernel"}) {
+                const std::vector<std::pair<std::string, std::string>> o = {
+                    {"init_method", method}, {"threads", "4"}
+                };
+                const std::string label = std::string(c.name) + "/" + method;
+                failures += !run_case<double>(
+                    spalm, label.c_str(), c.R, c.S, c.K, o, true
+                );
+                failures += !run_case<float>(
+                    spalm, label.c_str(), c.R, c.S, c.K, o, true
+                );
+                cases += 2;
+            }
+        }
+    }
     std::printf(
         "%s: %d native kernel cases (SS/SD/DS/DD x DS aligned panels x SS "
         "column blocks x full "
         "rows x selective "
         "packing x SS contiguous x threads x slice length (fixed / automatic) "
-        "x float/double), "
+        "x float/double, plus uninitialized results for MKL and SPALM), "
         "%d failed\n",
         failures ? "FAIL" : "PASS", cases, failures
     );
