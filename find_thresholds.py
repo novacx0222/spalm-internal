@@ -263,6 +263,16 @@ SPARSE_OUTPUT_METHODS = {"SS": "sparse", "MKL-S": "FORCE_MKL_SPARSE"}
 TILE_L2_CANDIDATES = (32, 64, 128, 256)
 TILE_L3_CANDIDATES = (288, 576, 1152, 2304, 4608, 9216)
 TILE_DENSITIES = (0.05, 0.25)
+# Small join dimensions with full subrows: the shape key compaction leaves
+# when the two sides share few keys (left and right matrices are size x K;
+# fill 1.0 stores every key of a row). Square uniform matrices alone never
+# produce it, and tiles chosen on them alone slowed such inputs down.
+# (K, left fill, right fill).
+TILE_COMPACT_CASES = ((256, 1.0, 1.0), (1024, 1.0, 1.0), (1024, 1.0, 0.05))
+# The tile costs are flat enough that single measurements decided the
+# choice: every candidate is measured in each of TILE_ROUNDS rounds, in
+# rotated order, and the median over the rounds is used.
+TILE_ROUNDS = 3
 # Average entries per subrow at the configured slice length: SD, DS and DD
 # (automatic length), and SS (always the base length).
 SLICE_ENTRIES = (2, 4, 8, 16, 32, 64, 128)
@@ -331,7 +341,8 @@ def tune_machine_params(lib, args, dtype, platform, type_name, params_path):
 
     Every call passes the parameters it depends on explicitly, so an existing
     machine_params.txt does not influence the measurements. Synthetic uniform
-    size x size matrices, the threshold run's threads and dtype.
+    size x size matrices (and size x K ones with full rows for the tiles),
+    the threshold run's threads and dtype.
     """
     size = args.tune_size
     configured = configured_slice_length(platform, type_name)
@@ -339,7 +350,7 @@ def tune_machine_params(lib, args, dtype, platform, type_name, params_path):
     csv_rows = []
 
     def measure(stage, A, B, C, name, method, label, candidate, slice_length,
-                extra, case):
+                extra, case, trials=None):
         def parse(text):
             return parse_time(text, label)
 
@@ -347,8 +358,9 @@ def tune_machine_params(lib, args, dtype, platform, type_name, params_path):
             return call_spalm(lib, A_csr, B_csr, C, init_method, dtype,
                               slice_length, threads=args.threads, extra=extra)
 
-        t = benchmark(call_fn, A, B, C, method, args.warmup, args.trials,
-                      parse, allow_fallback=method.startswith("FORCE_MKL"))
+        t = benchmark(call_fn, A, B, C, method, args.warmup,
+                      args.trials if trials is None else trials, parse,
+                      allow_fallback=method.startswith("FORCE_MKL"))
         csv_rows.append((stage, name, case, candidate, t))
         print(f"  {stage} {name} {case} {candidate}: {t:.6f}s")
         return t
@@ -364,18 +376,26 @@ def tune_machine_params(lib, args, dtype, platform, type_name, params_path):
     # -- Tile sizes: SD, DS, DD at the configured slice length ---------------
     tile_pairs = {d: uniform_pair(d, 1000 + i)
                   for i, d in enumerate(TILE_DENSITIES)}
-    tile_table = {}
-    for l2 in TILE_L2_CANDIDATES:
-        for l3 in TILE_L3_CANDIDATES:
+    tile_cases = {f"density={d}": tile_pairs[d] for d in TILE_DENSITIES}
+    for i, (k, left_fill, right_fill) in enumerate(TILE_COMPACT_CASES):
+        tile_cases[f"K={k} fill={left_fill:g}/{right_fill:g}"] = (
+            generate_uniform_csr(size, k, left_fill, dtype, 1100 + 2 * i),
+            generate_uniform_csr(size, k, right_fill, dtype, 1101 + 2 * i))
+    candidates = [(l2, l3) for l2 in TILE_L2_CANDIDATES
+                  for l3 in TILE_L3_CANDIDATES]
+    rounds = {c: {} for c in candidates}
+    for r in range(TILE_ROUNDS):
+        shift = r * len(candidates) // TILE_ROUNDS
+        for l2, l3 in candidates[shift:] + candidates[:shift]:
             extra = {"tile_size_l2": l2, "tile_size_l3": l3}
-            times = {}
             for name, method in DENSE_METHODS.items():
-                for d in TILE_DENSITIES:
-                    times[(name, d)] = measure(
-                        "tiles", *tile_pairs[d], C, name, method,
-                        DENSE_MM_LABEL, f"l2={l2} l3={l3}", configured,
-                        extra, f"density={d}")
-            tile_table[(l2, l3)] = times
+                for case, (A, B) in tile_cases.items():
+                    rounds[(l2, l3)].setdefault((name, case), []).append(
+                        measure("tiles", A, B, C, name, method,
+                                DENSE_MM_LABEL, f"l2={l2} l3={l3} round={r + 1}",
+                                configured, extra, case, trials=1))
+    tile_table = {c: {case: float(np.median(ts)) for case, ts in times.items()}
+                  for c, times in rounds.items()}
     # One pair for calls mixing SD, DS and DD, and one per algorithm (they
     # differ: SD prefers small S tiles, DS larger ones).
     default_tiles = (defaults["tile_size_l2"], defaults["tile_size_l3"])
