@@ -621,3 +621,30 @@ extern "C" int spalm(
     }
     return SPALM_INTERNAL_ERROR;
 }
+
+// Where the caller should start a dense result on 2 MiB huge pages, in bytes
+// past the page boundary, for the sparse-output backends (SS, MKL sparse:
+// sparse_output != 0) or the others. From machine_params.txt, else the
+// defaults (16 and 0). Returns -1 for a bad type or parameter file.
+extern "C" int spalm_result_base_offset(int type, int sparse_output) {
+    if (type != 0 && type != 1) return -1;
+    try {
+        machine_params machine;
+        if (!read_machine_params(type, "cpu", machine)) return -1;
+        std::cout << "[machine-params] file="
+                  << (machine.path.empty() ? "none" : machine.path)
+                  << " result_base_offset_sparse="
+                  << machine.result_base_offset_sparse
+                  << " result_base_offset_dense="
+                  << machine.result_base_offset_dense << " ignored="
+                  << (machine.ignored.empty() ? "none" : machine.ignored)
+                  << std::endl;
+        return sparse_output ? machine.result_base_offset_sparse
+                             : machine.result_base_offset_dense;
+    } catch (const std::exception &e) {
+        std::cerr << "spalm: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "spalm: unknown exception" << std::endl;
+    }
+    return -1;
+}

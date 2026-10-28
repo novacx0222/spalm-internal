@@ -142,6 +142,22 @@ int main(int argc, char **argv) {
     }
     auto spalm = reinterpret_cast<spalm_fn>(dlsym(handle, "spalm"));
     assert(spalm);
+    // Result offset for the caller: machine_params.txt or the defaults.
+    auto offset = reinterpret_cast<int (*)(int, int)>(
+        dlsym(handle, "spalm_result_base_offset")
+    );
+    assert(offset);
+    for (int type : {0, 1}) {
+        for (int sparse_output : {0, 1}) {
+            const int bytes = offset(type, sparse_output);
+            assert(bytes >= 0 && bytes < 4096 && bytes % 8 == 0);
+            std::printf(
+                "result_base_offset(type=%d, sparse_output=%d) = %d\n", type,
+                sparse_output, bytes
+            );
+        }
+    }
+    assert(offset(2, 0) == -1);
 
     std::mt19937 rng(20261027);
     std::uniform_real_distribution<double> u(0, 1);

@@ -102,4 +102,30 @@ bool read_tile_sizes(
     int &tile_size_l2, int &tile_size_l3
 );
 
+// Machine-specific parameters, measured by find_thresholds.py on the machine
+// that runs the library and saved to
+// parameters/<platform>/<float|double>/machine_params.txt (not in git). The
+// defaults are the values used before the file existed (outer-v5): without
+// the file, nothing changes.
+struct machine_params {
+    // Bytes past a 2 MiB boundary where the caller starts a huge-page dense
+    // result, for the sparse-output backends (SS, MKL sparse) and the rest.
+    int result_base_offset_sparse = 16;
+    int result_base_offset_dense = 0;
+    // The file that was read, "" when the defaults are used.
+    std::string path;
+    // Keys of the file this library does not use (other library versions
+    // may write more), space separated.
+    std::string ignored;
+};
+
+// "key: value" lines, '#' comments. A missing file leaves the defaults and
+// returns true; a line that is not "key: integer" or an offset out of range
+// returns false. Unknown keys are listed in params.ignored.
+bool parse_machine_params(const std::string &path, machine_params &params);
+
+bool read_machine_params(
+    const int type, const char *platform, machine_params &params
+);
+
 #endif

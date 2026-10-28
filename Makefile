@@ -108,6 +108,7 @@ test-preparation:
 	OMP_THREAD_LIMIT=2 $(TEST_BIN_DIR)/preparation_dispatch_test
 	OMP_THREAD_LIMIT=2 $(TEST_BIN_DIR)/key_compaction_test
 
-# Timing-label parser of find_thresholds.py (standard library only).
+# Timing-label parser and machine-parameter choice of find_thresholds.py
+# (standard library only).
 test-thresholds:
-	$(PYTHON) -B -m unittest discover -s tests -p 'test_find_thresholds.py' -v
+	$(PYTHON) -B -m unittest discover -s tests -p 'test_*.py' -v

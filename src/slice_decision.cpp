@@ -271,3 +271,56 @@ bool read_tile_sizes(
     file.close();
     return true;
 }
+
+bool parse_machine_params(const std::string &path, machine_params &params) {
+    std::ifstream file(path);
+    if (!file.is_open()) return true;
+    auto error = [&](const std::string &what) {
+        std::cerr << "Error: invalid machine parameter file " << path << ": "
+                  << what << std::endl;
+        return false;
+    };
+    std::string line;
+    while (std::getline(file, line)) {
+        const size_t start = line.find_first_not_of(" \t\r");
+        if (start == std::string::npos || line[start] == '#') continue;
+        const size_t colon = line.find(':');
+        if (colon == std::string::npos) return error("expected key: value");
+        std::string key = line.substr(start, colon - start);
+        key.erase(key.find_last_not_of(" \t") + 1);
+        std::istringstream iss(line.substr(colon + 1));
+        long long value;
+        std::string rest;
+        if (!(iss >> value) || (iss >> rest)) {
+            return error("'" + key + "' needs one integer");
+        }
+        if (key == "result_base_offset_sparse" ||
+            key == "result_base_offset_dense") {
+            // The caller's allocation accepts offsets below 4096 that are a
+            // multiple of the value size; 8 covers float and double.
+            if (value < 0 || value >= 4096 || value % 8 != 0) {
+                return error(key + " must be a multiple of 8 in [0, 4096)");
+            }
+            (key == "result_base_offset_sparse"
+                 ? params.result_base_offset_sparse
+                 : params.result_base_offset_dense) = static_cast<int>(value);
+        } else {
+            params.ignored += (params.ignored.empty() ? "" : " ") + key;
+        }
+    }
+    params.path = path;
+    return true;
+}
+
+bool read_machine_params(
+    const int type, const char *platform, machine_params &params
+) {
+    const std::string params_base = resolve_path_near_lib(
+        reinterpret_cast<void *>(&read_machine_params), "../parameters",
+        "parameters"
+    );
+    const std::string type_dir = (type == 0) ? "/float" : "/double";
+    return parse_machine_params(
+        params_base + "/" + platform + type_dir + "/machine_params.txt", params
+    );
+}
