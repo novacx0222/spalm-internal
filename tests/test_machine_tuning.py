@@ -112,6 +112,7 @@ class FormatTest(unittest.TestCase):
         self.assertIn("slice_length_max: 2048\n", text)
         self.assertIn("slice_length: 512\n", text)
         self.assertIn("tile_size_l3_ds: 2304\n", text)
+        self.assertIn("slice_target_entries_dd: 16\n", text)
         self.assertIn("result_base_offset_sparse: 16\n", text)
         self.assertEqual(len(text.splitlines()), 1 + len(mt.KEYS))
 

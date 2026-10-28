@@ -122,6 +122,10 @@ struct machine_params {
     // fewer than slice_target_entries entries on average.
     int slice_target_entries = 16;
     int slice_length_max = 2048;
+    // The same per algorithm (keys slice_target_entries_sd, ...,
+    // slice_length_max_dd), used like the per-algorithm tile sizes; 0: unset.
+    int method_slice_target_entries[3] = {};
+    int method_slice_length_max[3] = {};
     // Bytes past a 2 MiB boundary where the caller starts a huge-page dense
     // result, for the sparse-output backends (SS, MKL sparse) and the rest.
     int result_base_offset_sparse = 16;

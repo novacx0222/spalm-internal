@@ -436,6 +436,25 @@ def tune_machine_params(lib, args, dtype, platform, type_name, params_path):
           f"{costs.get(default_rule, math.nan):.3f})")
     rule = {"slice_length": base, "slice_target_entries": target,
             "slice_length_max": max_length}
+    # The rule per algorithm, at that base length: SD, DS and DD gain from
+    # longer slices at different subrow sizes (one shared rule made DD on
+    # uniform 5% 31% slower in encoder-1025 v12 while SD and DS gained).
+    method_rule = {}
+    for name in DENSE_METHODS:
+        cases = {case: v for case, v in slice_times.items() if case[0] == name}
+        (_, t, m), costs = machine_tuning.fit_slice_rule(
+            cases, size, (base,), SLICE_TARGETS, maxima)
+        default = (base, defaults[f"slice_target_entries_{name.lower()}"],
+                   defaults[f"slice_length_max_{name.lower()}"])
+        if default in costs and costs[default] <= costs[(base, t, m)] * (
+                1 + TOLERANCE):
+            _, t, m = default
+        print(f"  slice rule {name}: target={t} max={m} (relative cost "
+              f"{costs[(base, t, m)]:.3f}, default "
+              f"{costs.get(default, math.nan):.3f})")
+        rule[f"slice_target_entries_{name.lower()}"] = t
+        rule[f"slice_length_max_{name.lower()}"] = m
+        method_rule[name] = (t, m)
     del C
 
     # -- Result offset on huge pages, whole library call ----------------------
@@ -445,9 +464,9 @@ def tune_machine_params(lib, args, dtype, platform, type_name, params_path):
     # (an explicit slice_length key turns the automatic rule off).
     density = min(A.nnz / (size * size), B.nnz / (size * size))
     run_length = {"sparse": base, "FORCE_MKL_SPARSE": base}
-    for method in DENSE_METHODS.values():
+    for name, method in DENSE_METHODS.items():
         run_length[method] = machine_tuning.auto_slice_length(
-            base, density, size, target, max_length)
+            base, density, size, *method_rule[name])
     offsets = {}
     advised_all = True
     for key, methods in (("result_base_offset_sparse", SPARSE_OUTPUT_METHODS),

@@ -10,7 +10,8 @@ it and uses these functions to pick, from those measurements:
   - slice_target_entries / slice_length_max: the automatic slice length rule
     for SD, DS and DD (the library doubles the base slice length, up to
     slice_length_max keys and at most K, while the sparse side's subrows
-    would hold fewer than slice_target_entries entries on average);
+    would hold fewer than slice_target_entries entries on average), one for
+    calls mixing them and one per algorithm (slice_target_entries_sd, ...);
   - result_base_offset_sparse / result_base_offset_dense: where the caller
     starts a huge-page dense result, past the 2 MiB boundary.
 
@@ -34,6 +35,12 @@ DEFAULTS = {
     "tile_size_l3_dd": 2304,
     "slice_target_entries": 16,
     "slice_length_max": 2048,
+    "slice_target_entries_sd": 16,
+    "slice_length_max_sd": 2048,
+    "slice_target_entries_ds": 16,
+    "slice_length_max_ds": 2048,
+    "slice_target_entries_dd": 16,
+    "slice_length_max_dd": 2048,
     "result_base_offset_sparse": 16,
     "result_base_offset_dense": 0,
 }

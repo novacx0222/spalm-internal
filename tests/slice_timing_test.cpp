@@ -29,6 +29,7 @@ static void machine_params_tests() {
     assert(parse_text(
         "# measured\n\nslice_length: 1024\ntile_size_l2: 256\n"
         "tile_size_l3 : 4608\ntile_size_l2_ds: 128\ntile_size_l3_sd: 576\n"
+        "slice_target_entries_dd: 4\nslice_length_max_ds: 4096\n"
         "slice_target_entries: 8\nslice_length_max: 4096\n"
         "result_base_offset_sparse: 0\nresult_base_offset_dense: 64\n",
         params
@@ -39,6 +40,9 @@ static void machine_params_tests() {
         params.method_tile_size_l2[MACHINE_DS] == 128 &&
         params.method_tile_size_l2[MACHINE_SD] == 0 &&
         params.method_tile_size_l3[MACHINE_SD] == 576 &&
+        params.method_slice_target_entries[MACHINE_DD] == 4 &&
+        params.method_slice_target_entries[MACHINE_SD] == 0 &&
+        params.method_slice_length_max[MACHINE_DS] == 4096 &&
         params.tile_size_l3 == 4608 && params.slice_target_entries == 8 &&
         params.slice_length_max == 4096 &&
         params.result_base_offset_sparse == 0 &&
@@ -47,10 +51,11 @@ static void machine_params_tests() {
     for (const char *bad :
          {"tile_size_l2: 0\n", "slice_length_max: 3000\n",
           "slice_length: 768\n", "slice_length: 0\n", "tile_size_l2_dd: 0\n",
-          "tile_size_l2_xx: 64\n", "slice_target_entries: 0\n",
-          "result_base_offset_dense: 12\n", "result_base_offset_sparse: 4096\n",
-          "slice_length_max: 2048 x\n", "unknown_key: 1\n", "tile_size_l3\n",
-          "tile_size_l3: abc\n"}) {
+          "tile_size_l2_xx: 64\n", "slice_length_max_sd: 1000\n",
+          "slice_target_entries_ds: 0\n", "slice_length_sd: 1024\n",
+          "slice_target_entries: 0\n", "result_base_offset_dense: 12\n",
+          "result_base_offset_sparse: 4096\n", "slice_length_max: 2048 x\n",
+          "unknown_key: 1\n", "tile_size_l3\n", "tile_size_l3: abc\n"}) {
         machine_params p;
         assert(!parse_text(bad, p));
     }

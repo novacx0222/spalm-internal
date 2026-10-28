@@ -579,10 +579,17 @@ static int spalm_impl(
     slice_length = get_int("slice_length", slice_length);
     tile_size_l2 = get_int("tile_size_l2", tile_size_l2);
     tile_size_l3 = get_int("tile_size_l3", tile_size_l3);
+    int target_entries = machine.slice_target_entries;
+    int max_length = machine.slice_length_max;
+    if (dense_method >= 0) {
+        if (machine.method_slice_target_entries[dense_method] > 0)
+            target_entries = machine.method_slice_target_entries[dense_method];
+        if (machine.method_slice_length_max[dense_method] > 0)
+            max_length = machine.method_slice_length_max[dense_method];
+    }
     options.slice_target_entries =
-        get_int("slice_target_entries", machine.slice_target_entries);
-    options.slice_length_max =
-        get_int("slice_length_max", machine.slice_length_max);
+        get_int("slice_target_entries", target_entries);
+    options.slice_length_max = get_int("slice_length_max", max_length);
     if (options.slice_target_entries < 1 ||
         options.slice_target_entries > 32768) {
         return invalid("slice_target_entries must be in [1, 32768]");

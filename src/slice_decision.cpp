@@ -295,35 +295,44 @@ bool parse_machine_params(const std::string &path, machine_params &params) {
         if (!(iss >> value) || (iss >> rest)) {
             return error("'" + key + "' needs one integer");
         }
-        int *tile = nullptr;
+        // Generic keys, and per algorithm with a _sd, _ds or _dd suffix.
+        int *tile = nullptr, *target = nullptr, *max_length = nullptr;
         if (key == "tile_size_l2") tile = &params.tile_size_l2;
         if (key == "tile_size_l3") tile = &params.tile_size_l3;
+        if (key == "slice_target_entries")
+            target = &params.slice_target_entries;
+        if (key == "slice_length_max") max_length = &params.slice_length_max;
         const char *methods[3] = {"sd", "ds", "dd"};
         for (int m = 0; m < 3; ++m) {
-            if (key == std::string("tile_size_l2_") + methods[m])
+            const std::string suffix = std::string("_") + methods[m];
+            if (key == "tile_size_l2" + suffix)
                 tile = &params.method_tile_size_l2[m];
-            if (key == std::string("tile_size_l3_") + methods[m])
+            if (key == "tile_size_l3" + suffix)
                 tile = &params.method_tile_size_l3[m];
+            if (key == "slice_target_entries" + suffix)
+                target = &params.method_slice_target_entries[m];
+            if (key == "slice_length_max" + suffix)
+                max_length = &params.method_slice_length_max[m];
         }
         if (tile) {
             if (value < 1 || value > INT_MAX)
                 return error(key + " must be positive");
             *tile = static_cast<int>(value);
-        } else if (key == "slice_target_entries") {
+        } else if (target) {
             if (value < 1 || value > 32768) {
                 return error(key + " must be in [1, 32768]");
             }
-            params.slice_target_entries = static_cast<int>(value);
+            *target = static_cast<int>(value);
         } else if (key == "slice_length") {
             if (!power_of_two(value) || value > 32768) {
                 return error(key + " must be a power of 2 in [1, 32768]");
             }
             params.slice_length = static_cast<int>(value);
-        } else if (key == "slice_length_max") {
+        } else if (max_length) {
             if (!power_of_two(value) || value > 32768) {
                 return error(key + " must be a power of 2 in [1, 32768]");
             }
-            params.slice_length_max = static_cast<int>(value);
+            *max_length = static_cast<int>(value);
         } else if (
             key == "result_base_offset_sparse" ||
             key == "result_base_offset_dense"
