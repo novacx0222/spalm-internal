@@ -21,16 +21,16 @@ void sparse_sparse_mm_calculate_results(
     int *row_result_cnt, const int offset, csr<T> &result_csr
 );
 
-template <typename T>
-void csr_csr_matmul_kernel(
-    const int start, const int end, const int *Rj, const T *Rv, const int *Sa,
-    const int *Sj, const int *Sj_1, const T *Sv, T *ret
-);
-
 void csr_csr_matmul_kernel(
     const int start, const int end, const int *Rj, const double *Rv,
     const int *Sa, const int *Sj, const int *Sj_1, const double *Sv,
     double *ret, bool contiguous = true
+);
+
+void csr_csr_matmul_kernel(
+    const int start, const int end, const int *Rj, const float *Rv,
+    const int *Sa, const int *Sj, const int *Sj_1, const float *Sv, float *ret,
+    bool contiguous = true
 );
 
 template <typename T>
