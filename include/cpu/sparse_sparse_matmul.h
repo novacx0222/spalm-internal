@@ -24,26 +24,28 @@ void sparse_sparse_mm_calculate_results(
 void csr_csr_matmul_kernel(
     const int start, const int end, const int *Rj, const double *Rv,
     const int *Sa, const int *Sj, const int *Sj_1, const double *Sv,
-    double *ret, bool contiguous = true
+    double *ret, bool contiguous = true, uint64_t *matched_row = nullptr
 );
 
 void csr_csr_matmul_kernel(
     const int start, const int end, const int *Rj, const float *Rv,
     const int *Sa, const int *Sj, const int *Sj_1, const float *Sv, float *ret,
-    bool contiguous = true
+    bool contiguous = true, uint64_t *matched_row = nullptr
 );
 
 template <typename T>
 void spgemm_rows_dense_result(
     ss_matrix<T> &R_ssm, int *R_subrow_buckets, int *s_agg_idxs, T *s_vals,
-    int *sj_buckets, const int N, T *ret, int threads, bool contiguous = true
+    int *sj_buckets, const int N, T *ret, int threads, bool contiguous = true,
+    uint64_t *matched = nullptr
 );
 
 template <typename T>
 void spgemm_rows_dense_result_vanilla(
     const int N, ss_matrix<T> &R_ssm, int *s_col_idxs, int *s_agg_idxs,
     T *s_vals, T *ret, int threads, bool contiguous = true,
-    const int *block_starts = nullptr, const int blocks = 1
+    const int *block_starts = nullptr, const int blocks = 1,
+    uint64_t *matched = nullptr
 );
 
 template <typename T>

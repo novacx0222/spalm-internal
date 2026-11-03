@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <iostream>
+#include <optional>
 #include <type_traits>
 #include <cmath>
 #include <cstring>
@@ -14,6 +15,7 @@
 #include <vector>
 
 #include "cpu/kernel.h"
+#include "cpu/matched.h"
 #include "slice_decision.h"
 #include "util.h"
 
@@ -99,7 +101,8 @@ void inline dense_dense_matmul_task_shared(
     const int R_slice_end, const int S_slice_start, const int S_slice_end,
     T *R_packed_mem, BIT_DTYPE *R_bm, T *S_packed_mem, BIT_DTYPE *S_bm,
     ss_matrix<T> &R_ssm, ss_matrix<T> &S_ssm, T *ret, bool sparse_result,
-    const dense_packing_policy &policy, const bool full_rows
+    const dense_packing_policy &policy, const bool full_rows,
+    uint64_t *matched, uint32_t *marker_buffer
 ) {
     const int M = R_ssm.csr_mat.rows;
     const int K = R_ssm.csr_mat.cols;
@@ -146,10 +149,21 @@ void inline dense_dense_matmul_task_shared(
         }
     }
 
+    // The cells of the pairs below, for spalm_matched
+    std::optional<slice_marker<T>> marker;
+    if (matched) {
+        marker.emplace(
+            matched, N, marker_buffer, R_ssm, S_ssm, k_offset, S_slice_start,
+            S_slice_end, FixedAlg != DENSE_DENSE_RIGHT_INNER_KERNEL,
+            FixedAlg < 0 || FixedAlg == DENSE_DENSE_RIGHT_INNER_KERNEL
+        );
+    }
+
     for (int R_si = R_slice_start_task; R_si < R_slice_end; R_si++) {
         const int R_s_idx = R_si - R_slice_start;
         const slice &R_s = R_ssm.s_csc_mat.vals[R_si];
         const int *R_row_idxs = &R_ssm.sr_csc_mat.row_idxs[R_s.start];
+        if (marker) marker->load(R_si);
         for (int S_si = S_slice_start; S_si < S_slice_end; S_si++) {
             const int S_s_idx = S_si - S_slice_start;
             const slice &S_s = S_ssm.s_csc_mat.vals[S_si];
@@ -183,7 +197,13 @@ void inline dense_dense_matmul_task_shared(
                 );
                 break;
             }
+            if (marker && alg != SPARSE_SPARSE) {
+                marker->mark(
+                    R_si, S_si, alg == DENSE_DENSE_RIGHT_INNER_KERNEL
+                );
+            }
         }
+        if (marker) marker->clear(R_si);
     }
 }
 
@@ -280,6 +300,12 @@ void dense_dense_matmul(
     std::vector<aligned_unique_ptr<T>> S_packed_mem_threads(threads);
     std::vector<aligned_unique_ptr<BIT_DTYPE>> S_bm_threads(threads);
     std::atomic<bool> alloc_failed{false};
+    // Zeroed masks of each worker for marking matched pairs
+    const size_t marker_size =
+        slice_marker<T>::buffer_size(sl, S_slices_per_agg_tile);
+    std::vector<uint32_t> marker_buffers(
+        options.matched ? marker_size * threads : 0
+    );
 
     omp_set_dynamic(0);
 #pragma omp parallel num_threads(threads)
@@ -392,7 +418,11 @@ void dense_dense_matmul(
                                 R_packed_mem.get(), R_bm.get(),
                                 S_packed_mem_threads[worker].get(),
                                 S_bm_threads[worker].get(), R_ssm, S_ssm, ret,
-                                sparse_result, policy, full_rows
+                                sparse_result, policy, full_rows,
+                                options.matched,
+                                options.matched
+                                    ? &marker_buffers[marker_size * worker]
+                                    : nullptr
                             );
                         };
                         switch (policy.fixed_alg) {

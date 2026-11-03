@@ -1,5 +1,5 @@
 # MKL is needed to build the libraries, not to run the portable tests.
-TEST_GOALS := test test-dispatch test-preparation test-thresholds test-kernels-native
+TEST_GOALS := test test-dispatch test-preparation test-thresholds test-kernels-native test-matched
 ifneq ($(filter-out $(TEST_GOALS),$(or $(MAKECMDGOALS),default)),)
 ifndef ONEAPI_ROOT
 $(error ONEAPI_ROOT is not set. Please 'source set_intel_vars.sh'.)
@@ -64,8 +64,10 @@ $(BIN_DIR)/spalm.o: include/method_dispatch.h include/csr_preparation.h \
 	include/cpu/execution_options.h include/cpu/dense_dense_matmul.h \
 	include/cpu/sparse_sparse_matmul.h
 $(BIN_DIR)/sparse_sparse_matmul.o: include/csr_preparation.h \
-	include/cpu/sparse_sparse_matmul.h
-$(BIN_DIR)/dense_dense_matmul.o: include/cpu/dense_dense_matmul.h include/cpu/kernel.h
+	include/cpu/sparse_sparse_matmul.h include/cpu/matched.h \
+	include/cpu/execution_options.h
+$(BIN_DIR)/dense_dense_matmul.o: include/cpu/dense_dense_matmul.h include/cpu/kernel.h \
+	include/cpu/matched.h include/cpu/execution_options.h
 $(BIN_DIR)/run_baseline.so: include/util.h
 
 # Portable tests: no AVX-512, MKL or built libraries; run from the repo root.
@@ -93,6 +95,14 @@ test-kernels-native:
 	mkdir -p $(TEST_BIN_DIR)
 	$(CXX) -std=c++20 -O1 -g tests/native_kernel_test.cpp -ldl -o $(TEST_BIN_DIR)/native_kernel_test
 	$(TEST_BIN_DIR)/native_kernel_test $(BIN_DIR)/spalm.so
+
+# spalm_matched of bin/spalm.so (build-libs first): the bitmap of matched
+# pairs against brute force, with explicit zeros and sums of zero. x86 only.
+.PHONY: test-matched
+test-matched:
+	mkdir -p $(TEST_BIN_DIR)
+	$(CXX) -std=c++20 -O1 -g tests/matched_test.cpp -ldl -o $(TEST_BIN_DIR)/matched_test
+	$(TEST_BIN_DIR)/matched_test $(BIN_DIR)/spalm.so
 
 # CSR preparation: memory bounds, validation, zero pruning, ownership.
 test-preparation:

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 // Per-call execution switches, read from the spalm() key/value options so
 // each optimization can be measured independently. Defaults are enabled.
 struct cpu_execution_options {
@@ -37,4 +39,9 @@ struct cpu_execution_options {
     // backends overwrite it (GEMM with beta = 0, spmmd), every other path,
     // the zero-work exits included, zeroes it first.
     bool result_zeroed = true;
+    // From spalm_matched (not a key): the bitmap of matched pairs, zeroed by the
+    // caller, which the kernels mark (cpu/matched.h). Null: not wanted.
+    uint64_t *matched = nullptr;
+    // With matched: set to 0 when an MKL backend runs, which marks nothing
+    int *marked = nullptr;
 };

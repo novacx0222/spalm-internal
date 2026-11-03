@@ -316,6 +316,7 @@ int spalm_matmul(
                           ? "mkl-dense"
                           : "mkl-sparse")
                   << " (forced)" << std::endl;
+        if (options.marked) *options.marked = 0;
         const auto start = std::chrono::high_resolution_clock::now();
         const int status = run_mkl_backend(
             forced_backend, type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, ret, threads
@@ -434,6 +435,7 @@ int spalm_matmul(
                           ? "mkl-dense"
                           : "mkl-sparse")
                   << " (fallback)" << std::endl;
+        if (options.marked) *options.marked = 0;
         // Neither MKL path uses the slices: release them before MKL
         // allocates its dense inputs or transpose, instead of holding both.
         const auto release_begin = std::chrono::high_resolution_clock::now();
@@ -494,7 +496,7 @@ static int spalm_impl(
     int type, int *Ri, int *Rj, void *Rv, int *Si, int *Sj, void *Sv,
     const int M, const int K, const int N, bool sparse_result, void *ret,
     int *reti, int *retj, void *retv, int n, const char **keys,
-    const char **vals
+    const char **vals, uint64_t *matched, int *marked
 ) {
     const auto initialize_begin = std::chrono::high_resolution_clock::now();
     auto invalid = [](const char *what) {
@@ -558,6 +560,13 @@ static int spalm_impl(
                                 get_str("slice_length", nullptr) == nullptr;
     if (options.ss_column_blocks < -1) {
         return invalid("ss_column_blocks must be -1 (auto), 0, 1 or a count");
+    }
+    // A stored zero is a match: with matched pairs, explicit zeros are kept
+    options.matched = matched;
+    options.marked = marked;
+    if (matched) {
+        options.prune_zeros = false;
+        if (sparse_result) return invalid("matched pairs need a dense result");
     }
 
     std::cout << "SPALM MATMUL" << std::endl;
@@ -630,13 +639,12 @@ static int spalm_impl(
     );
 }
 
-// Returns a spalm_status; the result is valid only for 0 (SPALM_OK).
-// Callers that still declare this as returning void keep working.
-extern "C" int spalm(
+// spalm() and spalm_matched(): one call at a time, no exception out.
+static int spalm_call(
     int type, int *Ri, int *Rj, void *Rv, int *Si, int *Sj, void *Sv,
     const int M, const int K, const int N, bool sparse_result, void *ret,
     int *reti, int *retj, void *retv, int n, const char **keys,
-    const char **vals
+    const char **vals, uint64_t *matched, int *marked
 ) {
     // Decision thresholds and bucket settings are process-global, reset and
     // freed by every call: serialize calls so concurrent queries in one
@@ -650,7 +658,7 @@ extern "C" int spalm(
         const auto begin = std::chrono::high_resolution_clock::now();
         const int status = spalm_impl(
             type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, sparse_result, ret, reti,
-            retj, retv, n, keys, vals
+            retj, retv, n, keys, vals, matched, marked
         );
         // Everything inside the library, after the call lock is taken.
         print_time(
@@ -668,6 +676,43 @@ extern "C" int spalm(
         std::cerr << "spalm: unknown exception" << std::endl;
     }
     return SPALM_INTERNAL_ERROR;
+}
+
+// Returns a spalm_status; the result is valid only for 0 (SPALM_OK).
+// Callers that still declare this as returning void keep working.
+extern "C" int spalm(
+    int type, int *Ri, int *Rj, void *Rv, int *Si, int *Sj, void *Sv,
+    const int M, const int K, const int N, bool sparse_result, void *ret,
+    int *reti, int *retj, void *retv, int n, const char **keys,
+    const char **vals
+) {
+    return spalm_call(
+        type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, sparse_result, ret, reti, retj,
+        retv, n, keys, vals, nullptr, nullptr
+    );
+}
+
+// spalm() that also marks the pairs (i, j) that some key matches, whatever
+// the values: bit j % 64 of word i * ceil(N / 64) + j / 64 of matched, which
+// the caller zeroes, so a sum of zero is told apart from no match. Explicit
+// zeros are kept, and a sparse result is an invalid argument. *marked is 1
+// when the bitmap is complete, 0 when an MKL backend ran (forced or as the
+// fallback), which marks nothing: the backend is chosen as by spalm().
+extern "C" int spalm_matched(
+    int type, int *Ri, int *Rj, void *Rv, int *Si, int *Sj, void *Sv,
+    const int M, const int K, const int N, bool sparse_result, void *ret,
+    int *reti, int *retj, void *retv, int n, const char **keys,
+    const char **vals, uint64_t *matched, int *marked
+) {
+    if (!matched || !marked) {
+        std::cerr << "spalm: null matched or marked pointer" << std::endl;
+        return SPALM_INVALID_ARGUMENT;
+    }
+    *marked = 1;
+    return spalm_call(
+        type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, sparse_result, ret, reti, retj,
+        retv, n, keys, vals, matched, marked
+    );
 }
 
 // Present when spalm() accepts result_zeroed = 0 (an uninitialized result,

@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "cpu/matched.h"
 #include "csr_preparation.h"
 #include "slice_decision.h"
 #include "util.h"
@@ -102,7 +103,7 @@ void sparse_sparse_mm_calculate_results(
 void csr_csr_matmul_kernel(
     const int start, const int end, const int *Rj, const double *Rv,
     const int *Sa, const int *Sj, const int *Sj_1, const double *Sv,
-    double *ret, bool contiguous
+    double *ret, bool contiguous, uint64_t *matched_row
 ) {
     const __m256i lane_ids = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
     for (int r_kit = start; r_kit < end; r_kit++) {
@@ -114,7 +115,9 @@ void csr_csr_matmul_kernel(
 
         if (!iterations) {
             continue;
-        } else if (!(iterations & 0xfffffff8)) {
+        }
+        if (matched_row) mark_columns(&Sa[Sj[k]], iterations, matched_row);
+        if (!(iterations & 0xfffffff8)) {
             /*
       for (int s_ait = Sj[k]; s_ait < Sj_1[k]; s_ait++) {
         const int sagg = Sa[s_ait];
@@ -183,7 +186,7 @@ void csr_csr_matmul_kernel(
 void csr_csr_matmul_kernel(
     const int start, const int end, const int *Rj, const float *Rv,
     const int *Sa, const int *Sj, const int *Sj_1, const float *Sv, float *ret,
-    bool contiguous
+    bool contiguous, uint64_t *matched_row
 ) {
     const __m512i lane_ids =
         _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
@@ -195,6 +198,7 @@ void csr_csr_matmul_kernel(
         if (!iterations) {
             continue;
         }
+        if (matched_row) mark_columns(&Sa[Sj[k]], iterations, matched_row);
 
         const int left = iterations & 0b1111;
         const int s_ait_start = Sj[k];
@@ -235,10 +239,12 @@ void csr_csr_matmul_kernel(
 template <typename T>
 void spgemm_rows_dense_result(
     ss_matrix<T> &R_ssm, int *R_subrow_buckets, int *s_agg_idxs, T *s_vals,
-    int *sj_buckets, const int N, T *ret, int threads, bool contiguous
+    int *sj_buckets, const int N, T *ret, int threads, bool contiguous,
+    uint64_t *matched
 ) {
     const int M = R_ssm.csr_mat.rows;
     const int K = R_ssm.csr_mat.cols;
+    const size_t words = matched_words(N);
 
 #pragma omp parallel for num_threads(threads) schedule(dynamic, 4)
     for (int ra = 0; ra < M; ra++) {
@@ -254,7 +260,8 @@ void spgemm_rows_dense_result(
             csr_csr_matmul_kernel(
                 sr.start, sr.start + sr.len, R_ssm.csr_mat.col_idxs,
                 R_ssm.csr_mat.vals, s_agg_idxs, sj_starts, sj_ends, s_vals,
-                &ret[(size_t) ra * N], contiguous
+                &ret[(size_t) ra * N], contiguous,
+                matched ? matched + ra * words : nullptr
             );
         }
     }
@@ -325,10 +332,11 @@ template <typename T>
 void spgemm_rows_dense_result_vanilla(
     const int N, ss_matrix<T> &R_ssm, int *s_col_idxs, int *s_agg_idxs,
     T *s_vals, T *ret, int threads, bool contiguous, const int *block_starts,
-    const int blocks
+    const int blocks, uint64_t *matched
 ) {
     const int M = R_ssm.csr_mat.rows;
     csr<T> &R_csr = R_ssm.csr_mat;
+    const size_t words = matched_words(N);
     if (block_starts && blocks > 1) {
         // Blocks in order, each over all R rows: same updates per output
         // element, in the same order, so results are unchanged.
@@ -342,7 +350,8 @@ void spgemm_rows_dense_result_vanilla(
                 csr_csr_matmul_kernel(
                     R_csr.row_ptrs[ra], R_csr.row_ptrs[ra + 1], R_csr.col_idxs,
                     R_csr.vals, s_agg_idxs, first, last, s_vals,
-                    &ret[(size_t) ra * N], contiguous
+                    &ret[(size_t) ra * N], contiguous,
+                    matched ? matched + ra * words : nullptr
                 );
             }
         }
@@ -354,7 +363,8 @@ void spgemm_rows_dense_result_vanilla(
         csr_csr_matmul_kernel(
             R_csr.row_ptrs[ra], R_csr.row_ptrs[ra + 1], R_csr.col_idxs,
             R_csr.vals, s_agg_idxs, s_col_idxs, s_col_idxs + 1, s_vals,
-            &ret[(size_t) ra * N], contiguous
+            &ret[(size_t) ra * N], contiguous,
+            matched ? matched + ra * words : nullptr
         );
     }
 }
@@ -401,7 +411,7 @@ void sparse_sparse_matmul(
         spgemm_rows_dense_result_vanilla(
             N, R_ssm, transposed.offsets.get(), transposed.row_idxs.get(),
             transposed.values.get(), ret, threads, options.ss_contiguous,
-            blocks > 1 ? block_starts.data() : nullptr, blocks
+            blocks > 1 ? block_starts.data() : nullptr, blocks, options.matched
         );
         end = std::chrono::high_resolution_clock::now();
         print_time("[sparse-sparse-sparse-mm-time]", end - start);
@@ -451,7 +461,7 @@ void sparse_sparse_matmul(
         spgemm_rows_dense_result(
             R_ssm, R_subrow_buckets.get(), transposed.row_idxs.get(),
             transposed.values.get(), transposed.offsets.get(), N, ret, threads,
-            options.ss_contiguous
+            options.ss_contiguous, options.matched
         );
     } else {
         // TODO: sparse output path
