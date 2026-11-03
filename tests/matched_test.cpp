@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -121,8 +122,8 @@ static int call(
     return status;
 }
 
-// mkl: 1 when MKL must run, 0 when SPALM's kernels must, -1 either (the
-// automatic choice); MKL runs are counted in mkl_runs.
+// mkl: 1 when MKL must run (if a pair matches), 0 when SPALM's kernels must,
+// -1 either (the automatic choice); MKL runs are counted in mkl_runs.
 template <typename T>
 static bool run_case(
     spalm_matched_fn spalm_matched, const std::string &label, const csr &R,
@@ -140,6 +141,10 @@ static bool run_case(
     );
     mkl_runs += marked == 0;
     auto want_matched = reference_matched(R, S, K);
+    const bool any_match =
+        std::any_of(want_matched.begin(), want_matched.end(), [](uint64_t w) {
+            return w != 0;
+        });
     if (marked == 0) std::fill(want_matched.begin(), want_matched.end(), 0);
     const auto want = reference<T>(R, S, K);
     size_t bad_bits = 0, bad_values = 0, first = 0;
@@ -149,8 +154,11 @@ static bool run_case(
             bad_bits += __builtin_popcountll(matched[w] ^ want_matched[w]);
         }
     for (size_t i = 0; i < out.size(); ++i) bad_values += !(out[i] == want[i]);
-    const bool bad_marked =
-        (marked != 0 && marked != 1) || (mkl >= 0 && marked != 1 - mkl);
+    // Without a common key the library returns before any backend: the
+    // bitmap is complete (all zero) and marked, whatever the method
+    const bool bad_marked = (marked != 0 && marked != 1) ||
+                            (mkl == 0 && marked != 1) ||
+                            (mkl == 1 && marked != 0 && any_match);
     if (status != 0 || bad_marked || bad_bits || bad_values) {
         std::string opts;
         for (auto &kv : options) opts += " " + kv.first + "=" + kv.second;
