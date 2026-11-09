@@ -36,4 +36,8 @@ struct cpu_execution_options {
     // backends overwrite it (GEMM with beta = 0, spmmd), every other path,
     // the zero-work exits included, zeroes it first.
     bool result_zeroed = true;
+    // SS with sparse output (spalm_sparse()): entries per output page,
+    // 0 = pages growing from 64 Ki to 4 Mi entries. Small fixed pages are
+    // for tests (key: ss_output_page_entries).
+    long long ss_output_page_entries = 0;
 };

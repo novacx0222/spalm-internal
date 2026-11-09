@@ -19,6 +19,7 @@
 #include "mkl.h"
 #include "slice_decision.h"
 #include "cpu/sparse_sparse_matmul.h"
+#include "spalm_sparse_result.h"
 #include "ss_mat.h"
 #include "util.h"
 
@@ -59,13 +60,19 @@ using run_baseline_fn = void (*)(
     void *, void *, const int, const int, const int, const int
 );
 
+// MKL sparse-sparse with sparse output (run_baseline_sparse_output): C as
+// CSR arrays owned by *handle until run_baseline_sparse_output_free.
+using run_baseline_sparse_output_fn = int (*)(
+    int, int *, int *, void *, int *, int *, void *, const int, const int,
+    const int, const int, void **, int **, int **, int **, void **
+);
+using run_baseline_sparse_output_free_fn = void (*)(void *);
+
 // Returns nullptr (after printing why) if the MKL baseline cannot be loaded.
 // The library stays loaded for the process lifetime (unloading MKL corrupts
 // its thread pool); a successful lookup is cached, a failure is retried.
 // Calls are serialized by spalm(), so the cache needs no further locking.
-static run_baseline_fn load_run_baseline() {
-    static run_baseline_fn cached = nullptr;
-    if (cached) return cached;
+static void *load_baseline_library() {
     void *handle = dlopen(
         resolve_path_near_lib(
             reinterpret_cast<void *>(&spalm_lib_anchor), "run_baseline.so",
@@ -74,12 +81,41 @@ static run_baseline_fn load_run_baseline() {
             .c_str(),
         RTLD_LAZY
     );
-    if (!handle) {
-        std::cerr << "Cannot open library: " << dlerror() << '\n';
-        return nullptr;
+    if (!handle) std::cerr << "Cannot open library: " << dlerror() << '\n';
+    return handle;
+}
+
+template <typename F> static F load_baseline_symbol(const char *name) {
+    void *handle = load_baseline_library();
+    if (!handle) return nullptr;
+    F symbol = (F) dlsym(handle, name);
+    if (!symbol) {
+        std::cerr << "Cannot find " << name << ": " << dlerror() << '\n';
     }
-    cached = (run_baseline_fn) dlsym(handle, "run_baseline");
-    if (!cached) std::cerr << "Cannot find run_baseline: " << dlerror() << '\n';
+    return symbol;
+}
+
+static run_baseline_fn load_run_baseline() {
+    static run_baseline_fn cached = nullptr;
+    if (!cached) cached = load_baseline_symbol<run_baseline_fn>("run_baseline");
+    return cached;
+}
+
+struct baseline_sparse_output {
+    run_baseline_sparse_output_fn run = nullptr;
+    run_baseline_sparse_output_free_fn free = nullptr;
+};
+
+static baseline_sparse_output load_baseline_sparse_output() {
+    static baseline_sparse_output cached;
+    if (!cached.run || !cached.free) {
+        cached.run = load_baseline_symbol<run_baseline_sparse_output_fn>(
+            "run_baseline_sparse_output"
+        );
+        cached.free = load_baseline_symbol<run_baseline_sparse_output_free_fn>(
+            "run_baseline_sparse_output_free"
+        );
+    }
     return cached;
 }
 
@@ -148,6 +184,63 @@ int run_mkl_backend(
     return SPALM_OK;
 }
 
+// Forced MKL sparse-sparse with sparse output: the same S transpose as MKL
+// sparse-sparse, then mkl_sparse_?_sp2m instead of mkl_sparse_?_spmmd (in
+// run_baseline.so). The result keeps MKL's C; its rows are cut into blocks
+// of about 64 Ki entries for the caller's threads.
+static int run_mkl_sparse_output(
+    int type, int *Ri, int *Rj, void *Rv, int *Si, int *Sj, void *Sv, int M,
+    int K, int N, int threads, spalm_sparse_result &out
+) {
+    const baseline_sparse_output baseline = load_baseline_sparse_output();
+    if (!baseline.run || !baseline.free) return SPALM_BASELINE_ERROR;
+    std::cout << "Fallback: MKL sparse-sparse (sparse output)" << std::endl;
+    const auto start = std::chrono::high_resolution_clock::now();
+    void *handle = nullptr;
+    int *rows_start = nullptr, *rows_end = nullptr, *cols = nullptr;
+    void *vals = nullptr;
+    const int status = baseline.run(
+        type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, threads, &handle, &rows_start,
+        &rows_end, &cols, &vals
+    );
+    print_time(
+        "[mkl-call-total]", std::chrono::high_resolution_clock::now() - start
+    );
+    if (status != 0) {
+        std::cerr << "spalm: MKL sparse output failed (status " << status
+                  << ")" << std::endl;
+        return SPALM_INTERNAL_ERROR;
+    }
+    out.storage = std::shared_ptr<void>(handle, baseline.free);
+    const auto blocks_begin = std::chrono::high_resolution_clock::now();
+    constexpr long long target = 1LL << 16;
+    out.blocks.clear();
+    out.entries = 0;
+    for (int begin = 0; begin < M;) {
+        int end = begin;
+        long long entries = 0;
+        while (end < M && entries < target) {
+            entries += rows_end[end] - rows_start[end];
+            ++end;
+        }
+        if (entries > 0) {
+            out.blocks.push_back(
+                {begin, end - begin, rows_start + begin, rows_end + begin, cols,
+                 vals}
+            );
+        }
+        out.entries += entries;
+        begin = end;
+    }
+    print_time(
+        "[mkl-sparse-output-blocks]",
+        std::chrono::high_resolution_clock::now() - blocks_begin
+    );
+    std::cout << "[mkl-sparse-output] entries=" << out.entries
+              << " blocks=" << out.blocks.size() << std::endl;
+    return SPALM_OK;
+}
+
 // Slice length for this call. Each nonempty subrow of a sparse side costs a
 // read-modify-write of its packed-panel outputs per opposite slice, so very
 // short subrows (uniform 1%: about 5 entries at 512 keys) are dominated by
@@ -199,7 +292,8 @@ int spalm_matmul(
     const int M, const int K_input, const int N, const int slice_length,
     const int tile_size_l2, const int tile_size_l3, bool sparse_result, T *ret,
     int *reti, int *retj, T *retv, const int threads,
-    const cpu_execution_options &options
+    const cpu_execution_options &options,
+    spalm_sparse_result *sparse_out = nullptr
 ) {
     // The join dimension every later stage uses; key compaction shrinks it.
     int K = K_input;
@@ -208,11 +302,13 @@ int spalm_matmul(
     // zeroed here, and the zero-work exits zero it for the MKL backends.
     const bool forced_mkl = force_mkl_dense || force_mkl_sparse;
     const size_t result_bytes = (size_t) M * N * sizeof(T);
-    if (!options.result_zeroed && !forced_mkl) {
+    // Sparse output (sparse_out): no dense result; every exit before the
+    // multiplication leaves it without blocks.
+    if (ret && !options.result_zeroed && !forced_mkl) {
         zero_result(ret, result_bytes, threads);
     }
     auto zero_work = [&](const char *why) {
-        if (!options.result_zeroed && forced_mkl) {
+        if (ret && !options.result_zeroed && forced_mkl) {
             zero_result(ret, result_bytes, threads);
         }
         std::cout << "[backend] zero-work (" << why << ")" << std::endl;
@@ -317,9 +413,19 @@ int spalm_matmul(
                           : "mkl-sparse")
                   << " (forced)" << std::endl;
         const auto start = std::chrono::high_resolution_clock::now();
-        const int status = run_mkl_backend(
-            forced_backend, type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, ret, threads
-        );
+        int status = SPALM_INVALID_ARGUMENT;
+        if (!sparse_out) {
+            status = run_mkl_backend(
+                forced_backend, type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, ret,
+                threads
+            );
+        } else if (forced_backend == spalm_dispatch::Backend::MklSparse) {
+            status = run_mkl_sparse_output(
+                type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, threads, *sparse_out
+            );
+        } else {
+            std::cerr << "spalm: MKL dense has no sparse output" << std::endl;
+        }
         print_time(
             "[forced-backend-total]",
             std::chrono::high_resolution_clock::now() - start
@@ -428,6 +534,15 @@ int spalm_matmul(
         total_dense_mm_cost > (unsigned long long) M * K * N * 0.8,
         do_sparse_mm && !do_dense_mm
     );
+    // Sparse output exists for the full SS path only (init_method sparse:
+    // no dense slice pair, no fallback).
+    if (sparse_out &&
+        (backend != spalm_dispatch::Backend::Internal || do_dense_mm)) {
+        std::cerr << "spalm: sparse output needs every slice pair on the SS "
+                     "path (init_method sparse)"
+                  << std::endl;
+        return SPALM_INVALID_ARGUMENT;
+    }
     if (backend != spalm_dispatch::Backend::Internal) {
         std::cout << "[backend] "
                   << (backend == spalm_dispatch::Backend::MklDense
@@ -452,7 +567,8 @@ int spalm_matmul(
         std::cout << std::endl;
         if (do_sparse_mm) {
             sparse_sparse_matmul(
-                R_ssm, S_ssm, ret, sparse_result, threads, !do_dense_mm, options
+                R_ssm, S_ssm, ret, sparse_result, threads, !do_dense_mm,
+                options, sparse_out
             );
         }
 
@@ -490,11 +606,13 @@ struct bucket_info_guard {
     }
 };
 
+// sparse_out: the result goes there as row blocks (spalm_sparse()); ret
+// is not used.
 static int spalm_impl(
     int type, int *Ri, int *Rj, void *Rv, int *Si, int *Sj, void *Sv,
     const int M, const int K, const int N, bool sparse_result, void *ret,
     int *reti, int *retj, void *retv, int n, const char **keys,
-    const char **vals
+    const char **vals, spalm_sparse_result *sparse_out = nullptr
 ) {
     const auto initialize_begin = std::chrono::high_resolution_clock::now();
     auto invalid = [](const char *what) {
@@ -506,9 +624,28 @@ static int spalm_impl(
     if (n < 0 || (n > 0 && (!keys || !vals))) {
         return invalid("invalid key/value options");
     }
+    // Sparse output: SPALM SS (init_method sparse) and MKL sparse-sparse
+    // (FORCE_MKL_SPARSE) only. The first init_method counts, as below.
+    if (sparse_out) {
+        const char *method = "";
+        for (int i = 0; i < n; i++) {
+            if (strcmp(keys[i], "init_method") == 0) {
+                method = vals[i];
+                break;
+            }
+        }
+        if (strcmp(method, "sparse") != 0 &&
+            strcmp(method, "FORCE_MKL_SPARSE") != 0) {
+            return invalid(
+                "sparse output needs init_method sparse or FORCE_MKL_SPARSE"
+            );
+        }
+    }
     // A product with K = 0 is all zeros: an uninitialized result
-    // (result_zeroed = 0) is zeroed, an initialized one left as is.
+    // (result_zeroed = 0) is zeroed, an initialized one left as is; a
+    // sparse result has no blocks.
     if (M == 0 || K == 0 || N == 0) {
+        if (sparse_out) return SPALM_OK;
         bool zeroed = true;
         for (int i = 0; i < n; i++)
             if (strcmp(keys[i], "result_zeroed") == 0) zeroed = atoi(vals[i]);
@@ -521,11 +658,12 @@ static int spalm_impl(
         }
         return SPALM_OK;
     }
-    if (!Ri || !Rj || !Rv || !Si || !Sj || !Sv || !ret) {
+    if (!Ri || !Rj || !Rv || !Si || !Sj || !Sv || (!ret && !sparse_out)) {
         return invalid("null matrix or result pointer");
     }
     // The dense kernels address the result with 32-bit offsets, including
     // gather/scatter indices up to 12 rows and 32 columns past a tile start.
+    // Kept for sparse output too, which is not tested beyond it yet.
     if ((long long) (M + 16) * (N + 32) > INT_MAX) {
         return invalid("M * N is too large for 32-bit result offsets");
     }
@@ -556,6 +694,10 @@ static int spalm_impl(
     options.result_zeroed = get_int("result_zeroed", 1) != 0;
     options.auto_slice_length = get_int("auto_slice_length", 1) != 0 &&
                                 get_str("slice_length", nullptr) == nullptr;
+    {
+        const char *page = get_str("ss_output_page_entries", "0");
+        options.ss_output_page_entries = atoll(page);
+    }
     if (options.ss_column_blocks < -1) {
         return invalid("ss_column_blocks must be -1 (auto), 0, 1 or a count");
     }
@@ -605,7 +747,9 @@ static int spalm_impl(
     // std::cout << "Tile size join dim: " << tile_size_join_dim << std::endl;
     std::cout << "Tile size L2: " << tile_size_l2 << std::endl;
     std::cout << "Tile size L3: " << tile_size_l3 << std::endl;
-    if (sparse_result) {
+    if (sparse_out) {
+        std::cout << "Writing to sparse result (row blocks)" << std::endl;
+    } else if (sparse_result) {
         std::cout << "Writing to sparse result" << std::endl;
     } else {
         std::cout << "Writing to dense result" << std::endl;
@@ -620,38 +764,35 @@ static int spalm_impl(
         return spalm_matmul(
             type, Ri, Rj, (float *) Rv, Si, Sj, (float *) Sv, M, K, N,
             slice_length, tile_size_l2, tile_size_l3, sparse_result,
-            (float *) ret, reti, retj, (float *) retv, threads, options
+            (float *) ret, reti, retj, (float *) retv, threads, options,
+            sparse_out
         );
     }
     return spalm_matmul(
         type, Ri, Rj, (double *) Rv, Si, Sj, (double *) Sv, M, K, N,
         slice_length, tile_size_l2, tile_size_l3, sparse_result, (double *) ret,
-        reti, retj, (double *) retv, threads, options
+        reti, retj, (double *) retv, threads, options, sparse_out
     );
 }
 
-// Returns a spalm_status; the result is valid only for 0 (SPALM_OK).
-// Callers that still declare this as returning void keep working.
-extern "C" int spalm(
-    int type, int *Ri, int *Rj, void *Rv, int *Si, int *Sj, void *Sv,
-    const int M, const int K, const int N, bool sparse_result, void *ret,
-    int *reti, int *retj, void *retv, int n, const char **keys,
-    const char **vals
-) {
-    // Decision thresholds and bucket settings are process-global, reset and
-    // freed by every call: serialize calls so concurrent queries in one
-    // process cannot overwrite or free each other's state mid-run.
-    static std::mutex spalm_mutex;
-    std::lock_guard<std::mutex> lock(spalm_mutex);
-    // Never let an exception cross the C ABI. Exceptions thrown inside
-    // OpenMP regions still terminate the process; this covers the rest
-    // (e.g. std::bad_alloc from the slice or MKL input allocations).
+// Decision thresholds and bucket settings are process-global, reset and
+// freed by every call: spalm() and spalm_sparse() are serialized so
+// concurrent queries in one process cannot overwrite or free each other's
+// state mid-run. Never lets an exception cross the C ABI. Exceptions thrown
+// inside OpenMP regions still terminate the process; this covers the rest
+// (e.g. std::bad_alloc from the slice or MKL input allocations).
+// One lock for both entry points (a static inside the template would be
+// one per instantiation).
+static std::mutex &spalm_call_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+template <typename F> static int serialized_call(F call) {
+    std::lock_guard<std::mutex> lock(spalm_call_mutex());
     try {
         const auto begin = std::chrono::high_resolution_clock::now();
-        const int status = spalm_impl(
-            type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, sparse_result, ret, reti,
-            retj, retv, n, keys, vals
-        );
+        const int status = call();
         // Everything inside the library, after the call lock is taken.
         print_time(
             "[spalm-total]", std::chrono::high_resolution_clock::now() - begin
@@ -668,6 +809,70 @@ extern "C" int spalm(
         std::cerr << "spalm: unknown exception" << std::endl;
     }
     return SPALM_INTERNAL_ERROR;
+}
+
+// Returns a spalm_status; the result is valid only for 0 (SPALM_OK).
+// Callers that still declare this as returning void keep working.
+extern "C" int spalm(
+    int type, int *Ri, int *Rj, void *Rv, int *Si, int *Sj, void *Sv,
+    const int M, const int K, const int N, bool sparse_result, void *ret,
+    int *reti, int *retj, void *retv, int n, const char **keys,
+    const char **vals
+) {
+    return serialized_call([&] {
+        return spalm_impl(
+            type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, sparse_result, ret, reti,
+            retj, retv, n, keys, vals
+        );
+    });
+}
+
+// C = R * S^T as row blocks (spalm_sparse_result.h) instead of a dense
+// result, for init_method sparse (SPALM SS) and FORCE_MKL_SPARSE (MKL
+// sp2m); other methods are rejected. Same inputs and options as spalm().
+// On SPALM_OK *result is a handle for spalm_sparse_result_blocks(), to be
+// released with spalm_sparse_result_free(); otherwise it is null.
+extern "C" int spalm_sparse(
+    int type, int *Ri, int *Rj, void *Rv, int *Si, int *Sj, void *Sv,
+    const int M, const int K, const int N, int n, const char **keys,
+    const char **vals, void **result
+) {
+    if (!result) {
+        std::cerr << "spalm: null result handle pointer" << std::endl;
+        return SPALM_INVALID_ARGUMENT;
+    }
+    *result = nullptr;
+    std::unique_ptr<spalm_sparse_result> out;
+    const int status = serialized_call([&] {
+        out = std::make_unique<spalm_sparse_result>();
+        return spalm_impl(
+            type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, false, nullptr, nullptr,
+            nullptr, nullptr, n, keys, vals, out.get()
+        );
+    });
+    if (status == SPALM_OK) *result = out.release();
+    return status;
+}
+
+// Layout version of spalm_csr_block (SPALM_SPARSE_RESULT_ABI).
+extern "C" int spalm_sparse_result_abi() { return SPALM_SPARSE_RESULT_ABI; }
+
+// The blocks of a spalm_sparse() result; *count gets their number.
+extern "C" const spalm_csr_block *
+spalm_sparse_result_blocks(void *result, long long *count) {
+    const auto *r = static_cast<const spalm_sparse_result *>(result);
+    if (count) *count = r ? (long long) r->blocks.size() : 0;
+    return r && !r->blocks.empty() ? r->blocks.data() : nullptr;
+}
+
+// Entries over all blocks (MKL: explicit zeros included).
+extern "C" long long spalm_sparse_result_entries(void *result) {
+    const auto *r = static_cast<const spalm_sparse_result *>(result);
+    return r ? r->entries : 0;
+}
+
+extern "C" void spalm_sparse_result_free(void *result) {
+    delete static_cast<spalm_sparse_result *>(result);
 }
 
 // Present when spalm() accepts result_zeroed = 0 (an uninitialized result,

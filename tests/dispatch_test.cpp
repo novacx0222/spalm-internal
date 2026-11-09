@@ -14,10 +14,12 @@
 // Skip the x86-only low-level declarations; keep the exact high-level signature.
 #include "cpu/execution_options.h"
 #define SPARSE_SPARSE_MATMUL_H
+struct spalm_sparse_result;
 template <typename T>
 void sparse_sparse_matmul(
     ss_matrix<T> &, ss_matrix<T> &, T *, bool, int, bool = false,
-    const cpu_execution_options & = cpu_execution_options()
+    const cpu_execution_options & = cpu_execution_options(),
+    spalm_sparse_result * = nullptr
 );
 
 static int backend_calls;
@@ -64,8 +66,9 @@ void dense_dense_matmul(
 template <class T>
 void sparse_sparse_matmul(
     ss_matrix<T> &r, ss_matrix<T> &s, T *output, bool, int, bool,
-    const cpu_execution_options &
+    const cpu_execution_options &, spalm_sparse_result *sparse_out
 ) {
+    assert(!sparse_out);
     scalar_csr(
         r.csr_mat.row_ptrs, r.csr_mat.col_idxs, r.csr_mat.vals,
         s.csr_mat.row_ptrs, s.csr_mat.col_idxs, s.csr_mat.vals, output,

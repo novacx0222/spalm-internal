@@ -296,3 +296,126 @@ extern "C" void run_baseline(
     end = std::chrono::high_resolution_clock::now();
     print_time("[mkl-baseline-total]", end - e2e_start);
 }
+
+// C = R * S^T as a sparse matrix (MKL sparse-sparse with sparse output):
+// the same S transpose as "MKL sparse-sparse", then mkl_sparse_?_sp2m
+// instead of mkl_sparse_?_spmmd, so only the output differs. C's CSR arrays
+// (zero-based; rows_start / rows_end per row, columns not necessarily
+// sorted, products that cancel to 0 kept) are returned and owned by
+// *handle until run_baseline_sparse_output_free(*handle). Returns 0, or the
+// failing MKL status (nothing to free then).
+extern "C" int run_baseline_sparse_output(
+    int type, int *Ri, int *Rj, void *Rv, int *Si, int *Sj, void *Sv,
+    const int M, const int K, const int N, const int threads, void **handle,
+    int **rows_start, int **rows_end, int **cols, void **vals
+) {
+    static_assert(sizeof(MKL_INT) == sizeof(int), "LP64 MKL expected");
+    std::cout << "MKL sparse-sparse (sparse output)" << std::endl;
+    std::cout << M << " " << K << " " << N << std::endl;
+    std::cout << "THREADS: " << threads << std::endl;
+    mkl_set_num_threads(threads);
+    *handle = nullptr;
+    const auto e2e_start = std::chrono::high_resolution_clock::now();
+
+    sparse_matrix_t R_csr = nullptr, S_csr = nullptr, S_T_csr = nullptr,
+                    C = nullptr;
+    auto release_inputs = [&] {
+        if (R_csr) mkl_sparse_destroy(R_csr);
+        if (S_csr) mkl_sparse_destroy(S_csr);
+        if (S_T_csr) mkl_sparse_destroy(S_T_csr);
+        R_csr = S_csr = S_T_csr = nullptr;
+    };
+    auto fail = [&](const char *what, sparse_status_t status) {
+        std::cerr << "MKL " << what << " failed with status " << (int) status
+                  << std::endl;
+        release_inputs();
+        if (C) mkl_sparse_destroy(C);
+        return status != SPARSE_STATUS_SUCCESS ? (int) status : -1;
+    };
+
+    sparse_status_t status;
+    if (type == 1) {
+        status = mkl_sparse_d_create_csr(
+            &R_csr, SPARSE_INDEX_BASE_ZERO, M, K, Ri, Ri + 1, Rj,
+            (double *) Rv
+        );
+        if (status != SPARSE_STATUS_SUCCESS) return fail("create R", status);
+        status = mkl_sparse_d_create_csr(
+            &S_csr, SPARSE_INDEX_BASE_ZERO, N, K, Si, Si + 1, Sj,
+            (double *) Sv
+        );
+    } else {
+        status = mkl_sparse_s_create_csr(
+            &R_csr, SPARSE_INDEX_BASE_ZERO, M, K, Ri, Ri + 1, Rj, (float *) Rv
+        );
+        if (status != SPARSE_STATUS_SUCCESS) return fail("create R", status);
+        status = mkl_sparse_s_create_csr(
+            &S_csr, SPARSE_INDEX_BASE_ZERO, N, K, Si, Si + 1, Sj, (float *) Sv
+        );
+    }
+    if (status != SPARSE_STATUS_SUCCESS) return fail("create S", status);
+
+    const auto total_start = std::chrono::high_resolution_clock::now();
+    status =
+        mkl_sparse_convert_csr(S_csr, SPARSE_OPERATION_TRANSPOSE, &S_T_csr);
+    auto end = std::chrono::high_resolution_clock::now();
+    print_time("[mkl-csr-transpose]", end - total_start);
+    if (status != SPARSE_STATUS_SUCCESS) return fail("transpose S", status);
+
+    const auto start = std::chrono::high_resolution_clock::now();
+    matrix_descr general;
+    general.type = SPARSE_MATRIX_TYPE_GENERAL;
+    status = mkl_sparse_sp2m(
+        SPARSE_OPERATION_NON_TRANSPOSE, general, R_csr,
+        SPARSE_OPERATION_NON_TRANSPOSE, general, S_T_csr,
+        SPARSE_STAGE_FULL_MULT, &C
+    );
+    end = std::chrono::high_resolution_clock::now();
+    print_time("[mkl-sparse-mm-time]", end - start);
+    print_time("[mkl-total-sparse-mm]", end - total_start);
+    if (status != SPARSE_STATUS_SUCCESS) return fail("sp2m", status);
+
+    sparse_index_base_t base;
+    MKL_INT rows = 0, columns = 0;
+    MKL_INT *starts = nullptr, *ends = nullptr, *col_indx = nullptr;
+    if (type == 1) {
+        double *values = nullptr;
+        status = mkl_sparse_d_export_csr(
+            C, &base, &rows, &columns, &starts, &ends, &col_indx, &values
+        );
+        *vals = values;
+    } else {
+        float *values = nullptr;
+        status = mkl_sparse_s_export_csr(
+            C, &base, &rows, &columns, &starts, &ends, &col_indx, &values
+        );
+        *vals = values;
+    }
+    if (status != SPARSE_STATUS_SUCCESS) return fail("export C", status);
+    if (base != SPARSE_INDEX_BASE_ZERO || rows != M || columns != N) {
+        std::cerr << "MKL sp2m result is " << rows << " x " << columns
+                  << " (base " << (int) base << "), expected " << M << " x "
+                  << N << std::endl;
+        return fail("check C", SPARSE_STATUS_SUCCESS);
+    }
+
+    const auto release_begin = std::chrono::high_resolution_clock::now();
+    release_inputs();
+    print_time(
+        "[mkl-sparse-deallocate]",
+        std::chrono::high_resolution_clock::now() - release_begin
+    );
+    *handle = C;
+    *rows_start = starts;
+    *rows_end = ends;
+    *cols = col_indx;
+    print_time(
+        "[mkl-baseline-total]",
+        std::chrono::high_resolution_clock::now() - e2e_start
+    );
+    return 0;
+}
+
+extern "C" void run_baseline_sparse_output_free(void *handle) {
+    if (handle) mkl_sparse_destroy((sparse_matrix_t) handle);
+}

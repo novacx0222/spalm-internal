@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "cpu/ss_sparse_output.h"
 #include "csr_preparation.h"
 #include "slice_decision.h"
 #include "util.h"
@@ -337,17 +338,58 @@ void spgemm_rows_dense_result_vanilla(
     }
 }
 
+// Sparse output of the full SS path: the same kernel calls, per result
+// row, into a row buffer instead of the dense result (ss_sparse_output.h).
+template <typename T>
+static void spgemm_rows_sparse_result_vanilla(
+    const int N, ss_matrix<T> &R_ssm, int *s_col_idxs, int *s_agg_idxs,
+    T *s_vals, int threads, bool contiguous, const int *block_starts,
+    const int blocks, const cpu_execution_options &options,
+    spalm_sparse_result &result
+) {
+    csr<T> &R_csr = R_ssm.csr_mat;
+    auto output = std::make_shared<ss_sparse_output<T>>(
+        static_cast<size_t>(std::max(0LL, options.ss_output_page_entries))
+    );
+    ss_sparse_product(
+        *output, threads, R_csr.rows, N, R_csr.cols, R_csr.row_ptrs,
+        R_csr.col_idxs, s_agg_idxs, s_col_idxs, block_starts, blocks,
+        [&](int p0, int p1, const int *first, const int *last, T *acc) {
+            csr_csr_matmul_rows(
+                p0, p1, R_csr.col_idxs, R_csr.vals, s_agg_idxs, first, last,
+                s_vals, acc, contiguous
+            );
+        }
+    );
+    const auto finish_begin = std::chrono::high_resolution_clock::now();
+    output->finish(result);
+    print_time(
+        "[ss-sparse-output-finish]",
+        std::chrono::high_resolution_clock::now() - finish_begin
+    );
+    std::cout << "[ss-sparse-output] entries=" << result.entries
+              << " blocks=" << result.blocks.size()
+              << " pages=" << output->pages()
+              << " page_bytes=" << output->page_bytes()
+              << " scanned_rows=" << output->scanned_rows()
+              << " listed_rows=" << output->listed_rows() << std::endl;
+    result.storage = output;
+}
+
 template <typename T>
 void sparse_sparse_matmul(
     ss_matrix<T> &R_ssm, ss_matrix<T> &S_ssm, T *ret, bool sparse_output,
     const int threads, const bool all_sparse,
-    const cpu_execution_options &options
+    const cpu_execution_options &options, spalm_sparse_result *sparse_out
 ) {
     std::chrono::time_point<std::chrono::high_resolution_clock> start, end,
         sparse_matmul_start;
     sparse_matmul_start = std::chrono::high_resolution_clock::now();
     const int M = R_ssm.csr_mat.rows;
     const int N = S_ssm.csr_mat.rows;
+    if (sparse_out && !all_sparse) {
+        throw std::logic_error("SS sparse output needs every pair on SS");
+    }
 
     if (all_sparse) {
         auto transposed = transpose_all_sparse(S_ssm, threads);
@@ -376,11 +418,20 @@ void sparse_sparse_matmul(
                   << std::endl;
         print_time("[sparse-sparse-column-blocks-prepare]", end - start);
         start = std::chrono::high_resolution_clock::now();
-        spgemm_rows_dense_result_vanilla(
-            N, R_ssm, transposed.offsets.get(), transposed.row_idxs.get(),
-            transposed.values.get(), ret, threads, options.ss_contiguous,
-            blocks > 1 ? block_starts.data() : nullptr, blocks
-        );
+        if (sparse_out) {
+            spgemm_rows_sparse_result_vanilla(
+                N, R_ssm, transposed.offsets.get(), transposed.row_idxs.get(),
+                transposed.values.get(), threads, options.ss_contiguous,
+                blocks > 1 ? block_starts.data() : nullptr, blocks, options,
+                *sparse_out
+            );
+        } else {
+            spgemm_rows_dense_result_vanilla(
+                N, R_ssm, transposed.offsets.get(), transposed.row_idxs.get(),
+                transposed.values.get(), ret, threads, options.ss_contiguous,
+                blocks > 1 ? block_starts.data() : nullptr, blocks
+            );
+        }
         end = std::chrono::high_resolution_clock::now();
         print_time("[sparse-sparse-sparse-mm-time]", end - start);
         print_time(
@@ -444,11 +495,11 @@ void sparse_sparse_matmul(
 template void sparse_sparse_matmul<float>(
     ss_matrix<float> &R_ssm, ss_matrix<float> &S_ssm, float *ret,
     bool sparse_output, const int threads, const bool all_sparse,
-    const cpu_execution_options &options
+    const cpu_execution_options &options, spalm_sparse_result *sparse_out
 );
 
 template void sparse_sparse_matmul<double>(
     ss_matrix<double> &R_ssm, ss_matrix<double> &S_ssm, double *ret,
     bool sparse_output, const int threads, const bool all_sparse,
-    const cpu_execution_options &options
+    const cpu_execution_options &options, spalm_sparse_result *sparse_out
 );

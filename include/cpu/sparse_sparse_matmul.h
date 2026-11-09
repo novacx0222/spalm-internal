@@ -46,11 +46,16 @@ void spgemm_rows_dense_result_vanilla(
     const int *block_starts = nullptr, const int blocks = 1
 );
 
+struct spalm_sparse_result;
+
+// sparse_out (all_sparse only): the result goes there as row blocks
+// (spalm_sparse()), and ret is not used.
 template <typename T>
 void sparse_sparse_matmul(
     ss_matrix<T> &R_ssm, ss_matrix<T> &S_ssm, T *ret, bool sparse_output,
     const int threads, const bool all_sparse = false,
-    const cpu_execution_options &options = cpu_execution_options()
+    const cpu_execution_options &options = cpu_execution_options(),
+    spalm_sparse_result *sparse_out = nullptr
 );
 
 #endif
