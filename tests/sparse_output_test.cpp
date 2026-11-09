@@ -352,6 +352,53 @@ void check_pages() {
     ++cases;
 }
 
+// Default pages: one row of kHugePage - kFirstPage + 3 nonzeros fills the
+// pages below kHugePage entries (64 Ki doubling to 1 Mi) and starts one of
+// kHugePage. The blocks hold the row once, in order. On Linux, only that
+// last page is on huge pages, its arrays starting on 2 MiB boundaries.
+void check_huge_pages() {
+    using rows_t = ss_row_output<double>;
+    const size_t big = rows_t::kHugePage;
+    const int N = static_cast<int>(big - rows_t::kFirstPage + 3);
+    ss_sparse_output<double> out;
+    out.start(1, N);
+    auto &rows = out.local(0);
+    double *acc = rows.row_buffer();
+    for (int j = 0; j < N; ++j) acc[j] = j + 1;
+    rows.begin_block(0);
+    ss_emit_range(rows, acc, 0, N);
+    rows.end_row();
+    rows.end_block();
+    spalm_sparse_result result;
+    out.finish(result);
+    bool ok = out.pages() == 6 && result.blocks.size() == 6 &&
+              result.entries == N &&
+              out.page_bytes() == (2 * big - rows_t::kFirstPage) * 12;
+    int next = 0;
+    for (const auto &b : result.blocks) {
+        const auto *vals = static_cast<const double *>(b.vals);
+        for (int r = 0; ok && r < b.rows; ++r)
+            for (int p = b.starts[r]; ok && p < b.ends[r]; ++p, ++next)
+                ok = b.row_begin + r == 0 && b.cols[p] == next &&
+                     vals[p] == next + 1;
+    }
+    ok = ok && next == N;
+#if defined(__linux__)
+    auto aligned = [](const void *p) {
+        return reinterpret_cast<uintptr_t>(p) % spalm_huge::kHugeBytes == 0;
+    };
+    ok = ok && out.huge_page_bytes() == big * 12 &&
+         aligned(result.blocks[5].cols) && aligned(result.blocks[5].vals);
+#else
+    ok = ok && out.huge_page_bytes() == 0;
+#endif
+    if (!ok)
+        std::printf("FAIL huge pages: %zu blocks, %zu huge bytes\n",
+                    result.blocks.size(), out.huge_page_bytes());
+    failures += !ok;
+    ++cases;
+}
+
 // Part 2: the C API through spalm.cpp.
 template <typename T> int type_of() { return sizeof(T) == 4 ? 0 : 1; }
 
@@ -723,9 +770,11 @@ int main() {
     check_emit_semantics<double>();
     check_emit_semantics<float>();
     check_pages();
+    check_huge_pages();
     check_api_rejects_and_exits();
     std::printf("%s: %d sparse output cases (row loop x threads x pages x "
-                "column blocks, emit semantics, page splits, C API for SS and "
+                "column blocks, emit semantics, page splits, default page "
+                "growth, C API for SS and "
                 "MKL sp2m vs the dense result, rejected methods, zero-work "
                 "exits), %d failed\n",
                 failures ? "FAIL" : "PASS", cases, failures);

@@ -1,5 +1,5 @@
 # MKL is needed to build the libraries, not to run the portable tests.
-TEST_GOALS := test test-dispatch test-preparation test-sparse-output test-thresholds test-kernels-native
+TEST_GOALS := test test-dispatch test-preparation test-sparse-output test-huge-pages test-thresholds test-kernels-native
 ifneq ($(filter-out $(TEST_GOALS),$(or $(MAKECMDGOALS),default)),)
 ifndef ONEAPI_ROOT
 $(error ONEAPI_ROOT is not set. Please 'source set_intel_vars.sh'.)
@@ -62,20 +62,21 @@ clean:
 $(SPALM_OBJS): include/util.h include/slice_decision.h
 $(BIN_DIR)/spalm.o: include/method_dispatch.h include/csr_preparation.h \
 	include/cpu/execution_options.h include/cpu/dense_dense_matmul.h \
-	include/cpu/sparse_sparse_matmul.h include/spalm_sparse_result.h
+	include/cpu/sparse_sparse_matmul.h include/spalm_sparse_result.h \
+	include/huge_pages.h
 $(BIN_DIR)/sparse_sparse_matmul.o: include/csr_preparation.h \
 	include/cpu/sparse_sparse_matmul.h include/cpu/ss_sparse_output.h \
-	include/spalm_sparse_result.h
+	include/spalm_sparse_result.h include/huge_pages.h
 $(BIN_DIR)/dense_dense_matmul.o: include/cpu/dense_dense_matmul.h include/cpu/kernel.h
-$(BIN_DIR)/run_baseline.so: include/util.h
+$(BIN_DIR)/run_baseline.so: include/util.h include/huge_pages.h
 
 # Portable tests: no AVX-512, MKL or built libraries; run from the repo root.
 # Needs a compiler with OpenMP, e.g. on macOS: make test CXX=g++-16
 TEST_CXXFLAGS ?= -std=c++20 -O1 -g -fopenmp -fsanitize=address,undefined -fno-omit-frame-pointer
 TEST_BIN_DIR ?= /tmp/spalm-tests
 PYTHON ?= python3
-.PHONY: test test-dispatch test-preparation test-sparse-output test-thresholds
-test: test-dispatch test-preparation test-sparse-output test-thresholds
+.PHONY: test test-dispatch test-preparation test-sparse-output test-huge-pages test-thresholds
+test: test-dispatch test-preparation test-sparse-output test-huge-pages test-thresholds
 
 # Forced methods, backend selection and timing output.
 test-dispatch:
@@ -116,6 +117,13 @@ test-sparse-output:
 	$(CXX) $(CPPFLAGS) $(TEST_CXXFLAGS) -Itests/stubs -Iinclude tests/sparse_output_test.cpp src/slice_decision.cpp $(LDFLAGS) -o $(TEST_BIN_DIR)/sparse_output_test
 	$(TEST_BIN_DIR)/sparse_output_test
 	OMP_THREAD_LIMIT=2 $(TEST_BIN_DIR)/sparse_output_test
+
+# Huge-page allocations (huge_pages.h): owned arrays and MKL's allocator.
+# On Linux also checks that large blocks are 2 MiB aligned and THP eligible.
+test-huge-pages:
+	mkdir -p $(TEST_BIN_DIR)
+	$(CXX) $(CPPFLAGS) $(TEST_CXXFLAGS) -Iinclude tests/huge_pages_test.cpp $(LDFLAGS) -o $(TEST_BIN_DIR)/huge_pages_test
+	$(TEST_BIN_DIR)/huge_pages_test
 
 # Timing-label parser of find_thresholds.py (standard library only).
 test-thresholds:

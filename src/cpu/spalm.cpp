@@ -15,6 +15,7 @@
 #include "cpu/dense_dense_matmul.h"
 #include "cpu/execution_options.h"
 #include "csr_preparation.h"
+#include "huge_pages.h"
 #include "method_dispatch.h"
 #include "mkl.h"
 #include "slice_decision.h"
@@ -134,8 +135,10 @@ int run_mkl_backend(
         // 1.85 s for two 16000 x 16000 doubles). Allocate them uninitialized;
         // the fill loop zeroes each row (implicit zeros) before scattering
         // its entries, so the first touch is spread over the threads too.
-        auto R = std::make_unique_for_overwrite<T[]>(checked_matrix_size(M, K));
-        auto S = std::make_unique_for_overwrite<T[]>(checked_matrix_size(N, K));
+        // On huge pages (huge_pages.h): on 4 KiB pages, filling and freeing
+        // them took ~31 and ~33 ms per GB (m1 SuiteSparse run).
+        auto R = spalm_huge::make_for_overwrite<T>(checked_matrix_size(M, K));
+        auto S = spalm_huge::make_for_overwrite<T>(checked_matrix_size(N, K));
         auto end = std::chrono::high_resolution_clock::now();
         print_time("[mkl-dense-input-allocate]", end - start);
         start = end;

@@ -3,8 +3,32 @@
 #include <vector>
 #include "path_utils.h"
 
+#include <i_malloc.h>
+#include "huge_pages.h"
 #include "mkl.h"
 #include "util.h"
+
+// MKL allocates only through the function pointers of i_malloc.h, and
+// nothing before its first call. They are pointed at the huge-page
+// allocator when this library is loaded, before it calls MKL: blocks of
+// 2 MiB and more go on huge pages, smaller ones to the C library as
+// before. Above all sp2m's result: on 4 KiB pages, freeing it took ~50 ms
+// per GB. The pointers are process-wide, so this covers every MKL method,
+// whichever library calls it.
+__attribute__((constructor)) static void mkl_use_huge_pages() {
+    i_malloc = spalm_huge::huge_malloc;
+    i_calloc = spalm_huge::huge_calloc;
+    i_realloc = spalm_huge::huge_realloc;
+    i_free = spalm_huge::huge_free;
+}
+
+// Huge blocks MKL got so far in this process (not an "<n> ms" stage line).
+static void print_mkl_huge_pages() {
+    std::cout << "[mkl-huge-pages] installed="
+              << (i_malloc == spalm_huge::huge_malloc ? 1 : 0)
+              << " blocks=" << spalm_huge::allocated_blocks()
+              << " bytes=" << spalm_huge::allocated_bytes() << std::endl;
+}
 
 // Writes C = R * S^T into ret, overwriting it: the GEMM and sparse x dense
 // calls use beta = 0 and mkl_sparse_?_spmmd computes C := A * B, so ret
@@ -295,6 +319,7 @@ extern "C" void run_baseline(
 
     end = std::chrono::high_resolution_clock::now();
     print_time("[mkl-baseline-total]", end - e2e_start);
+    print_mkl_huge_pages();
 }
 
 // C = R * S^T as a sparse matrix (MKL sparse-sparse with sparse output):
@@ -413,6 +438,7 @@ extern "C" int run_baseline_sparse_output(
         "[mkl-baseline-total]",
         std::chrono::high_resolution_clock::now() - e2e_start
     );
+    print_mkl_huge_pages();
     return 0;
 }
 

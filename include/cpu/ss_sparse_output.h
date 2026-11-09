@@ -7,7 +7,8 @@
 // zeroes the buffer again. Rows go in tasks of 4 consecutive rows,
 // dynamically scheduled like the dense loop's schedule(dynamic, 4); a
 // task's rows form one block, split where a page fills up. No M x N result
-// is allocated.
+// is allocated. Pages of kHugePage entries and more are on huge pages
+// (huge_pages.h), smaller ones come from malloc.
 //
 // Portable: the SIMD multiply is passed in (ss_sparse_product), so the
 // tests run the same loop with a scalar one.
@@ -27,6 +28,7 @@
 #include <immintrin.h>
 #endif
 
+#include "huge_pages.h"
 #include "spalm_sparse_result.h"
 
 // Rows per task: the dense result loop's schedule(dynamic, 4).
@@ -73,13 +75,22 @@ public:
     // listed columns.
     long long scanned_rows = 0, listed_rows = 0;
 
-private:
-    friend class ss_sparse_output<T>;
+    // Default pages: kFirstPage entries, doubling up to kMaxPage.
     static constexpr size_t kFirstPage = size_t(1) << 16;
     static constexpr size_t kMaxPage = size_t(1) << 22;
+    // Pages of at least this many entries (8 and 16 MiB of columns and
+    // doubles) are on huge pages: on 4 KiB pages, freeing them took ~50 ms
+    // per GB. Smaller pages come from malloc, which in queries with up to
+    // some 20M result entries reuses memory the query already freed; on
+    // fresh huge mappings these were slower (x1.15 for 3-20M entries, v23
+    // SuiteSparse set on the 8488C).
+    static constexpr size_t kHugePage = size_t(1) << 21;
+
+private:
+    friend class ss_sparse_output<T>;
     struct page {
-        std::unique_ptr<int[]> cols;
-        std::unique_ptr<T[]> vals;
+        spalm_huge::array<int> cols;
+        spalm_huge::array<T> vals;
         size_t capacity;
     };
     struct pending {
@@ -120,9 +131,10 @@ private:
             : pages_.empty()
                 ? kFirstPage
                 : std::min(kMaxPage, pages_.back().capacity * 2);
+        const bool huge = cap >= kHugePage;
         page p{
-            std::make_unique_for_overwrite<int[]>(cap),
-            std::make_unique_for_overwrite<T[]>(cap), cap
+            spalm_huge::make_for_overwrite<int>(cap, huge),
+            spalm_huge::make_for_overwrite<T>(cap, huge), cap
         };
         cols_ = p.cols.get();
         vals_ = p.vals.get();
@@ -205,6 +217,16 @@ public:
         for (const auto &t : threads_)
             for (const auto &p : t.pages_)
                 n += p.capacity * (sizeof(int) + sizeof(T));
+        return n;
+    }
+    // The part of page_bytes() on huge pages.
+    size_t huge_page_bytes() const {
+        size_t n = 0;
+        for (const auto &t : threads_)
+            for (const auto &p : t.pages_)
+                n += p.capacity *
+                     (spalm_huge::is_mapped(p.cols) * sizeof(int) +
+                      spalm_huge::is_mapped(p.vals) * sizeof(T));
         return n;
     }
 

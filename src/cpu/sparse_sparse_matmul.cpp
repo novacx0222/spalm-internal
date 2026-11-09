@@ -372,7 +372,8 @@ static void spgemm_rows_sparse_result_vanilla(
               << " pages=" << output->pages()
               << " page_bytes=" << output->page_bytes()
               << " scanned_rows=" << output->scanned_rows()
-              << " listed_rows=" << output->listed_rows() << std::endl;
+              << " listed_rows=" << output->listed_rows()
+              << " huge_page_bytes=" << output->huge_page_bytes() << std::endl;
     result.storage = output;
 }
 
