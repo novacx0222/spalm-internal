@@ -374,26 +374,50 @@ struct dense_result_request {
 // whole-call rules. Three decision tables: "table" as loaded (the rules have
 // not changed it yet), "all_ss" (every slice pair SS) and "all_dense" (what
 // set_to_all_dense() makes of it). For each, "bucket" is mm_check() itself,
-// so "table bucket" repeats the MM cost lines, and "nnz" counts each
-// bucket's stored entries. The global table is restored before returning.
+// so "table bucket" repeats the MM cost lines, "nnz" counts each bucket's
+// stored entries, and [candidate-pairs] gives the slice pairs per kernel and
+// what the dense path would pack. The global table is restored before
+// returning.
 template <typename T>
 static void log_candidate_work(
-    const int *Ri, const int *Rj, const int M, const int *Si, const int *Sj,
-    const int N, const int K, ss_matrix<T> &R_ssm, ss_matrix<T> &S_ssm,
-    const int threads
+    const int *Ri, const int *Rj, const int M, const int N, const int K,
+    ss_matrix<T> &R_ssm, ss_matrix<T> &S_ssm, const int tile_size_l2,
+    const int tile_size_l3, const int threads,
+    const cpu_execution_options &options
 ) {
     const auto begin = std::chrono::high_resolution_clock::now();
     const auto f =
-        candidate_work::count_features(Ri, Rj, M, Si, Sj, N, K, threads);
+        candidate_work::count_features(Ri, Rj, M, S_ssm, N, K, threads);
     unsigned long long r_slices, s_slices, pairs;
     candidate_work::slice_counts(R_ssm, S_ssm, r_slices, s_slices, pairs);
     std::cout << "[candidate-features] M=" << M << " N=" << N << " K=" << K
               << " sl=" << R_ssm.sl << " mr=" << R_ssm.sh
               << " nr=" << S_ssm.sh << " nnz_r=" << Ri[M]
-              << " nnz_s=" << Si[N] << " flops=" << f.flops
+              << " nnz_s=" << S_ssm.csr_mat.row_ptrs[N] << " flops=" << f.flops
               << " row_bound=" << f.row_bound << " r_slices=" << r_slices
               << " s_slices=" << s_slices << " slice_pairs=" << pairs
               << std::endl;
+    auto round = [](double x) { return (unsigned long long) std::llround(x); };
+    // The result entries with the large budget (the reference) and the
+    // small one (what a decision could afford), each timed.
+    for (const auto &[budget, timer] :
+         {std::pair{candidate_work::kEntriesBudget, "[candidate-entries-time]"},
+          std::pair{
+              candidate_work::kEntriesSmallBudget,
+              "[candidate-entries-small-time]"
+          }}) {
+        const auto entries_begin = std::chrono::high_resolution_clock::now();
+        const auto e = candidate_work::estimate_entries(
+            Ri, Rj, M, S_ssm, N, K, f, threads, budget
+        );
+        const auto entries_end = std::chrono::high_resolution_clock::now();
+        std::cout << "[candidate-entries] budget=" << budget
+                  << " estimate=" << round(e.entries) << " exact=" << e.exact
+                  << " draws=" << e.draws << " rows=" << e.rows
+                  << " long_rows=" << e.long_rows << " visits=" << e.visits
+                  << std::endl;
+        print_time(timer, entries_end - entries_begin);
+    }
     const int nb = num_buckets;
     const std::vector<uint8_t> table(ss_upper.get(), ss_upper.get() + nb + 1);
     const std::vector<uint8_t> all_ss(nb + 1, (uint8_t) (nb + 1));
@@ -401,7 +425,11 @@ static void log_candidate_work(
     const std::pair<const char *, const std::vector<uint8_t> *> tables[] = {
         {"table", &table}, {"all_ss", &all_ss}, {"all_dense", &all_dense}
     };
-    for (const auto &[name, up] : tables) {
+    const auto plans = candidate_work::plan_counts(
+        R_ssm, S_ssm, {table.data(), all_ss.data(), all_dense.data()}, threads
+    );
+    for (int t = 0; t < 3; ++t) {
+        const auto &[name, up] = tables[t];
         std::copy(up->begin(), up->end(), ss_upper.get());
         unsigned long long c[4] = {};
         for (int col = 0; col < R_ssm.s_csc_mat.cols; ++col) {
@@ -412,16 +440,36 @@ static void log_candidate_work(
             c[2] += ds;
             c[3] += dd;
         }
-        const auto w = candidate_work::nnz_work(R_ssm, S_ssm, up->data());
-        auto round = [](double x) { return (unsigned long long) std::llround(x); };
+        const auto &w = plans[t].nnz;
+        const auto &p = plans[t].p;
+        const auto pack = candidate_work::packing_for(
+            up->data(), options.selective_packing, options.ds_aligned_panels,
+            R_ssm.sh
+        );
         std::cout << "[candidate-work] " << name << " bucket ss=" << c[0]
                   << " sd=" << c[1] << " ds=" << c[2] << " dd=" << c[3]
                   << std::endl;
         std::cout << "[candidate-work] " << name << " nnz ss=" << round(w.ss)
                   << " sd=" << round(w.sd) << " ds=" << round(w.ds)
                   << " dd=" << round(w.dd) << std::endl;
+        std::cout << "[candidate-pairs] " << name << " ss=" << p.ss
+                  << " sd=" << p.sd << " ds=" << p.ds << " dd=" << p.dd
+                  << " pack_r=" << pack.pack_r << " pack_s=" << pack.pack_s
+                  << " bitmaps=" << pack.bitmaps
+                  << " r_stride=" << pack.r_stride
+                  << " fixed_alg=" << pack.fixed_alg << std::endl;
     }
     std::copy(table.begin(), table.end(), ss_upper.get());
+    const auto d = candidate_work::dense_schedule_counts(
+        R_ssm, S_ssm, tile_size_l2, tile_size_l3, threads
+    );
+    std::cout << "[candidate-dense-schedule] tile_size_l2=" << tile_size_l2
+              << " tile_size_l3=" << tile_size_l3 << " threads=" << threads
+              << " value_bytes=" << sizeof(T) << " r_packs=" << d.r_packs
+              << " r_pack_entries=" << d.r_pack_entries
+              << " s_packs=" << d.s_packs
+              << " s_pack_entries=" << d.s_pack_entries
+              << " tasks=" << d.tasks << std::endl;
     print_time(
         "[candidate-work-time]",
         std::chrono::high_resolution_clock::now() - begin
@@ -697,7 +745,10 @@ int spalm_matmul(
     std::cout << "DENSE-DENSE MM cost: " << dense_dense_mm_cost << std::endl;
     print_time("[mm-select-total]", end - total_start);
     if (options.log_candidate_work) {
-        log_candidate_work(Ri, Rj, M, Si, Sj, N, K, R_ssm, S_ssm, threads);
+        log_candidate_work(
+            Ri, Rj, M, N, K, R_ssm, S_ssm, tile_size_l2, tile_size_l3, threads,
+            options
+        );
     }
 
     if (total_dense_mm_cost) {

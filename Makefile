@@ -79,15 +79,18 @@ PYTHON ?= python3
 .PHONY: test test-dispatch test-preparation test-sparse-output test-huge-pages test-thresholds test-slice-length
 test: test-dispatch test-preparation test-sparse-output test-huge-pages test-thresholds test-slice-length
 
-# Forced methods, backend selection and timing output.
+# Forced methods, backend selection and timing output; the
+# log_candidate_work counts (candidate_work.h) against brute force.
 test-dispatch:
 	mkdir -p $(TEST_BIN_DIR)
 	$(CXX) $(CPPFLAGS) $(TEST_CXXFLAGS) -Iinclude tests/timing_dispatch_test.cpp $(LDFLAGS) -o $(TEST_BIN_DIR)/timing_dispatch_test
 	$(CXX) $(CPPFLAGS) $(TEST_CXXFLAGS) -Iinclude tests/slice_timing_test.cpp src/slice_decision.cpp $(LDFLAGS) -o $(TEST_BIN_DIR)/slice_timing_test
 	$(CXX) $(CPPFLAGS) $(TEST_CXXFLAGS) -Itests/stubs -Iinclude tests/dispatch_test.cpp src/slice_decision.cpp $(LDFLAGS) -o $(TEST_BIN_DIR)/dispatch_test
+	$(CXX) $(CPPFLAGS) $(TEST_CXXFLAGS) -Iinclude tests/candidate_work_test.cpp src/slice_decision.cpp $(LDFLAGS) -o $(TEST_BIN_DIR)/candidate_work_test
 	$(TEST_BIN_DIR)/timing_dispatch_test
 	$(TEST_BIN_DIR)/slice_timing_test
 	$(TEST_BIN_DIR)/dispatch_test
+	$(TEST_BIN_DIR)/candidate_work_test
 
 # Actual AVX-512 kernels of bin/spalm.so (build-libs first) against a scalar
 # reference, for every forced SPALM method and execution switch. x86 only.

@@ -788,6 +788,39 @@ template <class T> void check_candidate_work() {
     };
     for (const char *l : lines) assert(count(log, l) == 1);
     assert(count(log, "[candidate-work] ") == 6);
+    // Both budgets count exactly: every row has all 32 columns after its
+    // first key's 32 S rows.
+    for (const char *budget : {"134217728", "1048576"}) {
+        assert(count(log, std::string("[candidate-entries] budget=") + budget +
+                              " estimate=768 exact=1 draws=24 rows=24 "
+                              "long_rows=0 visits=768\n") == 1);
+    }
+    assert(count(log, "[candidate-entries] ") == 2);
+    assert(count(log, "[candidate-entries-small-time] ") == 1);
+    // Double: R slice 0 (bucket 0) x 2 S slices on SS, R slice 1 x 2 on DD.
+    const std::string half = fl ? "1" : "2", all = fl ? "2" : "4";
+    const std::string pairs[] = {
+        "[candidate-pairs] table ss=" + half + " sd=0 ds=0 dd=" + half +
+            " pack_r=1 pack_s=1 bitmaps=1 r_stride=12 fixed_alg=-1\n",
+        "[candidate-pairs] all_ss ss=" + all +
+            " sd=0 ds=0 dd=0 pack_r=0 pack_s=0 bitmaps=0 r_stride=12 "
+            "fixed_alg=0\n",
+        "[candidate-pairs] all_dense ss=0 sd=0 ds=0 dd=" + all +
+            " pack_r=1 pack_s=1 bitmaps=1 r_stride=12 fixed_alg=3\n",
+    };
+    for (const std::string &l : pairs) assert(count(log, l) == 1);
+    assert(count(log, "[candidate-pairs] ") == 3);
+    // One slice column, 2 threads: both R slices in one block of 2 R tasks
+    // (one slice each), and every S tile packed once per R task.
+    const std::string schedule =
+        std::string("[candidate-dense-schedule] tile_size_l2=128 "
+                    "tile_size_l3=") +
+        (fl ? "4608" : "2304") +
+        " threads=2 value_bytes=" + (fl ? "4" : "8") +
+        " r_packs=2 r_pack_entries=3084 s_packs=" + all +
+        " s_pack_entries=16384 tasks=2\n";
+    assert(count(log, schedule) == 1);
+    assert(count(log, "[candidate-entries-time] ") == 1);
     // "table bucket" repeats the cost lines.
     assert(count(log, "\nSPARSE MM cost: 32\n") == 1);
     assert(count(log, "\nDENSE-DENSE MM cost: 98304\n") == 1);
