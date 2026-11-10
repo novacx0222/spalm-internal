@@ -23,6 +23,9 @@ void sparse_sparse_matmul(
 );
 
 static int backend_calls;
+// Calls of the SS kernel with sparse output (its row blocks are tested in
+// tests/native_kernel_test.cpp and sparse_output_test.cpp).
+static int sparse_out_calls;
 static void scalar_baseline(
     int, const char *, int *, int *, void *, void *, int *, int *, void *,
     void *, void *, int, int, int, int
@@ -68,7 +71,10 @@ void sparse_sparse_matmul(
     ss_matrix<T> &r, ss_matrix<T> &s, T *output, bool, int, bool,
     const cpu_execution_options &, spalm_sparse_result *sparse_out
 ) {
-    assert(!sparse_out);
+    if (sparse_out) {
+        ++sparse_out_calls;
+        return;
+    }
     scalar_csr(
         r.csr_mat.row_ptrs, r.csr_mat.col_idxs, r.csr_mat.vals,
         s.csr_mat.row_ptrs, s.csr_mat.col_idxs, s.csr_mat.vals, output,
@@ -504,13 +510,218 @@ template <class T> void check_tunables() {
     assert(status == SPALM_CONFIG_ERROR && backend_calls == 0);
 }
 
+// The caller's dense result for spalm_sparse_or_dense(), filled with `fill`
+// when requested; null when `fail` is set.
+template <class T> struct dense_buffer {
+    std::vector<T> data;
+    T fill = T(0);
+    bool fail = false;
+    int calls = 0;
+    static void *provide(void *p) {
+        auto *b = static_cast<dense_buffer *>(p);
+        ++b->calls;
+        if (b->fail) return nullptr;
+        std::fill(b->data.begin(), b->data.end(), b->fill);
+        return b->data.data();
+    }
+};
+
+// spalm_sparse_or_dense() on the run_mixed() inputs: row blocks (no request)
+// exactly when the call stays on SS; otherwise one request after the
+// decision, the product in that buffer and no handle.
+template <class T> void check_sparse_or_dense() {
+    constexpr int type = sizeof(T) == sizeof(float) ? 0 : 1;
+    const int M = 24, K = 16, N = 32;
+    std::vector<int> ri{0}, rj, si{0}, sj;
+    std::vector<T> rv, sv;
+    for (int r = 0; r < M; ++r) {
+        for (int k = 0; k < K; ++k) {
+            if (r < 12 && !(r == 0 && k == 0)) continue;
+            rj.push_back(k);
+            rv.push_back(T(1));
+        }
+        ri.push_back(int(rj.size()));
+    }
+    for (int s = 0; s < N; ++s) {
+        for (int k = 0; k < K; ++k) {
+            sj.push_back(k);
+            sv.push_back(T(1));
+        }
+        si.push_back(int(sj.size()));
+    }
+    // Row 0: one key; rows 12-23: all 16; S is full.
+    std::vector<T> expected(size_t(M) * N, T(0));
+    for (int s = 0; s < N; ++s) expected[s] = T(1);
+    for (int r = 12; r < M; ++r)
+        for (int s = 0; s < N; ++s) expected[size_t(r) * N + s] = T(K);
+    const std::string table = write_thresholds_file();
+    auto run = [&](const conf &c, dense_buffer<T> &buf, void **handle,
+                   int k = 16) {
+        std::vector<const char *> keys{"threads", "slice_length"},
+            vals{"2", "16"};
+        for (const auto &[key, v] : c) {
+            keys.push_back(key);
+            vals.push_back(v);
+        }
+        buf.data.assign(size_t(M) * N, T(-5));
+        backend_calls = 0;
+        sparse_out_calls = 0;
+        int status = -1;
+        const std::string log = capture_stdout([&] {
+            status = spalm_sparse_or_dense(
+                type, ri.data(), rj.data(), rv.data(), si.data(), sj.data(),
+                sv.data(), M, k, N, int(keys.size()), keys.data(),
+                vals.data(), &dense_buffer<T>::provide, &buf, handle
+            );
+        });
+        return std::make_pair(status, log);
+    };
+    const char *t = table.c_str();
+    // Mixed calls: both test doubles add the whole product (the exact
+    // per-pair split is checked natively), so the buffer holds it twice.
+    std::vector<T> twice(expected);
+    for (T &x : twice) x += x;
+    struct choice_case {
+        conf c;
+        bool dense;
+        const char *line;
+        bool mixed = false;
+    } cases[] = {
+        {{{"init_method", "no_fallback"}, {"thresholds_file", t},
+          {"auto_sparse_ratio", "0"}},
+         true, "[result-choice] dense (mixed)", true},
+        {{{"init_method", "no_fallback"}, {"thresholds_file", t},
+          {"dense_mm_threshold", "1000000000000"}},
+         false, "[result-choice] sparse (all SS)"},
+        {{{"init_method", "no_fallback"}, {"thresholds_file", t},
+          {"cost_weight_ss", "0"}},
+         true, "[result-choice] dense (all dense)"},
+        {{{"init_method", ""}, {"thresholds_file", t},
+          {"dense_mm_threshold", "1000000000000"},
+          {"auto_mkl_dense_ratio", "1e9"}},
+         true, "[result-choice] dense (mkl-sparse fallback)"},
+        {{{"init_method", ""}, {"thresholds_file", t},
+          {"auto_mkl_dense_ratio", "0"}},
+         true, "[result-choice] dense (mkl-dense fallback)"},
+        {{{"init_method", "FORCE_MKL_DENSE"}}, true,
+         "[result-choice] dense (forced mkl-dense)"},
+        {{{"init_method", "dense_bm_inner_kernel"}}, true,
+         "[result-choice] dense (all dense)"},
+        {{{"init_method", "sparse"}}, false, "[result-choice] sparse (all SS)"},
+    };
+    for (const auto &c : cases) {
+        dense_buffer<T> buf;
+        void *handle = reinterpret_cast<void *>(1);
+        const auto [status, log] = run(c.c, buf, &handle);
+        if (status != SPALM_OK || count(log, "[result-choice] ") != 1 ||
+            count(log, c.line) != 1) {
+            std::cerr << "want " << c.line << ", status " << status << ":\n"
+                      << log;
+        }
+        assert(status == SPALM_OK);
+        assert(count(log, "[result-choice] ") == 1 && count(log, c.line) == 1);
+        if (c.dense) {
+            assert(buf.calls == 1 && !handle && sparse_out_calls == 0);
+            assert(count(log, "[dense-result-request]") == 1);
+            assert(buf.data == (c.mixed ? twice : expected));
+        } else {
+            assert(buf.calls == 0 && handle && sparse_out_calls == 1);
+            spalm_sparse_result_free(handle);
+        }
+    }
+    // An uninitialized buffer (result_zeroed = 0) is zeroed before the
+    // kernels add to it (mixed: twice the product, see above).
+    {
+        dense_buffer<T> buf;
+        buf.fill = T(777);
+        void *handle = nullptr;
+        const auto [status, log] = run(
+            {{"init_method", "no_fallback"}, {"thresholds_file", t},
+             {"auto_sparse_ratio", "0"}, {"result_zeroed", "0"}},
+            buf, &handle
+        );
+        assert(status == SPALM_OK && buf.calls == 1 && !handle);
+        assert(count(log, "[result-choice] dense (mixed)") == 1);
+        assert(buf.data == twice);
+    }
+    // No buffer from the caller: an internal error, no handle, no kernel.
+    {
+        dense_buffer<T> buf;
+        buf.fail = true;
+        void *handle = reinterpret_cast<void *>(1);
+        const auto [status, log] = run(
+            {{"init_method", "no_fallback"}, {"thresholds_file", t},
+             {"auto_sparse_ratio", "0"}},
+            buf, &handle
+        );
+        assert(status == SPALM_INTERNAL_ERROR && buf.calls == 1 && !handle);
+        assert(backend_calls == 0 && count(log, "[result-choice] ") == 0);
+    }
+    // K = 0: a zero product, no request, a handle without blocks.
+    {
+        dense_buffer<T> buf;
+        void *handle = nullptr;
+        std::vector<int> ri0(M + 1, 0), si0(N + 1, 0);
+        std::vector<const char *> keys{"init_method"}, vals{"no_fallback"};
+        const int status = spalm_sparse_or_dense(
+            type, ri0.data(), rj.data(), rv.data(), si0.data(), sj.data(),
+            sv.data(), M, 0, N, 1, keys.data(), vals.data(),
+            &dense_buffer<T>::provide, &buf, &handle
+        );
+        assert(status == SPALM_OK && buf.calls == 0 && handle);
+        long long blocks = -1;
+        spalm_sparse_result_blocks(handle, &blocks);
+        assert(blocks == 0);
+        spalm_sparse_result_free(handle);
+    }
+    // No callback, or no handle pointer: invalid arguments.
+    {
+        void *handle = reinterpret_cast<void *>(1);
+        const char *keys[] = {"init_method"}, *vals[] = {"no_fallback"};
+        assert(
+            spalm_sparse_or_dense(
+                type, ri.data(), rj.data(), rv.data(), si.data(), sj.data(),
+                sv.data(), M, K, N, 1, keys, vals, nullptr, nullptr, &handle
+            ) == SPALM_INVALID_ARGUMENT &&
+            !handle
+        );
+        dense_buffer<T> buf;
+        assert(
+            spalm_sparse_or_dense(
+                type, ri.data(), rj.data(), rv.data(), si.data(), sj.data(),
+                sv.data(), M, K, N, 1, keys, vals, &dense_buffer<T>::provide,
+                &buf, nullptr
+            ) == SPALM_INVALID_ARGUMENT &&
+            buf.calls == 0
+        );
+    }
+    // spalm_sparse() keeps rejecting the methods without sparse output.
+    {
+        void *handle = reinterpret_cast<void *>(1);
+        const char *keys[] = {"init_method"}, *vals[] = {"no_fallback"};
+        int status = -1;
+        capture_stdout([&] {
+            status = spalm_sparse(
+                type, ri.data(), rj.data(), rv.data(), si.data(), sj.data(),
+                sv.data(), M, K, N, 1, keys, vals, &handle
+            );
+        });
+        assert(status == SPALM_INVALID_ARGUMENT && !handle);
+    }
+    unlink(table.c_str());
+}
+
 int main() {
     check_methods<float>();
     check_methods<double>();
     check_tunables<float>();
     check_tunables<double>();
+    check_sparse_or_dense<float>();
+    check_sparse_or_dense<double>();
     std::cout << "PASS: forced SPALM and MKL methods through the C API, "
                  "backend lines, timing labels and format; tunables: "
                  "defaults, parsing, validation, [conf] lines, thresholds "
-                 "file and their effect on the automatic dispatch\n";
+                 "file and their effect on the automatic dispatch; "
+                 "spalm_sparse_or_dense: result choice, requests, zeroing "
+                 "and failures\n";
 }

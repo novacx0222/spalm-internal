@@ -33,6 +33,10 @@ struct sparse_api {
     spalm_sparse_blocks_fn blocks;
     spalm_sparse_free_fn free;
 };
+using spalm_sparse_or_dense_fn = int (*)(
+    int, int *, int *, void *, int *, int *, void *, int, int, int, int,
+    const char **, const char **, spalm_dense_result_fn, void *, void **
+);
 
 struct csr {
     int rows = 0;
@@ -251,6 +255,128 @@ static int run_sparse_pages(
     return failures;
 }
 
+// The caller's side of spalm_sparse_or_dense(): a dense result handed out
+// on request (filled with `fill`), or null when `fail` is set.
+template <typename T> struct dense_request_ctx {
+    std::vector<T> buf;
+    T fill = T(0);
+    bool fail = false;
+    int calls = 0;
+    static void *provide(void *p) {
+        auto *ctx = static_cast<dense_request_ctx *>(p);
+        ++ctx->calls;
+        if (ctx->fail) return nullptr;
+        std::fill(ctx->buf.begin(), ctx->buf.end(), ctx->fill);
+        return ctx->buf.data();
+    }
+};
+
+// spalm_sparse_or_dense(): the result is either row blocks (callback not
+// called, a handle) or the dense buffer (called once, no handle), and must
+// match the reference bit for bit. expect_dense: 1 / 0 = which one the
+// decision must take, -1 = either. unzeroed: the buffer starts as NaN with
+// result_zeroed = 0. fail: the callback returns null, so a dense decision
+// must fail with status 4 (and leave no handle). With `log`, the
+// library's stdout is kept there.
+template <typename T>
+static bool run_sparse_or_dense_case(
+    spalm_sparse_or_dense_fn run, const sparse_api &api, const char *label,
+    const csr &R, const csr &S, int K,
+    std::vector<std::pair<std::string, std::string>> options, int expect_dense,
+    bool unzeroed = false, bool fail = false, std::string *log = nullptr
+) {
+    constexpr int type = sizeof(T) == sizeof(float) ? 0 : 1;
+    std::vector<T> rv(R.val.begin(), R.val.end()),
+        sv(S.val.begin(), S.val.end());
+    std::vector<int> ri = R.ptr, rj = R.col, si = S.ptr, sj = S.col;
+    rv.reserve(1), sv.reserve(1), rj.reserve(1), sj.reserve(1);
+    if (unzeroed) options.push_back({"result_zeroed", "0"});
+    std::vector<const char *> keys, vals;
+    for (auto &kv : options) {
+        keys.push_back(kv.first.c_str());
+        vals.push_back(kv.second.c_str());
+    }
+    dense_request_ctx<T> ctx;
+    ctx.buf.assign(size_t(R.rows) * S.rows, T(0));
+    ctx.fill = unzeroed ? T(NAN) : T(0);
+    ctx.fail = fail;
+    fflush(stdout);
+    char log_path[] = "/tmp/spalm-native-log-XXXXXX";
+    const int saved = dup(1),
+              null = log ? mkstemp(log_path) : open("/dev/null", O_WRONLY);
+    dup2(null, 1);
+    void *handle = reinterpret_cast<void *>(1);
+    const int status = run(
+        type, ri.data(), rj.data(), rv.data(), si.data(), sj.data(), sv.data(),
+        R.rows, K, S.rows, int(keys.size()), keys.data(), vals.data(),
+        &dense_request_ctx<T>::provide, &ctx, &handle
+    );
+    fflush(stdout);
+    dup2(saved, 1);
+    close(saved);
+    close(null);
+    if (log) {
+        log->clear();
+        if (FILE *f = std::fopen(log_path, "r")) {
+            char buf[4096];
+            for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;)
+                log->append(buf, n);
+            std::fclose(f);
+        }
+        unlink(log_path);
+    }
+    const auto expected = reference<T>(R, S, K);
+    size_t bad = 0;
+    const bool dense = ctx.calls > 0;
+    const char *why = nullptr;
+    if (ctx.calls > 1) why = "callback called more than once";
+    else if (fail && dense) {
+        if (status != 4 || handle) why = "failed callback: want status 4, no handle";
+    } else if (status != 0) why = "status";
+    else if (dense == bool(handle)) why = "handle and callback disagree";
+    else if (expect_dense >= 0 && dense != bool(expect_dense))
+        why = dense ? "dense result, want sparse" : "sparse result, want dense";
+    else if (dense) {
+        for (size_t i = 0; i < expected.size(); ++i)
+            if (!(ctx.buf[i] == expected[i])) ++bad;
+    } else {
+        std::vector<char> seen(expected.size(), 0);
+        long long count = 0;
+        const spalm_csr_block *blocks = api.blocks(handle, &count);
+        for (long long b = 0; b < count; ++b) {
+            const spalm_csr_block &blk = blocks[b];
+            const T *v = static_cast<const T *>(blk.vals);
+            for (int r = 0; r < blk.rows; ++r) {
+                const int i = blk.row_begin + r;
+                for (int p = blk.starts[r]; p < blk.ends[r]; ++p) {
+                    const int j = blk.cols[p];
+                    if (i < 0 || i >= R.rows || j < 0 || j >= S.rows) {
+                        ++bad;
+                        continue;
+                    }
+                    const size_t e = size_t(i) * S.rows + j;
+                    if (seen[e]++ || !(v[p] == expected[e])) ++bad;
+                }
+            }
+        }
+        for (size_t e = 0; e < expected.size(); ++e)
+            if (!seen[e] && expected[e] != T(0)) ++bad;
+    }
+    if (status == 0 && handle) api.free(handle);
+    if (fail && !dense && expect_dense == 1) why = "callback not called";
+    if (why || bad) {
+        std::string opts;
+        for (auto &kv : options) opts += " " + kv.first + "=" + kv.second;
+        std::printf(
+            "FAIL sparse-or-dense %s %s status=%d calls=%d mismatches=%zu %s%s\n",
+            label, type ? "double" : "float", status, ctx.calls, bad,
+            why ? why : "", opts.c_str()
+        );
+        return false;
+    }
+    return true;
+}
+
 int main(int argc, char **argv) {
     const char *lib = argc > 1 ? argv[1] : "bin/spalm.so";
     void *handle = dlopen(lib, RTLD_NOW);
@@ -273,6 +399,11 @@ int main(int argc, char **argv) {
         )
     };
     assert(sparse.run && sparse.blocks && sparse.free);
+    // Row blocks or the caller's dense result, after the decision.
+    const auto sparse_or_dense = reinterpret_cast<spalm_sparse_or_dense_fn>(
+        dlsym(handle, "spalm_sparse_or_dense")
+    );
+    assert(sparse_or_dense);
     using abi_fn = int (*)();
     assert(
         reinterpret_cast<abi_fn>(dlsym(handle, "spalm_sparse_result_abi"))() ==
@@ -545,7 +676,101 @@ int main(int argc, char **argv) {
                 }
                 failures += !run_case<float>(spalm, "auto-table", R, S, K, o);
                 cases += 2;
+                // spalm_sparse_or_dense(): row blocks exactly when the call
+                // is all SS (float: either, its S slices differ).
+                const bool all_ss =
+                    std::string(c.backend).find("sparse=1 dense=0") !=
+                    std::string::npos;
+                failures += !run_sparse_or_dense_case<double>(
+                    sparse_or_dense, sparse, "auto-table", R, S, K, o,
+                    all_ss ? 0 : 1, false, false, &log
+                );
+                const char *choice = all_ss ? "[result-choice] sparse (all SS)"
+                                     : std::string(c.backend).find("sparse=1") !=
+                                             std::string::npos
+                                         ? "[result-choice] dense (mixed)"
+                                         : "[result-choice] dense (all dense)";
+                if (log.find(choice) == std::string::npos) {
+                    std::printf("FAIL sparse-or-dense auto-table: expected '%s'\n", choice);
+                    ++failures;
+                }
+                failures += !run_sparse_or_dense_case<float>(
+                    sparse_or_dense, sparse, "auto-table", R, S, K, o, -1
+                );
+                cases += 2;
+                if (all_ss) {
+                    // Rows split over 64-entry pages.
+                    kv paged = o;
+                    paged.push_back({"ss_output_page_entries", "64"});
+                    failures += !run_sparse_or_dense_case<double>(
+                        sparse_or_dense, sparse, "auto-table/pages", R, S, K,
+                        paged, 0
+                    );
+                    ++cases;
+                } else {
+                    // Uninitialized buffer (result_zeroed = 0): every element
+                    // written; a failed request fails the call.
+                    failures += !run_sparse_or_dense_case<double>(
+                        sparse_or_dense, sparse, "auto-table/unzeroed", R, S,
+                        K, o, 1, true
+                    );
+                    failures += !run_sparse_or_dense_case<double>(
+                        sparse_or_dense, sparse, "auto-table/no-buffer", R, S,
+                        K, o, 1, false, true
+                    );
+                    cases += 2;
+                }
             }
+        }
+        // auto (MKL fallback allowed): an all-SS decision goes to MKL
+        // sparse-sparse, which writes the dense result; without that
+        // fallback it stays on SS with row blocks.
+        for (const char *threads : {"1", "4"}) {
+            struct fallback_case {
+                kv conf;
+                int dense;
+                const char *choice;
+            } fallback_cases[] = {
+                {{{"dense_mm_threshold", "1e18"}, {"auto_mkl_dense_ratio", "1e9"}},
+                 1, "[result-choice] dense (mkl-sparse fallback)"},
+                {{{"dense_mm_threshold", "1e18"}, {"auto_mkl_dense_ratio", "1e9"},
+                  {"auto_mkl_sparse_fallback", "0"}},
+                 0, "[result-choice] sparse (all SS)"},
+                {{{"auto_mkl_dense_ratio", "0"}}, 1,
+                 "[result-choice] dense (mkl-dense fallback)"},
+            };
+            for (const auto &c : fallback_cases) {
+                kv o = {{"threads", threads}, {"thresholds_file", table}};
+                o.insert(o.end(), c.conf.begin(), c.conf.end());
+                std::string log;
+                failures += !run_sparse_or_dense_case<double>(
+                    sparse_or_dense, sparse, "auto-table/auto", R, S, K, o,
+                    c.dense, false, false, &log
+                );
+                if (log.find(c.choice) == std::string::npos) {
+                    std::printf("FAIL sparse-or-dense auto: expected '%s'\n", c.choice);
+                    ++failures;
+                }
+                failures += !run_sparse_or_dense_case<float>(
+                    sparse_or_dense, sparse, "auto-table/auto", R, S, K, o, c.dense
+                );
+                cases += 2;
+            }
+        }
+        // Zero products: no request, a handle without entries.
+        {
+            const csr empty = make_csr(M, K, [](int, int) { return false; }, rng);
+            const csr no_keys_R = make_csr(M, 0, [](int, int) { return true; }, rng);
+            const csr no_keys_S = make_csr(N, 0, [](int, int) { return true; }, rng);
+            const kv o = {{"init_method", "no_fallback"}, {"threads", "4"},
+                          {"thresholds_file", table}};
+            failures += !run_sparse_or_dense_case<double>(
+                sparse_or_dense, sparse, "zero/empty-R", empty, S, K, o, 0
+            );
+            failures += !run_sparse_or_dense_case<double>(
+                sparse_or_dense, sparse, "zero/K=0", no_keys_R, no_keys_S, 0, o, 0
+            );
+            cases += 2;
         }
         unlink(table);
     }
@@ -650,6 +875,66 @@ int main(int argc, char **argv) {
             ++cases;
         }
     }
+    // spalm_sparse_or_dense() with the forced methods: SS and MKL sp2m keep
+    // row blocks, the dense kernels and MKL dense ask for the dense result;
+    // a null callback is rejected.
+    {
+        const int M = 61, N = 300, K = 700;
+        const csr R =
+            make_csr(M, K, [&](int, int) { return u(rng) < 0.03; }, rng);
+        const csr S =
+            make_csr(N, K, [&](int, int) { return u(rng) < 0.03; }, rng);
+        struct forced_case {
+            const char *method;
+            int dense;
+        } forced_cases[] = {
+            {"sparse", 0},
+            {"FORCE_MKL_SPARSE", 0},
+            {"FORCE_MKL_DENSE", 1},
+            {"dense_bm_inner_kernel", 1},
+            {"dense_left_spmm_inner_kernel", 1},
+            {"dense_right_spmm_inner_kernel", 1},
+        };
+        for (const auto &c : forced_cases) {
+            for (const char *threads : {"1", "4"}) {
+                const std::vector<std::pair<std::string, std::string>> o = {
+                    {"init_method", c.method}, {"threads", threads}
+                };
+                const std::string label = std::string("forced/") + c.method;
+                failures += !run_sparse_or_dense_case<double>(
+                    sparse_or_dense, sparse, label.c_str(), R, S, K, o, c.dense
+                );
+                failures += !run_sparse_or_dense_case<float>(
+                    sparse_or_dense, sparse, label.c_str(), R, S, K, o, c.dense
+                );
+                cases += 2;
+                if (c.dense) {
+                    failures += !run_sparse_or_dense_case<double>(
+                        sparse_or_dense, sparse, label.c_str(), R, S, K, o, 1,
+                        true
+                    );
+                    failures += !run_sparse_or_dense_case<double>(
+                        sparse_or_dense, sparse, label.c_str(), R, S, K, o, 1,
+                        false, true
+                    );
+                    cases += 2;
+                }
+            }
+        }
+        std::vector<double> rv(R.val), sv(S.val);
+        std::vector<int> ri = R.ptr, rj = R.col, si = S.ptr, sj = S.col;
+        const char *keys[] = {"init_method"}, *vals[] = {"sparse"};
+        void *result = reinterpret_cast<void *>(1);
+        const int status = sparse_or_dense(
+            1, ri.data(), rj.data(), rv.data(), si.data(), sj.data(),
+            sv.data(), M, K, N, 1, keys, vals, nullptr, nullptr, &result
+        );
+        if (status != 1 || result) {
+            std::printf("FAIL sparse-or-dense accepted a null callback\n");
+            ++failures;
+        }
+        ++cases;
+    }
     std::printf(
         "%s: %d native kernel cases (SS/SD/DS/DD x DS aligned panels x SS "
         "column blocks x full "
@@ -657,7 +942,8 @@ int main(int argc, char **argv) {
         "packing x SS contiguous x threads x slice length (fixed / automatic) "
         "x float/double, plus tunables, mixed SS and dense calls from a "
         "thresholds file, uninitialized results for MKL and SPALM, and "
-        "sparse output for SS and MKL sp2m), "
+        "sparse output for SS and MKL sp2m, and row blocks or a requested "
+        "dense result from spalm_sparse_or_dense), "
         "%d failed\n",
         failures ? "FAIL" : "PASS", cases, failures
     );

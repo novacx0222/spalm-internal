@@ -360,9 +360,21 @@ static int choose_slice_length_by_density(
     return length;
 }
 
+// spalm_sparse_or_dense(): the caller's dense result, requested only when
+// the decision needs one.
+struct dense_result_request {
+    spalm_dense_result_fn fn = nullptr;
+    void *ctx = nullptr;
+    bool called = false;
+};
+
 // Accumulates R * S^T into the caller's zero-initialized ret; with
 // options.result_zeroed false, ret holds garbage and every element is written
 // (see cpu_execution_options).
+// With dense_request (spalm_sparse_or_dense), ret starts null and sparse_out
+// is set: a call that runs entirely on the SS path (or FORCE_MKL_SPARSE)
+// keeps the row blocks; any other decision gets ret from the caller and
+// clears sparse_out.
 template <typename T>
 int spalm_matmul(
     const int type, int *Ri, int *Rj, T *Rv, int *Si, int *Sj, T *Sv,
@@ -370,7 +382,8 @@ int spalm_matmul(
     const int tile_size_l2, const int tile_size_l3, bool sparse_result, T *ret,
     int *reti, int *retj, T *retv, const int threads,
     const cpu_execution_options &options,
-    spalm_sparse_result *sparse_out = nullptr
+    spalm_sparse_result *sparse_out = nullptr,
+    dense_result_request *dense_request = nullptr
 ) {
     // The join dimension every later stage uses; key compaction shrinks it.
     int K = K_input;
@@ -389,6 +402,29 @@ int spalm_matmul(
             zero_result(ret, result_bytes, threads);
         }
         std::cout << "[backend] zero-work (" << why << ")" << std::endl;
+    };
+    // spalm_sparse_or_dense(): this decision needs the dense result. It is
+    // zeroed here when the caller left it uninitialized, as at the top,
+    // except for the forced MKL backends, which overwrite it.
+    auto request_dense_result = [&](const char *why) {
+        const auto begin = std::chrono::high_resolution_clock::now();
+        ret = static_cast<T *>(dense_request->fn(dense_request->ctx));
+        dense_request->called = true;
+        print_time(
+            "[dense-result-request]",
+            std::chrono::high_resolution_clock::now() - begin
+        );
+        if (!ret) {
+            std::cerr << "spalm: the caller could not provide the dense result"
+                      << std::endl;
+            return false;
+        }
+        sparse_out = nullptr;
+        if (!options.result_zeroed && !forced_mkl) {
+            zero_result(ret, result_bytes, threads);
+        }
+        std::cout << "[result-choice] dense (" << why << ")" << std::endl;
+        return true;
     };
     // An empty dimension, or no stored entry on a side, contributes nothing:
     // no CSR copies, slices, packing buffers or MKL call are needed.
@@ -491,12 +527,21 @@ int spalm_matmul(
                   << " (forced)" << std::endl;
         const auto start = std::chrono::high_resolution_clock::now();
         int status = SPALM_INVALID_ARGUMENT;
+        if (sparse_out && dense_request &&
+            forced_backend == spalm_dispatch::Backend::MklDense &&
+            !request_dense_result("forced mkl-dense")) {
+            return SPALM_INTERNAL_ERROR;
+        }
         if (!sparse_out) {
             status = run_mkl_backend(
                 forced_backend, type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, ret,
                 threads
             );
         } else if (forced_backend == spalm_dispatch::Backend::MklSparse) {
+            if (dense_request) {
+                std::cout << "[result-choice] sparse (forced mkl-sparse)"
+                          << std::endl;
+            }
             status = run_mkl_sparse_output(
                 type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, threads, *sparse_out
             );
@@ -646,13 +691,24 @@ int spalm_matmul(
         do_sparse_mm && !do_dense_mm && options.auto_mkl_sparse_fallback
     );
     // Sparse output exists for the full SS path only (init_method sparse:
-    // no dense slice pair, no fallback).
+    // no dense slice pair, no fallback). spalm_sparse_or_dense() writes any
+    // other decision to the caller's dense result instead.
     if (sparse_out &&
         (backend != spalm_dispatch::Backend::Internal || do_dense_mm)) {
-        std::cerr << "spalm: sparse output needs every slice pair on the SS "
-                     "path (init_method sparse)"
-                  << std::endl;
-        return SPALM_INVALID_ARGUMENT;
+        if (!dense_request) {
+            std::cerr << "spalm: sparse output needs every slice pair on the "
+                         "SS path (init_method sparse)"
+                      << std::endl;
+            return SPALM_INVALID_ARGUMENT;
+        }
+        const char *why =
+            backend == spalm_dispatch::Backend::MklDense    ? "mkl-dense fallback"
+            : backend == spalm_dispatch::Backend::MklSparse ? "mkl-sparse fallback"
+            : do_sparse_mm                                  ? "mixed"
+                                                            : "all dense";
+        if (!request_dense_result(why)) return SPALM_INTERNAL_ERROR;
+    } else if (sparse_out && dense_request) {
+        std::cout << "[result-choice] sparse (all SS)" << std::endl;
     }
     if (backend != spalm_dispatch::Backend::Internal) {
         std::cout << "[backend] "
@@ -798,12 +854,14 @@ static void print_conf(
 }
 
 // sparse_out: the result goes there as row blocks (spalm_sparse()); ret
-// is not used.
+// is not used. dense_request (spalm_sparse_or_dense()): any init_method, and
+// a decision that needs the dense result gets it from the caller.
 static int spalm_impl(
     int type, int *Ri, int *Rj, void *Rv, int *Si, int *Sj, void *Sv,
     const int M, const int K, const int N, bool sparse_result, void *ret,
     int *reti, int *retj, void *retv, int n, const char **keys,
-    const char **vals, spalm_sparse_result *sparse_out = nullptr
+    const char **vals, spalm_sparse_result *sparse_out = nullptr,
+    dense_result_request *dense_request = nullptr
 ) {
     const auto initialize_begin = std::chrono::high_resolution_clock::now();
     auto invalid = [](const char *what) {
@@ -816,8 +874,9 @@ static int spalm_impl(
         return invalid("invalid key/value options");
     }
     // Sparse output: SPALM SS (init_method sparse) and MKL sparse-sparse
-    // (FORCE_MKL_SPARSE) only. The first init_method counts, as below.
-    if (sparse_out) {
+    // (FORCE_MKL_SPARSE) only, unless the dense result can be requested. The
+    // first init_method counts, as below.
+    if (sparse_out && !dense_request) {
         const char *method = "";
         for (int i = 0; i < n; i++) {
             if (strcmp(keys[i], "init_method") == 0) {
@@ -1064,7 +1123,11 @@ static int spalm_impl(
     // std::cout << "Tile size join dim: " << tile_size_join_dim << std::endl;
     std::cout << "Tile size L2: " << tile_size_l2 << std::endl;
     std::cout << "Tile size L3: " << tile_size_l3 << std::endl;
-    if (sparse_out) {
+    if (sparse_out && dense_request) {
+        std::cout << "Writing to sparse result (row blocks), or to the "
+                     "caller's dense result if the decision needs one"
+                  << std::endl;
+    } else if (sparse_out) {
         std::cout << "Writing to sparse result (row blocks)" << std::endl;
     } else if (sparse_result) {
         std::cout << "Writing to sparse result" << std::endl;
@@ -1082,13 +1145,14 @@ static int spalm_impl(
             type, Ri, Rj, (float *) Rv, Si, Sj, (float *) Sv, M, K, N,
             slice_length, tile_size_l2, tile_size_l3, sparse_result,
             (float *) ret, reti, retj, (float *) retv, threads, options,
-            sparse_out
+            sparse_out, dense_request
         );
     }
     return spalm_matmul(
         type, Ri, Rj, (double *) Rv, Si, Sj, (double *) Sv, M, K, N,
         slice_length, tile_size_l2, tile_size_l3, sparse_result, (double *) ret,
-        reti, retj, (double *) retv, threads, options, sparse_out
+        reti, retj, (double *) retv, threads, options, sparse_out,
+        dense_request
     );
 }
 
@@ -1168,6 +1232,43 @@ extern "C" int spalm_sparse(
         );
     });
     if (status == SPALM_OK) *result = out.release();
+    return status;
+}
+
+// C = R * S^T as row blocks when the whole call runs on the SS path with
+// sparse output (every slice pair SS and no MKL fallback, e.g. init_method
+// no_fallback deciding "all SS", or init_method sparse) or on
+// FORCE_MKL_SPARSE; otherwise into a dense M x N result that the caller
+// provides on request: dense_result(ctx) is called at most once, after the
+// dispatch decision (see spalm_dense_result_fn). Any init_method; same
+// inputs and options as spalm(). A null from dense_result fails the call
+// with SPALM_INTERNAL_ERROR. On SPALM_OK, *result is null if dense_result
+// was called (the result is in that buffer), else a handle as from
+// spalm_sparse() (no blocks for a zero product); on failure it is null.
+extern "C" int spalm_sparse_or_dense(
+    int type, int *Ri, int *Rj, void *Rv, int *Si, int *Sj, void *Sv,
+    const int M, const int K, const int N, int n, const char **keys,
+    const char **vals, spalm_dense_result_fn dense_result, void *ctx,
+    void **result
+) {
+    if (!result || !dense_result) {
+        std::cerr << "spalm: null result handle pointer or dense result "
+                     "function"
+                  << std::endl;
+        if (result) *result = nullptr;
+        return SPALM_INVALID_ARGUMENT;
+    }
+    *result = nullptr;
+    std::unique_ptr<spalm_sparse_result> out;
+    dense_result_request request{dense_result, ctx};
+    const int status = serialized_call([&] {
+        out = std::make_unique<spalm_sparse_result>();
+        return spalm_impl(
+            type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, false, nullptr, nullptr,
+            nullptr, nullptr, n, keys, vals, out.get(), &request
+        );
+    });
+    if (status == SPALM_OK && !request.called) *result = out.release();
     return status;
 }
 

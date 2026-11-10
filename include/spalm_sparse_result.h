@@ -14,6 +14,13 @@
 // (`value != 0`: -0.0 dropped, NaN kept).
 //
 // The arrays stay valid until spalm_sparse_result_free().
+//
+// spalm_sparse_or_dense() takes any init_method (e.g. no_fallback). It
+// returns these blocks when the whole call runs on the SS path (every slice
+// pair SS, no MKL fallback) or on FORCE_MKL_SPARSE; otherwise it asks the
+// caller for a dense M x N result (spalm_dense_result_fn), after the
+// dispatch decision, and writes that instead. The block layout is the same
+// (SPALM_SPARSE_RESULT_ABI); callers find the entry point by its name.
 
 #define SPALM_SPARSE_RESULT_ABI 1
 
@@ -22,6 +29,12 @@
 #include <vector>
 extern "C" {
 #endif
+
+// Returns the caller's dense M x N result (row-major, float or double as the
+// call's type; zero-filled unless the call passes result_zeroed = 0), or
+// null if it cannot be provided. Called at most once per call, on the
+// calling thread; it must not throw.
+typedef void *(*spalm_dense_result_fn)(void *ctx);
 
 typedef struct spalm_csr_block {
     int row_begin;

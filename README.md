@@ -108,6 +108,26 @@ the cost model entirely and need no thresholds file. Automatic mode may fall
 back to MKL; one `[backend] ...` line says what ran: `spalm-internal`,
 `mkl-dense`/`mkl-sparse` (`forced` or `fallback`), or `zero-work`.
 
+### Sparse output
+
+`spalm_sparse()` returns C as row blocks in CSR form
+(`include/spalm_sparse_result.h`) instead of filling a dense result, for
+`init_method` `sparse` and `FORCE_MKL_SPARSE` only.
+
+`spalm_sparse_or_dense()` takes any `init_method` (e.g. `no_fallback`) and a
+callback, `spalm_dense_result_fn`, that returns the caller's dense M x N
+result. After the dispatch decision:
+
+- **Row blocks:** the call runs entirely on the SS path (every slice pair SS,
+  no MKL fallback) or on `FORCE_MKL_SPARSE`. The callback is not called.
+- **Dense result:** any other decision (mixed, all dense, an MKL fallback,
+  the dense kernels, `FORCE_MKL_DENSE`) calls the callback once, writes the
+  dense result there, and returns no handle.
+
+A `[result-choice] sparse|dense (<why>)` line says which, and
+`[dense-result-request]` times the callback. A callback that returns null
+fails the call with `4`.
+
 ## Timing output
 
 Each stage prints `[stage-name] <milliseconds> ms` (six decimals). Nested
