@@ -2,7 +2,10 @@
 // brute-force reference, and the decision on inputs whose best length is
 // known from measurements: uniform 1% rows lengthen to 4x (encoder-1025 and
 // the 16000 grid), uniform 20% rows, banded rows and thinly spread
-// SuiteSparse-like rows stay at the configured length.
+// SuiteSparse-like rows stay at the configured length. Then the two limits:
+// lengths within K, and nothing lengthened below kMinCost (the 16000 grid's
+// uniform_1 is above it, the same rows at 2000 x 16000 below), with the
+// size bound that skips counting.
 #include "slice_length_rule.h"
 
 #include <cassert>
@@ -112,15 +115,17 @@ static void check_counts_against_reference() {
     std::cout << "counts match the reference" << std::endl;
 }
 
-// Chosen level for SD (R sparse), DS (S sparse) and DD (both).
+// Chosen level for SD (R sparse), DS (S sparse) and DD (both). min_cost 0:
+// the doubling rule alone, whatever the size.
 static std::tuple<int, int, int> levels_for(
-    const test_csr &r, const test_csr &s, int threads = 4
+    const test_csr &r, const test_csr &s, int threads = 4,
+    double min_cost = 0
 ) {
     const auto rc = counts(r, 512, 3, 12, threads);
     const auto sc = counts(s, 512, 3, 16, threads);
-    const auto sd = slr::choose(rc, sc, true, false);
-    const auto ds = slr::choose(rc, sc, false, true);
-    const auto dd = slr::choose(rc, sc, true, true);
+    const auto sd = slr::choose(rc, sc, true, false, min_cost);
+    const auto ds = slr::choose(rc, sc, false, true, min_cost);
+    const auto dd = slr::choose(rc, sc, true, true, min_cost);
     std::cout << "    SD level " << sd.level << " (cost " << sd.cost[1] << ", "
               << sd.cost[2] << "; per subrow " << sd.per_subrow[0] << ")"
               << "  DS level " << ds.level << " (cost " << ds.cost[1] << ")"
@@ -181,8 +186,83 @@ static void check_decisions() {
     std::cout << "decisions as expected" << std::endl;
 }
 
+// The level-0 cost, from the counts and from sizes alone.
+static double cost0(const test_csr &r, const test_csr &s, bool rs, bool ss) {
+    const auto rc = counts(r, 512, 1, 12, 4);
+    const auto sc = counts(s, 512, 1, 16, 4);
+    return slr::choose(rc, sc, rs, ss).cost0;
+}
+
+static double bound(const test_csr &r, const test_csr &s, bool rs, bool ss) {
+    return slr::cost0_bound(
+        r.idx.size(), r.rows, 12, s.idx.size(), s.rows, 16, rs, ss
+    );
+}
+
+static void check_limits() {
+    // Lengths within K.
+    assert(slr::levels_within(512, 0) == 1);
+    assert(slr::levels_within(512, 1023) == 1);
+    assert(slr::levels_within(512, 1024) == 2);
+    assert(slr::levels_within(512, 2047) == 2);
+    assert(slr::levels_within(512, 2048) == 3);
+    assert(slr::levels_within(512, 100000) == 3);
+    assert(slr::levels_within(300, 1700) == 3);
+    assert(slr::levels_within(0, 100000) == 1);
+
+    std::mt19937 rng(23);
+    std::cout << "uniform 1%, 16000 x 16000 (the grid's uniform_1)" << std::endl;
+    {
+        const auto a = uniform(rng, 16000, 16000, 0.01);
+        const auto c = cost0(a, a, true, false);
+        std::cout << "    SD cost0 " << c << ", bound " << bound(a, a, true, false)
+                  << std::endl;
+        assert(c >= slr::kMinCost);
+        assert(levels_for(a, a, 8, slr::kMinCost) == std::make_tuple(2, 2, 2));
+    }
+    std::cout << "uniform 1%, 2000 x 16000: below kMinCost" << std::endl;
+    {
+        const auto a = uniform(rng, 2000, 16000, 0.01);
+        const auto c = cost0(a, a, true, true);
+        std::cout << "    DD cost0 " << c << std::endl;
+        assert(c < slr::kMinCost);
+        assert(levels_for(a, a, 4, slr::kMinCost) == std::make_tuple(0, 0, 0));
+        assert(levels_for(a, a, 4, 0) == std::make_tuple(2, 2, 2));
+        // The decision keeps the costs for the log.
+        const auto rc = counts(a, 512, 3, 12, 4);
+        const auto sc = counts(a, 512, 3, 16, 4);
+        const auto d = slr::choose(rc, sc, true, true);
+        assert(d.level == 0 && d.cost0 == c && d.cost[2] < 0.5);
+        assert(d.cost0 == slr::side_cost(rc, sc, 0) + slr::side_cost(sc, rc, 0));
+    }
+    // The size bound is never below the cost: uniform, spread, banded, empty
+    // rows, and R and S of different heights.
+    {
+        const test_csr inputs[] = {
+            uniform(rng, 2000, 16000, 0.01), uniform(rng, 400, 16000, 0.2),
+            spread(rng, 3000, 50000, 7), banded(4096, 2),
+            uniform(rng, 500, 16000, 0.0001), // mostly empty rows
+        };
+        for (const auto &r : inputs)
+            for (const auto &s : inputs) {
+                if (r.cols != s.cols) continue;
+                for (int sides = 1; sides <= 3; ++sides) {
+                    const bool rs = sides & 1, ss = sides & 2;
+                    assert(cost0(r, s, rs, ss) <= bound(r, s, rs, ss));
+                }
+            }
+        // Only the sparse sides count.
+        const auto &a = inputs[0];
+        assert(bound(a, a, true, true) ==
+               bound(a, a, true, false) + bound(a, a, false, true));
+        assert(bound(a, a, false, false) == 0);
+    }
+    std::cout << "limits as expected" << std::endl;
+}
+
 int main() {
     check_counts_against_reference();
     check_decisions();
+    check_limits();
     return 0;
 }

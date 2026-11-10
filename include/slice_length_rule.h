@@ -20,9 +20,29 @@
 //     fastest: the saved writes no longer pay for longer packed panels), and
 //   - the modelled cost drops by at least 1 - kMinCostRatio.
 // DD and mixed tables sum the SD and DS costs. All counts are exact (one
-// pass over each CSR); nothing depends on the machine.
+// pass over each CSR).
+//
+// Two limits come from measurements (v25 SuiteSparse run, 8488C, 30
+// threads, 170 matrices at 512 and at the lengths the rules chose; the
+// model's costs recomputed exactly). Only these depend on the machine:
+//   - No length beyond K (levels_within): a longer panel only pads a single
+//     slice column.
+//   - The modelled cost at the configured length must reach kMinCost: there,
+//     about 250 ms of SD or DS kernel, or 120 ms of DD (whose cost counts
+//     both sides). Below it, of the 37 measured cells the
+//     rule would have lengthened, 30 got slower (1.40x slice-mm in gmean)
+//     and one faster: the packing buffers grow with the length, and on
+//     medium graph-like inputs the kernels ran 1.2-1.9x slower where the
+//     model predicted 0.55-0.75 (probably the longer packed panels no longer
+//     fit in L2). Above it, 11 of 13 got faster and none slower (0.72x).
+// That run still had the packing buffers on 4 KiB pages, which cost 2-7 ms
+// more per call at 2048 than at 512 (packing_buffers.h). Without that cost
+// medium graph-like inputs still ran slower at 2048 (pajek_fa, gnutella05:
+// 1.1-1.4x library time), and a few just below kMinCost ran faster
+// (priebel_192bit DD and SD: 0.96-0.97x).
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <vector>
 #ifdef _OPENMP
@@ -36,8 +56,22 @@ namespace slice_length_rule {
 inline constexpr double kSubrowWriteEntries = 16.0;
 // A doubling must cut the modelled cost to at most this fraction.
 inline constexpr double kMinCostRatio = 0.9;
+// Smallest modelled cost at the configured length that is lengthened at
+// all (see the top of this file). In the v25 run the cells above it were
+// all at least 3.3e9; the largest below, 2.4e9 (priebel_192bit DD), ran
+// the same at 2048 as at 512.
+inline constexpr double kMinCost = 3e9;
 // Lengths tried: base, 2 * base and 4 * base.
 inline constexpr int kMaxLevels = 3;
+
+// Levels to count: base << level stays within K (at least one level).
+inline int levels_within(const int base, const int K) {
+    int levels = 1;
+    while (levels < kMaxLevels && base > 0 &&
+           (static_cast<long long>(base) << levels) <= K)
+        ++levels;
+    return levels;
+}
 
 // Per slice column, for slice length base << level: stored entries,
 // nonempty subrows and nonempty slices (slice_height rows each).
@@ -157,6 +191,21 @@ inline double side_cost(
     return cost;
 }
 
+// An upper bound of the level-0 cost from sizes alone: per sparse-side
+// entry, at most one packed row and one subrow write per slice of the other
+// side (a subrow holds at least one entry).
+inline double cost0_bound(
+    const long long r_entries, const int r_rows, const int r_height,
+    const long long s_entries, const int s_rows, const int s_height,
+    const bool r_sparse, const bool s_sparse
+) {
+    const double r_slices = r_height > 0 ? (r_rows + r_height - 1.0) / r_height : 0;
+    const double s_slices = s_height > 0 ? (s_rows + s_height - 1.0) / s_height : 0;
+    const double per_entry = 1 + kSubrowWriteEntries;
+    return (r_sparse ? static_cast<double>(r_entries) * per_entry * std::ceil(s_slices) : 0.0) +
+           (s_sparse ? static_cast<double>(s_entries) * per_entry * std::ceil(r_slices) : 0.0);
+}
+
 inline double entries_per_subrow(const column_counts &x, const int level) {
     long long e = 0, s = 0;
     for (size_t c = 0; c < x.entries[level].size(); ++c) {
@@ -168,16 +217,17 @@ inline double entries_per_subrow(const column_counts &x, const int level) {
 
 struct decision {
     int level = 0;
+    double cost0 = 0;                      // modelled cost at level 0
     double cost[kMaxLevels] = {};          // relative to level 0
     double per_subrow[kMaxLevels] = {};    // entries per nonempty subrow
 };
 
 // r_sparse: R's subrows are multiplied with packed S (SD, DD); s_sparse:
 // S's subrows with packed R (DS, DD). Both count tables need the same
-// levels.
+// levels. Below min_cost at level 0 nothing is lengthened.
 inline decision choose(
     const column_counts &r, const column_counts &s, const bool r_sparse,
-    const bool s_sparse
+    const bool s_sparse, const double min_cost = kMinCost
 ) {
     decision d;
     const int levels = std::min(r.levels, s.levels);
@@ -190,9 +240,10 @@ inline decision choose(
         if (s_sparse) e = std::min(e, entries_per_subrow(s, l));
         d.per_subrow[l] = (r_sparse || s_sparse) ? e : 0.0;
     }
+    d.cost0 = raw[0];
     for (int l = 0; l < levels; ++l)
         d.cost[l] = raw[0] > 0 ? raw[l] / raw[0] : 1.0;
-    if (!r_sparse && !s_sparse) return d;
+    if ((!r_sparse && !s_sparse) || raw[0] < min_cost) return d;
     while (d.level + 1 < levels &&
            d.per_subrow[d.level] < kSubrowWriteEntries &&
            raw[d.level + 1] <= kMinCostRatio * raw[d.level])

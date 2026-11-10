@@ -5,13 +5,17 @@
 // pointers of the C library, the 2 MiB threshold, and threads. On Linux,
 // blocks of at least 2 MiB must be fresh mappings: 2 MiB aligned, zero
 // filled and marked for huge pages ("hg" in /proc/self/smaps); elsewhere
-// they come from malloc.
+// they come from malloc. Also the packing buffers of the dense-path kernels
+// (packing_buffers.h): alignment, one huge mapping shared by the per-worker
+// S blocks, disjoint blocks, and the fallbacks.
 #include "huge_pages.h"
+#include "packing_buffers.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -197,12 +201,101 @@ void check_threads() {
     check(bad == 0 && live() == 0, "threads: malloc / realloc / free");
 }
 
+bool aligned_to(const void *p, size_t alignment) {
+    return reinterpret_cast<uintptr_t>(p) % alignment == 0;
+}
+
+// Packing buffers of the dense-path kernels (packing_buffers.h).
+void check_packing() {
+    using namespace spalm_packing;
+    {
+        auto a = try_make_buffer<double>(100);
+        check(a && aligned_to(a.get(), kAlignment) && !spalm_huge::is_mapped(a),
+              "small packing buffer: posix_memalign, 64-byte aligned");
+        fill(a.get(), 800, 11);
+        check(same(a.get(), 800, 11), "small packing buffer: usable");
+    }
+    {
+        const size_t n = spalm_huge::kHugeBytes / sizeof(double) + 16;
+        auto a = try_make_buffer<double>(n);
+        check(a && aligned_to(a.get(), kAlignment), "large packing buffer: aligned");
+        check(spalm_huge::is_mapped(a) == kLinux, "large packing buffer: mapping on Linux only");
+        if (kLinux) check(aligned(a.get()) && advised(a.get()), "large packing buffer: huge pages");
+        fill(a.get(), n * sizeof(double), 12);
+        check(same(a.get(), n * sizeof(double), 12), "large packing buffer: usable");
+        auto b = try_make_buffer<double>(n, false);
+        check(b && !spalm_huge::is_mapped(b) && aligned_to(b.get(), kAlignment),
+              "large packing buffer without huge pages: posix_memalign");
+    }
+    check(!try_make_buffer<double>(0), "empty packing buffer: none");
+    check(!try_make_buffer<double>(SIZE_MAX / 4), "oversized packing buffer: none");
+    bool threw = false;
+    try {
+        make_buffer<double>(SIZE_MAX / 4);
+    } catch (const std::bad_alloc &) {
+        threw = true;
+    }
+    check(threw, "oversized packing buffer: bad_alloc");
+
+    // Per-worker blocks: the sizes of slice length 2048 and 512 in double
+    // (8 slices x length x 16 values, plus the 128-byte pad), and a small one.
+    const struct {
+        int workers;
+        size_t count;
+        bool shared;
+        const char *name;
+    } sizes[] = {
+        {30, 8 * 2048 * 16 + 16, true, "2 MiB blocks"},
+        {30, 8 * 512 * 16 + 16, true, "512 KiB blocks"},
+        {4, 1000, false, "small blocks"},
+        {1, 8 * 2048 * 16 + 16, true, "one 2 MiB block"},
+    };
+    for (const auto &s : sizes) {
+        worker_blocks<double> blocks(s.workers, s.count);
+        const std::string name = s.name;
+        check(blocks.shared() == (s.shared && kLinux), (name + ": shared mapping on Linux only").c_str());
+        std::vector<double *> at(s.workers, nullptr);
+        int bad = 0;
+#pragma omp parallel for reduction(+ : bad) num_threads(8)
+        for (int w = 0; w < s.workers; ++w) {
+            at[w] = blocks.get(w);
+            bad += at[w] == nullptr || !aligned_to(at[w], kAlignment) ||
+                   (blocks.shared() && !aligned_to(at[w], kBlockAlignment));
+            if (at[w]) fill(at[w], s.count * sizeof(double), 20 + w);
+        }
+        check(bad == 0, (name + ": one aligned block per worker").c_str());
+        for (int w = 0; w < s.workers; ++w) {
+            bad += at[w] && !same(at[w], s.count * sizeof(double), 20 + w);
+            bad += blocks.get(w) != at[w];
+        }
+        check(bad == 0, (name + ": blocks disjoint and stable").c_str());
+        check(blocks.get(-1) == nullptr && blocks.get(s.workers) == nullptr,
+              (name + ": other workers: none").c_str());
+    }
+    {
+        worker_blocks<double> none(0, 1000);
+        worker_blocks<double> empty(4, 0);
+        worker_blocks<double> huge(2, SIZE_MAX / 4);
+        check(none.get(0) == nullptr && empty.get(0) == nullptr && huge.get(0) == nullptr,
+              "no workers, empty or oversized blocks: none");
+    }
+    {
+        worker_blocks<float> blocks(30, 8 * 2048 * 32 + 32);
+        float *a = blocks.get(29);
+        check(a != nullptr && blocks.shared() == kLinux, "float blocks: shared mapping on Linux only");
+        if (a) fill(a, (8 * 2048 * 32 + 32) * sizeof(float), 9);
+        check(a && same(a, (8 * 2048 * 32 + 32) * sizeof(float), 9), "float blocks: last worker usable");
+    }
+    check(live() == 0, "packing buffers: no allocator blocks");
+}
+
 } // namespace
 
 int main() {
     check_arrays();
     check_allocator();
     check_threads();
+    check_packing();
     std::printf("%s: %d huge-page cases (%s), %d failed\n",
                 failures ? "FAIL" : "PASS", cases,
                 kLinux ? "Linux: mappings checked" : "not Linux: malloc only",

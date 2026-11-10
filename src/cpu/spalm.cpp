@@ -267,12 +267,21 @@ static int choose_slice_length_by_counts(
     bool r_sparse = false, s_sparse = false;
     sparse_sides(r_sparse, s_sparse);
     if (!r_sparse && !s_sparse) return configured;
-    // A length at or beyond K is one slice column; no point going further.
-    int levels = 1;
-    while (levels < slice_length_rule::kMaxLevels &&
-           ((long long) configured << (levels - 1)) < K)
-        ++levels;
+    // No length beyond K: it would only pad a single slice column.
+    const int levels = slice_length_rule::levels_within(configured, K);
     if (levels == 1) return configured;
+    const char *sides = r_sparse && s_sparse ? "RS" : r_sparse ? "R" : "S";
+    // Below kMinCost nothing is lengthened: inputs whose level-0 cost cannot
+    // reach it are not even counted.
+    const double bound = slice_length_rule::cost0_bound(
+        Ri[M], M, r_height, Si[N], N, s_height, r_sparse, s_sparse
+    );
+    if (bound < slice_length_rule::kMinCost) {
+        std::cout << "[slice-length] rule=counts configured=" << configured
+                  << " chosen=" << configured << " sides=" << sides
+                  << " cost0_bound=" << bound << " (not counted)" << std::endl;
+        return configured;
+    }
     const auto begin = std::chrono::high_resolution_clock::now();
     const auto r = slice_length_rule::count_columns(
         Ri, Rj, M, K, configured, levels, r_height, threads
@@ -287,15 +296,14 @@ static int choose_slice_length_by_counts(
         std::chrono::high_resolution_clock::now() - begin
     );
     std::cout << "[slice-length] rule=counts configured=" << configured
-              << " chosen=" << length << " sides="
-              << (r_sparse && s_sparse ? "RS" : r_sparse ? "R" : "S")
+              << " chosen=" << length << " sides=" << sides
               << " entries_per_subrow=";
     for (int l = 0; l < levels; ++l)
         std::cout << (l ? "," : "") << d.per_subrow[l];
     std::cout << " cost=";
     for (int l = 0; l < levels; ++l)
         std::cout << (l ? "," : "") << d.cost[l];
-    std::cout << std::endl;
+    std::cout << " cost0=" << d.cost0 << std::endl;
     return length;
 }
 

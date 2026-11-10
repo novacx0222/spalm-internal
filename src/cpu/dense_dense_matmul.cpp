@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "cpu/kernel.h"
+#include "packing_buffers.h"
 #include "slice_decision.h"
 #include "util.h"
 
@@ -258,9 +259,10 @@ void dense_dense_matmul(
               << " fixed_alg=" << policy.fixed_alg
               << " sd_ds_full_rows=" << full_rows << " r_stride=" << r_stride
               << std::endl;
-    aligned_unique_ptr<T> R_packed_mem;
+    // Huge pages from 2 MiB on (packing_buffers.h).
+    spalm_huge::array<T> R_packed_mem;
     if (policy.pack_r) {
-        R_packed_mem = make_aligned_unique<T>(R_block_size + pad);
+        R_packed_mem = spalm_packing::make_buffer<T>(R_block_size + pad);
         std::memset(R_packed_mem.get() + R_block_size, 0, pad_bytes);
     }
     aligned_unique_ptr<BIT_DTYPE> R_bm;
@@ -271,15 +273,26 @@ void dense_dense_matmul(
         "[dense-dense-memory-allocation-time]", mem_alloc_end - mem_alloc_start
     );
 
-    // Per-worker S packing buffers are allocated on a worker's first task
-    // rather than for every thread up front. An allocation failure inside the
-    // parallel region must not throw (that terminates the process): it is
-    // flagged, remaining tasks are skipped, and std::bad_alloc is thrown after.
+    // Per-worker S packing blocks: slices of one huge-page mapping when they
+    // reach 2 MiB together, whose pages are backed only when a worker first
+    // packs; otherwise allocated on a worker's first task (packing_buffers.h).
+    // An allocation failure inside the parallel region must not throw (that
+    // terminates the process): it is flagged, remaining tasks are skipped,
+    // and std::bad_alloc is thrown after.
     const size_t S_block_size = (size_t) S_slices_per_agg_tile * sl * nr;
     const size_t S_bm_size = (size_t) S_slices_per_agg_tile * bm_words;
-    std::vector<aligned_unique_ptr<T>> S_packed_mem_threads(threads);
+    spalm_packing::worker_blocks<T> S_packed_blocks(
+        policy.pack_s ? threads : 0, S_block_size + pad
+    );
+    std::vector<T *> S_packed_mem_threads(threads, nullptr);
     std::vector<aligned_unique_ptr<BIT_DTYPE>> S_bm_threads(threads);
     std::atomic<bool> alloc_failed{false};
+    std::cout << "[dense-packing-buffers] r_bytes="
+              << (policy.pack_r ? (R_block_size + pad) * sizeof(T) : 0)
+              << " r_huge=" << spalm_huge::is_mapped(R_packed_mem)
+              << " s_block_bytes="
+              << (policy.pack_s ? (S_block_size + pad) * sizeof(T) : 0)
+              << " s_shared_huge=" << S_packed_blocks.shared() << std::endl;
 
     omp_set_dynamic(0);
 #pragma omp parallel num_threads(threads)
@@ -364,25 +377,20 @@ void dense_dense_matmul(
 
                         const int worker = omp_get_thread_num();
                         if (policy.pack_s && !S_packed_mem_threads[worker]) {
-                            S_packed_mem_threads[worker] =
-                                try_make_aligned<T>(S_block_size + pad);
+                            T *block = S_packed_blocks.get(worker);
                             if (policy.bitmaps) {
                                 S_bm_threads[worker] =
                                     try_make_aligned<BIT_DTYPE>(S_bm_size);
                             }
-                            if (!S_packed_mem_threads[worker] ||
+                            if (!block ||
                                 (policy.bitmaps && !S_bm_threads[worker])) {
-                                S_packed_mem_threads[worker].reset();
                                 alloc_failed.store(
                                     true, std::memory_order_relaxed
                                 );
                                 continue;
                             }
-                            std::memset(
-                                S_packed_mem_threads[worker].get() +
-                                    S_block_size,
-                                0, pad_bytes
-                            );
+                            std::memset(block + S_block_size, 0, pad_bytes);
+                            S_packed_mem_threads[worker] = block;
                         }
                         auto task = [&](auto fixed) {
                             dense_dense_matmul_task_shared<
@@ -390,7 +398,7 @@ void dense_dense_matmul(
                                 slice_col, R_si_l3, R_slice_start_task,
                                 R_slice_end, S_si, S_slice_end,
                                 R_packed_mem.get(), R_bm.get(),
-                                S_packed_mem_threads[worker].get(),
+                                S_packed_mem_threads[worker],
                                 S_bm_threads[worker].get(), R_ssm, S_ssm, ret,
                                 sparse_result, policy, full_rows
                             );

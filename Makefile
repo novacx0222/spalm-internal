@@ -67,7 +67,8 @@ $(BIN_DIR)/spalm.o: include/method_dispatch.h include/csr_preparation.h \
 $(BIN_DIR)/sparse_sparse_matmul.o: include/csr_preparation.h \
 	include/cpu/sparse_sparse_matmul.h include/cpu/ss_sparse_output.h \
 	include/spalm_sparse_result.h include/huge_pages.h
-$(BIN_DIR)/dense_dense_matmul.o: include/cpu/dense_dense_matmul.h include/cpu/kernel.h
+$(BIN_DIR)/dense_dense_matmul.o: include/cpu/dense_dense_matmul.h include/cpu/kernel.h \
+	include/packing_buffers.h include/huge_pages.h
 $(BIN_DIR)/run_baseline.so: include/util.h include/huge_pages.h
 
 # Portable tests: no AVX-512, MKL or built libraries; run from the repo root.
@@ -118,7 +119,8 @@ test-sparse-output:
 	$(TEST_BIN_DIR)/sparse_output_test
 	OMP_THREAD_LIMIT=2 $(TEST_BIN_DIR)/sparse_output_test
 
-# Huge-page allocations (huge_pages.h): owned arrays and MKL's allocator.
+# Huge-page allocations (huge_pages.h): owned arrays, MKL's allocator and the
+# packing buffers of the dense-path kernels (packing_buffers.h).
 # On Linux also checks that large blocks are 2 MiB aligned and THP eligible.
 test-huge-pages:
 	mkdir -p $(TEST_BIN_DIR)
