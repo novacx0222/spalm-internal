@@ -1,5 +1,5 @@
 # MKL is needed to build the libraries, not to run the portable tests.
-TEST_GOALS := test test-dispatch test-preparation test-sparse-output test-huge-pages test-thresholds test-kernels-native
+TEST_GOALS := test test-dispatch test-preparation test-sparse-output test-huge-pages test-thresholds test-slice-length test-kernels-native
 ifneq ($(filter-out $(TEST_GOALS),$(or $(MAKECMDGOALS),default)),)
 ifndef ONEAPI_ROOT
 $(error ONEAPI_ROOT is not set. Please 'source set_intel_vars.sh'.)
@@ -75,8 +75,8 @@ $(BIN_DIR)/run_baseline.so: include/util.h include/huge_pages.h
 TEST_CXXFLAGS ?= -std=c++20 -O1 -g -fopenmp -fsanitize=address,undefined -fno-omit-frame-pointer
 TEST_BIN_DIR ?= /tmp/spalm-tests
 PYTHON ?= python3
-.PHONY: test test-dispatch test-preparation test-sparse-output test-huge-pages test-thresholds
-test: test-dispatch test-preparation test-sparse-output test-huge-pages test-thresholds
+.PHONY: test test-dispatch test-preparation test-sparse-output test-huge-pages test-thresholds test-slice-length
+test: test-dispatch test-preparation test-sparse-output test-huge-pages test-thresholds test-slice-length
 
 # Forced methods, backend selection and timing output.
 test-dispatch:
@@ -124,6 +124,14 @@ test-huge-pages:
 	mkdir -p $(TEST_BIN_DIR)
 	$(CXX) $(CPPFLAGS) $(TEST_CXXFLAGS) -Iinclude tests/huge_pages_test.cpp $(LDFLAGS) -o $(TEST_BIN_DIR)/huge_pages_test
 	$(TEST_BIN_DIR)/huge_pages_test
+
+# Slice length from counts (slice_length_rule.h): counts against a reference
+# and the decision on uniform, banded and thinly spread inputs.
+test-slice-length:
+	mkdir -p $(TEST_BIN_DIR)
+	$(CXX) $(CPPFLAGS) $(TEST_CXXFLAGS) -Iinclude tests/slice_length_rule_test.cpp $(LDFLAGS) -o $(TEST_BIN_DIR)/slice_length_rule_test
+	$(TEST_BIN_DIR)/slice_length_rule_test
+	OMP_THREAD_LIMIT=2 $(TEST_BIN_DIR)/slice_length_rule_test
 
 # Timing-label parser of find_thresholds.py (standard library only).
 test-thresholds:

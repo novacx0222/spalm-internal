@@ -27,10 +27,11 @@ struct cpu_execution_options {
     // of a slice, so the packed rows DS loads are cache-line aligned (the
     // DD kernel needs 12) (key: ds_aligned_panels).
     bool ds_aligned_panels = true;
-    // Lengthen the slices (up to 2048 keys) while the sparse side's subrows
-    // would hold fewer than 16 entries on average; off when slice_length is
-    // given explicitly (key: auto_slice_length).
-    bool auto_slice_length = true;
+    // Slice length (key: auto_slice_length; 0 when slice_length is given
+    // explicitly). 0: the configured length. 1: up to 4 times it, from
+    // exact counts of subrows and packed slices (slice_length_rule.h).
+    // 2: the earlier rule from global density alone, kept for comparison.
+    int auto_slice_length = 1;
     // The caller zeroed the result (key: result_zeroed, default 1). With 0
     // it holds garbage and the library writes every element: the forced MKL
     // backends overwrite it (GEMM with beta = 0, spmmd), every other path,

@@ -19,6 +19,7 @@
 #include "method_dispatch.h"
 #include "mkl.h"
 #include "slice_decision.h"
+#include "slice_length_rule.h"
 #include "cpu/sparse_sparse_matmul.h"
 #include "spalm_sparse_result.h"
 #include "ss_mat.h"
@@ -244,27 +245,73 @@ static int run_mkl_sparse_output(
     return SPALM_OK;
 }
 
-// Slice length for this call. Each nonempty subrow of a sparse side costs a
-// read-modify-write of its packed-panel outputs per opposite slice, so very
-// short subrows (uniform 1%: about 5 entries at 512 keys) are dominated by
-// that overhead; on encoder-1025 SD/DS/DD ran 36-45% faster at 2048 there,
-// while subrows of about 25 entries or full ones ran best at 512. So the
-// configured length is doubled, up to 2048 and at most K, while the
-// average entries per subrow of the sparse side(s) the decision table uses
-// stay below 16: R for SD, S for DS, the sparser of both for DD or mixed
-// tables. Only SS slice pairs: unchanged.
-static int choose_slice_length(
-    const int configured, const int *Ri, const int M, const int *Si,
-    const int N, const int K
-) {
+// Sides whose subrows the decision table multiplies with packed slices of
+// the other side: R for SD, S for DS, both for DD or mixed tables. Only SS
+// slice pairs: neither, and the slice length stays as configured.
+static void sparse_sides(bool &r_sparse, bool &s_sparse) {
     bool used[4] = {};
     for (int left = 0; left <= num_buckets; ++left)
         for (int right = 0; right <= num_buckets; ++right)
             used[get_alg(left, right)] = true;
-    const bool r_sparse =
-        used[DENSE_DENSE_LEFT_INNER_KERNEL] || used[DENSE_DENSE];
-    const bool s_sparse =
-        used[DENSE_DENSE_RIGHT_INNER_KERNEL] || used[DENSE_DENSE];
+    r_sparse = used[DENSE_DENSE_LEFT_INNER_KERNEL] || used[DENSE_DENSE];
+    s_sparse = used[DENSE_DENSE_RIGHT_INNER_KERNEL] || used[DENSE_DENSE];
+}
+
+// auto_slice_length = 1: the slice length from exact counts of subrows and
+// slices at 1, 2 and 4 times the configured length (slice_length_rule.h).
+static int choose_slice_length_by_counts(
+    const int configured, const int *Ri, const int *Rj, const int M,
+    const int *Si, const int *Sj, const int N, const int K,
+    const int r_height, const int s_height, const int threads
+) {
+    bool r_sparse = false, s_sparse = false;
+    sparse_sides(r_sparse, s_sparse);
+    if (!r_sparse && !s_sparse) return configured;
+    // A length at or beyond K is one slice column; no point going further.
+    int levels = 1;
+    while (levels < slice_length_rule::kMaxLevels &&
+           ((long long) configured << (levels - 1)) < K)
+        ++levels;
+    if (levels == 1) return configured;
+    const auto begin = std::chrono::high_resolution_clock::now();
+    const auto r = slice_length_rule::count_columns(
+        Ri, Rj, M, K, configured, levels, r_height, threads
+    );
+    const auto s = slice_length_rule::count_columns(
+        Si, Sj, N, K, configured, levels, s_height, threads
+    );
+    const auto d = slice_length_rule::choose(r, s, r_sparse, s_sparse);
+    const int length = configured << d.level;
+    print_time(
+        "[slice-length-count]",
+        std::chrono::high_resolution_clock::now() - begin
+    );
+    std::cout << "[slice-length] rule=counts configured=" << configured
+              << " chosen=" << length << " sides="
+              << (r_sparse && s_sparse ? "RS" : r_sparse ? "R" : "S")
+              << " entries_per_subrow=";
+    for (int l = 0; l < levels; ++l)
+        std::cout << (l ? "," : "") << d.per_subrow[l];
+    std::cout << " cost=";
+    for (int l = 0; l < levels; ++l)
+        std::cout << (l ? "," : "") << d.cost[l];
+    std::cout << std::endl;
+    return length;
+}
+
+// auto_slice_length = 2, kept for comparison: the rule of 2026-10-27, from
+// global density alone. It estimates the entries per subrow as if each row
+// spread its entries evenly over K, and doubles the configured length, up to
+// 2048 and at most K, while that estimate stays below 16 (tuned on the
+// uniform encoder-1025 inputs, where the estimate is exact). Clustered rows
+// look far sparser than they are, and the packed slices of the other side
+// are not considered.
+static int choose_slice_length_by_density(
+    const int configured, const int *Ri, const int M, const int *Si,
+    const int N, const int K
+) {
+    bool r_sparse = false, s_sparse = false;
+    sparse_sides(r_sparse, s_sparse);
     if (!r_sparse && !s_sparse) return configured;
     // Stored entries per key of a nonempty row.
     auto density = [K](const int *row_ptrs, const int rows) {
@@ -279,7 +326,7 @@ static int choose_slice_length(
     int length = configured;
     while (length < 2048 && length < K && d * std::min(length, K) < 16.0)
         length *= 2;
-    std::cout << "[slice-length] configured=" << configured
+    std::cout << "[slice-length] rule=density configured=" << configured
               << " chosen=" << length
               << " entries_per_subrow=" << d * std::min(configured, K) << " -> "
               << d * std::min(length, K) << std::endl;
@@ -436,13 +483,19 @@ int spalm_matmul(
         return status;
     }
 
-    const int sl = options.auto_slice_length
-                       ? choose_slice_length(slice_length, Ri, M, Si, N, K)
-                       : slice_length;
-
     // type is validated by spalm(): 0 = float, 1 = double.
     const int R_ik_slice_height = 12;
     const int S_ik_slice_height = type == 0 ? 32 : 16;
+
+    int sl = slice_length;
+    if (options.auto_slice_length == 1) {
+        sl = choose_slice_length_by_counts(
+            slice_length, Ri, Rj, M, Si, Sj, N, K, R_ik_slice_height,
+            S_ik_slice_height, threads
+        );
+    } else if (options.auto_slice_length == 2) {
+        sl = choose_slice_length_by_density(slice_length, Ri, M, Si, N, K);
+    }
 
     ss_matrix<T> R_ssm;
     ss_matrix<T> S_ssm;
@@ -695,11 +748,15 @@ static int spalm_impl(
     options.ds_aligned_panels = get_int("ds_aligned_panels", 1) != 0;
     // An explicit slice_length is used as given.
     options.result_zeroed = get_int("result_zeroed", 1) != 0;
-    options.auto_slice_length = get_int("auto_slice_length", 1) != 0 &&
-                                get_str("slice_length", nullptr) == nullptr;
+    options.auto_slice_length = get_str("slice_length", nullptr) == nullptr
+                                    ? get_int("auto_slice_length", 1)
+                                    : 0;
     {
         const char *page = get_str("ss_output_page_entries", "0");
         options.ss_output_page_entries = atoll(page);
+    }
+    if (options.auto_slice_length < 0 || options.auto_slice_length > 2) {
+        return invalid("auto_slice_length must be 0, 1 (counts) or 2 (density)");
     }
     if (options.ss_column_blocks < -1) {
         return invalid("ss_column_blocks must be -1 (auto), 0, 1 or a count");
