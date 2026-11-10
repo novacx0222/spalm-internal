@@ -750,8 +750,9 @@ def run_asl_stage(args, lib, dtype, calibration_path):
     For each synthetic pair and each of DD, SD and DS, one call without a
     gate (asl_min_cost = 0) gives the rule's choice and its cost0. Where the
     rule lengthens, the call is timed ([slice-mm-total]: slice preparation
-    plus multiplication) at the configured and at the chosen length. The
-    gate is then the cut on cost0 that minimises the geometric mean time
+    plus multiplication) at the configured and at the chosen length, with
+    fresh buffers as in a DuckDB query (fix_mmap_threshold). The gate is
+    then the cut on cost0 that minimises the geometric mean time
     over all those cells (choose_min_cost)."""
     sizes = [int(s) for s in args.asl_sizes.split(",")]
     print(f"\n[asl] slice-length gate: sizes {sizes}, "
@@ -832,7 +833,7 @@ def run_asl_stage(args, lib, dtype, calibration_path):
     calib.update_calibration(
         calibration_path, {"asl_min_cost": min_cost},
         f"find_thresholds.py asl {time.strftime('%Y-%m-%d')}, "
-        f"threads={args.threads}: {note}")
+        f"threads={args.threads}, {args.malloc}: {note}")
     print(f"Updated {calibration_path}")
 
 
@@ -861,12 +862,15 @@ def run_rblock_stage(args, lib, dtype, calibration_path):
     which a huge-page mapping pays.
 
     For each block size, DS and DD calls run alternately with the block on
-    huge pages (r_block_huge_bytes = 0) and never (-1). The difference of the
-    median [mm-total] times is fitted by a line in the block size; its zero,
-    rounded up to a whole MiB, is the threshold (huge_break_even). On the
-    8488C the mapping cost about 0.5 ms flat (one 2 MiB page zeroed in one
-    fault behind the packing barrier) and saved about 60 us per MiB at the
-    free (packing_buffers.h)."""
+    huge pages (r_block_huge_bytes = 0) and never (-1). Every buffer is a
+    fresh mapping, as in a DuckDB query (fix_mmap_threshold, set by main).
+    The difference of the median [mm-total] times is fitted by a line in the
+    block size; its zero, rounded up to a whole MiB, is the threshold
+    (huge_break_even). On the 8488C the mapping cost about 0.5 ms flat (one
+    2 MiB page zeroed in one fault behind the packing barrier) and saved
+    about 60 us per MiB at the free (packing_buffers.h). v32's run, without
+    fresh buffers, found that it never paid: glibc then hands a freed block
+    below 32 MiB, already touched, to the next call."""
     print(f"\n[rblock] R block huge pages: {args.warmup} warmup + "
           f"{args.rblock_trials} timed runs per setting")
     S = generate_fixed_rows_csr(RBLOCK_S_ROWS, RBLOCK_K, RBLOCK_KEYS,
@@ -928,7 +932,7 @@ def run_rblock_stage(args, lib, dtype, calibration_path):
     calib.update_calibration(
         calibration_path, {"r_block_huge_bytes": value},
         f"find_thresholds.py rblock {time.strftime('%Y-%m-%d')}, "
-        f"threads={args.threads}: {note}")
+        f"threads={args.threads}, {args.malloc}: {note}")
     print(f"Updated {calibration_path}")
 
 
@@ -1003,11 +1007,24 @@ def main():
         "calibration.txt"
 
     lib = load_so("spalm.so")
+    args.malloc = "malloc default"
     # rblock before asl: the asl stage's timings then use the R block
     # threshold this run measured, as the library will.
     for stage in STAGES:
         if stage not in stages:
             continue
+        if stage != "table" and args.malloc == "malloc default":
+            # From here on every large buffer is a fresh mapping, as in the
+            # one call of a DuckDB query (the table stage, kernel times only,
+            # runs as before).
+            if calib.fix_mmap_threshold():
+                args.malloc = "fresh buffers"
+                print(f"\n[malloc] mmap threshold fixed at "
+                      f"{calib.FRESH_MMAP_THRESHOLD} bytes: every buffer from "
+                      f"there on is mapped and unmapped per call")
+            else:
+                args.malloc = "no glibc"
+                print("\n[malloc] no glibc: allocation left as it is")
         if stage == "table":
             run_table_stage(args, lib, dtype)
         elif stage == "rblock":

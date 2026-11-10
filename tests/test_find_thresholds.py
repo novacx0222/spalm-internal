@@ -226,6 +226,16 @@ class HugeBreakEvenTest(unittest.TestCase):
             calib.huge_break_even([(self.MIB, 0.1), (4 * self.MIB, 0.2)])
 
 
+class FixMmapThresholdTest(unittest.TestCase):
+    def test_set_with_glibc_only(self):
+        # Runs last in its process: the setting stays for the process.
+        expected = sys.platform.startswith("linux")
+        if expected:
+            import ctypes
+            expected = hasattr(ctypes.CDLL(None), "mallopt")
+        self.assertEqual(calib.fix_mmap_threshold(), expected)
+
+
 class MedianTest(unittest.TestCase):
     def test_median(self):
         self.assertEqual(calib.median([3, 1, 2]), 2)

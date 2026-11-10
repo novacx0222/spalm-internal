@@ -13,6 +13,7 @@ matrices the scripts generate on the spot.
 
 import math
 import os
+import sys
 from pathlib import Path
 
 CALIBRATED_KEYS = ("asl_min_cost", "r_block_huge_bytes", "ss_page_huge_entries")
@@ -177,6 +178,42 @@ def huge_break_even(points):
     if b >= 0 or a + b * hi > 0:
         return -1, (a, b)
     return max(HUGE_BYTES, int(math.ceil(-a / b)) * MIB), (a, b)
+
+
+# glibc's mallopt parameter (malloc.h), and the threshold that
+# fix_mmap_threshold keeps: glibc's initial one.
+M_MMAP_THRESHOLD = -3
+FRESH_MMAP_THRESHOLD = 128 * 1024
+
+
+def fix_mmap_threshold(threshold=FRESH_MMAP_THRESHOLD):
+    """Keep glibc's mmap threshold at `threshold` for the rest of the process,
+    so that every buffer of that size or more is a mapping of its own.
+
+    glibc raises the threshold, up to 32 MiB, whenever a mapped block is
+    freed. In a process that calls spalm() many times, later buffers below
+    that size then come from heap memory an earlier call already touched: no
+    page faults, nothing to unmap. A DuckDB query calls spalm() once in its
+    process and gets fresh mappings: in v26/v27 the R blocks of 2 to 13 MiB
+    on 4 KiB pages were unmapped after each call (about 60 us per MiB), and
+    huge pages paid from about 8 MiB. Measured with reused memory, the
+    mapping looked like it never paid, and longer slices looked cheaper
+    than they are. Setting the threshold also turns glibc's adjustment off.
+
+    Returns True when set, False when there is no glibc (not Linux), where
+    nothing is changed."""
+    if not sys.platform.startswith("linux"):
+        return False
+    import ctypes
+    try:
+        mallopt = ctypes.CDLL(None).mallopt
+    except AttributeError:
+        return False
+    mallopt.argtypes = (ctypes.c_int, ctypes.c_int)
+    mallopt.restype = ctypes.c_int
+    if mallopt(M_MMAP_THRESHOLD, threshold) != 1:
+        raise OSError(f"mallopt(M_MMAP_THRESHOLD, {threshold}) failed")
+    return True
 
 
 def median(values):
