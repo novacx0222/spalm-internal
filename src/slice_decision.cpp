@@ -281,3 +281,68 @@ bool read_tile_sizes(
     file.close();
     return true;
 }
+
+bool read_calibration(
+    const int type, const char *platform, const char *file,
+    calibration_values &out
+) {
+    out = calibration_values{};
+    if (file && std::strcmp(file, "none") == 0) return true;
+    const bool custom_file = file && file[0] != '\0';
+    std::string path;
+    if (custom_file) {
+        path = file;
+    } else {
+        const std::string params_base = resolve_path_near_lib(
+            reinterpret_cast<void *>(&read_calibration), "../parameters",
+            "parameters"
+        );
+        path = params_base + "/" + platform + (type == 0 ? "/float" : "/double") +
+               "/calibration.txt";
+    }
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        if (!custom_file) return true; // optional at the default place
+        std::cerr << "Error: calibration file not found: " << path << std::endl;
+        return false;
+    }
+    auto trim = [](std::string s) {
+        const char *blank = " \t\r\n";
+        const size_t b = s.find_first_not_of(blank);
+        if (b == std::string::npos) return std::string();
+        return s.substr(b, s.find_last_not_of(blank) - b + 1);
+    };
+    std::string line;
+    int number = 0;
+    while (std::getline(in, line)) {
+        ++number;
+        const size_t hash = line.find('#');
+        if (hash != std::string::npos) line.resize(hash);
+        line = trim(line);
+        if (line.empty()) continue;
+        const size_t colon = line.find(':');
+        const std::string key =
+            colon == std::string::npos ? "" : trim(line.substr(0, colon));
+        const std::string value =
+            colon == std::string::npos ? "" : trim(line.substr(colon + 1));
+        if (key.empty() || value.empty()) {
+            std::cerr << "Error: invalid calibration file " << path << " line "
+                      << number << ": expected \"key: value\"" << std::endl;
+            return false;
+        }
+        bool calibrated = false;
+        for (const char *k : kCalibratedKeys) calibrated |= key == k;
+        if (!calibrated) {
+            out.ignored.push_back(key);
+            continue;
+        }
+        if (out.find(key.c_str())) {
+            std::cerr << "Error: invalid calibration file " << path << ": "
+                      << key << " appears twice" << std::endl;
+            return false;
+        }
+        out.values.emplace_back(key, value);
+    }
+    out.path = path;
+    return true;
+}

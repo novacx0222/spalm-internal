@@ -352,7 +352,10 @@ static void spgemm_rows_sparse_result_vanilla(
 ) {
     csr<T> &R_csr = R_ssm.csr_mat;
     auto output = std::make_shared<ss_sparse_output<T>>(
-        static_cast<size_t>(std::max(0LL, options.ss_output_page_entries))
+        static_cast<size_t>(std::max(0LL, options.ss_output_page_entries)),
+        options.ss_page_huge_entries < 0
+            ? ss_row_output<T>::kNeverHuge
+            : static_cast<size_t>(options.ss_page_huge_entries)
     );
     ss_sparse_product(
         *output, threads, R_csr.rows, N, R_csr.cols, R_csr.row_ptrs,

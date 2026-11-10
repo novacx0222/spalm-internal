@@ -399,6 +399,41 @@ void check_huge_pages() {
     ++cases;
 }
 
+// ss_page_huge_entries: the same row with the threshold moved. Never: no
+// page is mapped. From 512 Ki entries: the 512 Ki, 1 Mi and 2 Mi pages are
+// (on Linux), the smaller ones are not. The entries are the same.
+void check_huge_page_threshold() {
+    using rows_t = ss_row_output<double>;
+    const size_t big = rows_t::kHugePage;
+    const int N = static_cast<int>(big - rows_t::kFirstPage + 3);
+    for (const size_t from : {rows_t::kNeverHuge, size_t(1) << 19}) {
+        ss_sparse_output<double> out(0, from);
+        out.start(1, N);
+        auto &rows = out.local(0);
+        double *acc = rows.row_buffer();
+        for (int j = 0; j < N; ++j) acc[j] = j + 1;
+        rows.begin_block(0);
+        ss_emit_range(rows, acc, 0, N);
+        rows.end_row();
+        rows.end_block();
+        spalm_sparse_result result;
+        out.finish(result);
+        bool ok = out.pages() == 6 && result.entries == N;
+#if defined(__linux__)
+        const size_t want =
+            from == rows_t::kNeverHuge ? 0 : (size_t(7) << 19) * 12;
+#else
+        const size_t want = 0;
+#endif
+        ok = ok && out.huge_page_bytes() == want;
+        if (!ok)
+            std::printf("FAIL huge page threshold %zu: %zu huge bytes\n", from,
+                        out.huge_page_bytes());
+        failures += !ok;
+        ++cases;
+    }
+}
+
 // Part 2: the C API through spalm.cpp.
 template <typename T> int type_of() { return sizeof(T) == 4 ? 0 : 1; }
 
@@ -771,6 +806,7 @@ int main() {
     check_emit_semantics<float>();
     check_pages();
     check_huge_pages();
+    check_huge_page_threshold();
     check_api_rejects_and_exits();
     std::printf("%s: %d sparse output cases (row loop x threads x pages x "
                 "column blocks, emit semantics, page splits, default page "

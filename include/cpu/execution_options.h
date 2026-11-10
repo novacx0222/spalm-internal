@@ -80,6 +80,17 @@ struct cpu_execution_options {
     long long r_block_huge_bytes = 8LL << 20;
     long long s_blocks_huge_bytes = 2LL << 20;
 
+    // SS with sparse output: pages of at least this many entries are on
+    // huge pages, smaller ones come from malloc (ss_sparse_output.h); -1:
+    // never (key: ss_page_huge_entries).
+    long long ss_page_huge_entries = 1LL << 21;
+
+    // asl_min_cost, r_block_huge_bytes and ss_page_huge_entries may also come
+    // from parameters/cpu/<type>/calibration.txt, written per machine by
+    // find_thresholds.py and calibrate_run.py from synthetic inputs. A key
+    // given to spalm() wins over the file, the file over these defaults
+    // (keys: calibration_file = a path, or "none" to skip the file).
+
     // Automatic SS column blocks (ss_column_blocks = -1): at least this many
     // output columns per block, and each block's part of S^T sized to the
     // shared cache divided by this (keys: ss_column_block_min_cols,

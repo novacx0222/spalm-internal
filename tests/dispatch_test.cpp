@@ -327,11 +327,19 @@ template <class T> void check_tunables() {
     T rv[] = {2, 6, -1, 3};
     int si[] = {0, 3, 4}, sj[] = {0, 1, 3, 2};
     T sv[] = {4, 8, 5, 7};
+    // Without calibration_file in c, no calibration.txt is read, so the
+    // built-in defaults hold even where the scripts wrote one.
     auto run = [&](const conf &c, int *status) {
         std::vector<const char *> keys{"threads"}, vals{"2"};
+        bool calibration_given = false;
         for (const auto &[k, v] : c) {
             keys.push_back(k);
             vals.push_back(v);
+            calibration_given |= std::string(k) == "calibration_file";
+        }
+        if (!calibration_given) {
+            keys.push_back("calibration_file");
+            vals.push_back("none");
         }
         T output[4] = {};
         backend_calls = 0;
@@ -360,13 +368,94 @@ template <class T> void check_tunables() {
               " auto_slice_length=1 asl_min_cost=3e+09 "
               "asl_subrow_write_entries=16 asl_min_cost_ratio=0.9 "
               "asl_max_levels=3 ",
-              " r_block_huge_bytes=8388608 s_blocks_huge_bytes=2097152 ",
+              " r_block_huge_bytes=8388608 s_blocks_huge_bytes=2097152 "
+              "ss_page_huge_entries=2097152 ",
               " ss_column_blocks=-1 ss_column_block_min_cols=256 "
               "ss_column_block_cache_divisor=3 "})
             assert(line.find(want) != std::string::npos);
         assert(count(log, "[conf-unused]") == 0);
         assert(count(log, "[weighted-cost]") == 0);
+        assert(count(log, "[calibration] file=none used=-\n") == 1);
         check_timing_format(log);
+    }
+    // calibration.txt: its values replace the defaults of the calibrated
+    // keys, a key given to spalm() wins over it, other keys are listed and
+    // ignored; a missing explicit file or a malformed line is a
+    // configuration error, a bad value is rejected like the same key.
+    {
+        auto file = [](const char *text) {
+            char path[] = "/tmp/spalm-dispatch-calibration-XXXXXX";
+            const int fd = mkstemp(path);
+            assert(fd >= 0);
+            close(fd);
+            std::ofstream(path) << text;
+            return std::string(path);
+        };
+        const std::string good = file(
+            "# measured on synthetic inputs\n"
+            "asl_min_cost: 5e9\n"
+            "r_block_huge_bytes: 4194304  # 4 MiB\n"
+            "\n"
+            "ss_page_huge_entries: -1\n"
+            "later_key: 7\n"
+        );
+        std::string log =
+            run({{"init_method", "sparse"}, {"calibration_file", good.c_str()}},
+                &status);
+        assert(status == SPALM_OK && backend_calls == 1);
+        std::string line = conf_line(log);
+        for (const char *want :
+             {" asl_min_cost=5e+09 ", " r_block_huge_bytes=4194304 ",
+              " ss_page_huge_entries=-1 "})
+            assert(line.find(want) != std::string::npos);
+        assert(
+            count(log, "[calibration] file=" + good +
+                           " used=asl_min_cost,r_block_huge_bytes,"
+                           "ss_page_huge_entries ignored=later_key\n") == 1
+        );
+        assert(count(log, "[conf-unused]") == 0);
+        log = run(
+            {{"init_method", "sparse"},
+             {"calibration_file", good.c_str()},
+             {"asl_min_cost", "1e10"},
+             {"ss_page_huge_entries", "1048576"}},
+            &status
+        );
+        assert(status == SPALM_OK && backend_calls == 1);
+        line = conf_line(log);
+        for (const char *want :
+             {" asl_min_cost=1e+10 ", " r_block_huge_bytes=4194304 ",
+              " ss_page_huge_entries=1048576 "})
+            assert(line.find(want) != std::string::npos);
+        assert(
+            count(log, "[calibration] file=" + good +
+                           " used=r_block_huge_bytes ignored=later_key\n") == 1
+        );
+        std::remove(good.c_str());
+
+        const std::string missing = good + "-missing";
+        const std::string no_colon = file("asl_min_cost 5e9\n");
+        const std::string twice =
+            file("asl_min_cost: 5e9\nasl_min_cost: 6e9\n");
+        const std::string empty_value = file("r_block_huge_bytes:\n");
+        for (const std::string &bad : {missing, no_colon, twice, empty_value}) {
+            run({{"init_method", "sparse"}, {"calibration_file", bad.c_str()}},
+                &status);
+            assert(status == SPALM_CONFIG_ERROR && backend_calls == 0);
+        }
+        const std::string not_number = file("r_block_huge_bytes: 1 MiB\n");
+        const std::string out_of_range = file("ss_page_huge_entries: -2\n");
+        const std::string negative_cost = file("asl_min_cost: -1\n");
+        for (const std::string &bad :
+             {not_number, out_of_range, negative_cost}) {
+            run({{"init_method", "sparse"}, {"calibration_file", bad.c_str()}},
+                &status);
+            assert(status == SPALM_INVALID_ARGUMENT && backend_calls == 0);
+        }
+        for (const std::string &f :
+             {no_colon, twice, empty_value, not_number, out_of_range,
+              negative_cost})
+            std::remove(f.c_str());
     }
     // Values are read and printed; 5e8 is an integer; misspelled keys are
     // listed, the operator's own keys are not.
@@ -426,6 +515,8 @@ template <class T> void check_tunables() {
         {{"asl_max_levels", "4"}},
         {{"r_block_huge_bytes", "-2"}},
         {{"s_blocks_huge_bytes", "1 MiB"}},
+        {{"ss_page_huge_entries", "-2"}},
+        {{"ss_page_huge_entries", "2.5"}},
         {{"ss_column_block_min_cols", "0"}},
         {{"ss_column_block_cache_divisor", "0"}},
         {{"ss_column_block_cache_divisor", "3000000000"}},
@@ -444,6 +535,8 @@ template <class T> void check_tunables() {
           conf{{"auto_sparse_ratio", "0"}},
           conf{{"cost_weight_ss", "0"}},
           conf{{"r_block_huge_bytes", "0"}, {"s_blocks_huge_bytes", "-1"}},
+          conf{{"ss_page_huge_entries", "-1"}},
+          conf{{"ss_page_huge_entries", "0"}},
           conf{{"asl_max_levels", "1"}}}) {
         conf c = ok;
         c.push_back({"init_method", "sparse"});

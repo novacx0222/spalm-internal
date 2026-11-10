@@ -40,7 +40,8 @@ template <typename T> class ss_sparse_output;
 // first row and the row offsets into its page.
 template <typename T> class ss_row_output {
 public:
-    ss_row_output(size_t fixed_page, int N) : fixed_page_(fixed_page), N_(N) {}
+    ss_row_output(size_t fixed_page, int N, size_t huge_from = kHugePage)
+        : fixed_page_(fixed_page), huge_from_(huge_from), N_(N) {}
 
     // The dense buffer of one output row: N values, zero between rows.
     // Allocated and first touched by the thread that uses it.
@@ -83,8 +84,11 @@ public:
     // per GB. Smaller pages come from malloc, which in queries with up to
     // some 20M result entries reuses memory the query already freed; on
     // fresh huge mappings these were slower (x1.15 for 3-20M entries, v23
-    // SuiteSparse set on the 8488C).
+    // SuiteSparse set on the 8488C). Default of the ss_page_huge_entries key,
+    // which calibrate_run.py --page-sweep measures per machine.
     static constexpr size_t kHugePage = size_t(1) << 21;
+    // ss_page_huge_entries = -1: no page on huge pages.
+    static constexpr size_t kNeverHuge = SIZE_MAX;
 
 private:
     friend class ss_sparse_output<T>;
@@ -131,7 +135,7 @@ private:
             : pages_.empty()
                 ? kFirstPage
                 : std::min(kMaxPage, pages_.back().capacity * 2);
-        const bool huge = cap >= kHugePage;
+        const bool huge = cap >= huge_from_;
         page p{
             spalm_huge::make_for_overwrite<int>(cap, huge),
             spalm_huge::make_for_overwrite<T>(cap, huge), cap
@@ -144,6 +148,7 @@ private:
     }
 
     size_t fixed_page_;
+    size_t huge_from_;
     int N_;
     std::unique_ptr<T[]> acc_;
     std::vector<page> pages_;
@@ -161,15 +166,20 @@ private:
 template <typename T> class ss_sparse_output {
 public:
     // page_entries: entries per page (0: pages grow from 64 Ki to 4 Mi
-    // entries; at least 64). Small fixed pages are for tests.
-    explicit ss_sparse_output(size_t page_entries = 0)
-        : fixed_page_(page_entries ? std::max<size_t>(page_entries, 64) : 0) {
-    }
+    // entries; at least 64). Small fixed pages are for tests. Pages of at
+    // least huge_from entries are on huge pages (kNeverHuge: none).
+    explicit ss_sparse_output(
+        size_t page_entries = 0,
+        size_t huge_from = ss_row_output<T>::kHugePage
+    )
+        : fixed_page_(page_entries ? std::max<size_t>(page_entries, 64) : 0),
+          huge_from_(huge_from) {}
 
     void start(int threads, int N) {
         threads_.clear();
         threads_.reserve(static_cast<size_t>(threads));
-        for (int t = 0; t < threads; ++t) threads_.emplace_back(fixed_page_, N);
+        for (int t = 0; t < threads; ++t)
+            threads_.emplace_back(fixed_page_, N, huge_from_);
     }
     ss_row_output<T> &local(int thread) {
         return threads_[static_cast<size_t>(thread)];
@@ -232,6 +242,7 @@ public:
 
 private:
     size_t fixed_page_;
+    size_t huge_from_;
     std::vector<ss_row_output<T>> threads_;
 };
 

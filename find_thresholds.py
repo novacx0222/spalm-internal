@@ -14,16 +14,31 @@ Key optimisations over a naive BxB sweep:
     if a non-SS algorithm wins for --early-stop consecutive right buckets,
     the first of those buckets becomes the threshold and the row is done.
 
-Produces:
+Produces (stage "table"):
   - decision_thresholds.txt  (threshold file for spalm)
   - algorithm_map.csv        (detailed timings)
   - algorithm_map.png        (heatmap visualization)
+
+Stages "rblock" and "asl" measure two defaults of calibration.txt
+(parameters/<platform>/<type>/, read by the library on every call; a key
+given to spalm() wins), on inputs generated here, never on SuiteSparse or
+grid matrices:
+  - r_block_huge_bytes: the R packing block size from which a huge-page
+    mapping pays (DS and DD, mapped against not mapped);
+  - asl_min_cost: the smallest modelled cost at which the slice-length rule
+    may lengthen (DD, SD and DS at the configured and the chosen length).
+Each writes its cells (rblock_cells.csv, asl_cells.csv) next to it.
+The third key, ss_page_huge_entries, is measured end to end through DuckDB
+(calibrate_run.py --page-sweep, an experiment script kept outside this
+repository), with the same file helpers (spalm_calibration.py).
 """
 
 import argparse
+import csv
 import ctypes
 import math
 import re
+import time
 from io import StringIO
 from pathlib import Path
 
@@ -32,7 +47,10 @@ from scipy.sparse import random as sparse_random, csr_matrix
 from sklearn.isotonic import IsotonicRegression
 from wurlitzer import STDOUT, pipes
 
-from spalm_timing import DENSE_MM_LABEL, SPARSE_MM_LABEL, parse_time
+import spalm_calibration as calib
+from spalm_timing import (DENSE_MM_LABEL, MM_TOTAL_LABEL,
+                          SLICE_MM_TOTAL_LABEL, SPARSE_MM_LABEL,
+                          parse_r_block, parse_slice_length, parse_time)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SPALM_BIN = SCRIPT_DIR / "bin"
@@ -86,8 +104,12 @@ def _make_kv_params(d):
 
 
 def call_spalm(lib, A_csr, B_csr, C, init_method, dtype, slice_length,
-               threads=4):
-    """Call spalm with a given init_method, return captured stdout."""
+               threads=4, extra=None):
+    """Call spalm with a given init_method, return captured stdout.
+
+    slice_length None leaves the key out, so the library applies its
+    slice-length rule (auto_slice_length = 1) from the configured length.
+    `extra` adds further keys (e.g. asl_min_cost, r_block_huge_bytes)."""
     M, K = A_csr.shape
     N, _ = B_csr.shape
     C.fill(0)
@@ -95,11 +117,10 @@ def call_spalm(lib, A_csr, B_csr, C, init_method, dtype, slice_length,
     type_num = 0 if dtype == np.float32 else 1
 
     func = lib.spalm
-    params = {
-        "init_method": init_method,
-        "slice_length": slice_length,
-        "threads": threads,
-    }
+    params = {"init_method": init_method, "threads": threads}
+    if slice_length is not None:
+        params["slice_length"] = slice_length
+    params.update(extra or {})
     n, keys_arr, vals_arr = _make_kv_params(params)
 
     out = StringIO()
@@ -234,39 +255,9 @@ def print_smoothing_summary(name, keys, before_vals, after_vals,
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Find algorithm decision thresholds")
-    parser.add_argument("--size", type=int, default=2048,
-                        help="Square matrix dimension (default: 2048)")
-    parser.add_argument("--step", type=int, default=1,
-                        help="Bucket step size for sampling (default: 5)")
-    parser.add_argument("--dtype", choices=["float32", "float64"],
-                        default="float32")
-    parser.add_argument("--slice-length", type=int, default=1024,
-                        help="Slice length / BK (default: 1024)")
-    parser.add_argument("--num-buckets", type=int, default=100)
-    parser.add_argument("--platform", choices=["cpu"], default="cpu",
-                        help="Target platform (default: cpu)")
-    parser.add_argument("--output-dir", type=str, default=None,
-                        help="Output dir (default: parameters/<platform>/<type>/)")
-    parser.add_argument("--warmup", type=int, default=1,
-                        help="Warmup runs before timing (default: 1)")
-    parser.add_argument("--trials", type=int, default=3,
-                        help="Timed runs, keep best (default: 3)")
-    parser.add_argument("--threads", type=int, default=4,
-                        help="CPU threads (default: 4, CPU platform only)")
-    parser.add_argument("--early-stop", type=int, default=3,
-                        help="Consecutive non-winner tests to stop a row "
-                             "(default: 3)")
-    parser.add_argument("--log-buckets", action="store_true", default=False,
-                        help="Use logarithmic bucket spacing")
-    parser.add_argument("--curvature", type=int, default=50,
-                        help="Log curvature parameter C (int, default 50 "
-                             "=> ~10%% of buckets below 1%% density)")
-    args = parser.parse_args()
-
-    dtype = np.float32 if args.dtype == "float32" else np.float64
+def run_table_stage(args, lib, dtype):
+    """Stage "table": decision_thresholds.txt (ss_upper, ri_upper,
+    left_dense_threshold) from kernel times on uniform square inputs."""
     M = K = N = args.size
     BK = args.slice_length
     num_buckets = args.num_buckets
@@ -289,9 +280,6 @@ def main():
     if buckets[-1] != num_buckets:
         buckets.append(num_buckets)
     n = len(buckets)
-
-    # -- Load library and build a platform-specific call closure ---------------
-    lib = load_so("spalm.so")
 
     def call_fn(*, A_csr, B_csr, C, init_method):
         return call_spalm(lib, A_csr, B_csr, C, init_method,
@@ -617,6 +605,415 @@ def main():
         print(f"Saved {png_path}")
     except ImportError:
         print("matplotlib not available, skipping heatmap")
+
+
+# ---------------------------------------------------------------------------
+# Stages "asl" and "rblock": calibration.txt (spalm_calibration.py)
+# ---------------------------------------------------------------------------
+
+# The dense-path kernels whose packing buffers and slice length these stages
+# calibrate (forced init_method, as in the table stage).
+DENSE_METHODS = {
+    "DD": "dense_bm_inner_kernel",
+    "SD": "dense_left_spmm_inner_kernel",
+    "DS": "dense_right_spmm_inner_kernel",
+}
+
+def run_dense(lib, A_csr, B_csr, C, method, dtype, threads, label,
+              slice_length=None, extra=None):
+    """One forced dense-path call: (seconds at `label`, native output)."""
+    M, N = A_csr.shape[0], B_csr.shape[0]
+    out = call_spalm(lib, A_csr, B_csr, C[:M * N], DENSE_METHODS[method],
+                     dtype, slice_length, threads, extra)
+    try:
+        if re.search(r"(?m)^\s*Fallback:", out):
+            raise ValueError("unexpected MKL fallback in a forced internal mode")
+        value = parse_time(out, label)
+        if value is None:
+            raise ValueError(f"no {label} line")
+    except ValueError as exc:
+        raise BenchmarkError(
+            f"{method}: {exc}\n--- native output ---\n{out.strip()}\n"
+            f"--- end ---") from exc
+    return value, out
+
+
+def interleaved(run_a, run_b, warmup, trials):
+    """Median times of two settings, run alternately (a b, b a, ...) so that
+    drift over the stage hits both alike. Each run returns (seconds, out);
+    also returns the last output of each."""
+    for _ in range(warmup):
+        run_a()
+        run_b()
+    times_a, times_b = [], []
+    out_a = out_b = None
+    for t in range(trials):
+        order = ((run_a, times_a), (run_b, times_b))
+        for fn, times in (order if t % 2 == 0 else order[::-1]):
+            value, out = fn()
+            times.append(value)
+            if times is times_a:
+                out_a = out
+            else:
+                out_b = out
+    return calib.median(times_a), calib.median(times_b), out_a, out_b
+
+
+def as_spalm_csr(mat, dtype):
+    """CSR with sorted, duplicate-free int32 indices and contiguous values,
+    as spalm() reads them."""
+    mat = csr_matrix(mat, dtype=dtype)
+    mat.sum_duplicates()
+    mat.indptr = mat.indptr.astype(np.int32)
+    mat.indices = mat.indices.astype(np.int32)
+    mat.data = np.ascontiguousarray(mat.data, dtype=dtype)
+    return mat
+
+
+def _random_values(rng, count, dtype):
+    values = rng.standard_normal(count).astype(dtype)
+    values[values == 0] = dtype(1e-6)
+    return values
+
+
+def generate_powerlaw_csr(rows, cols, mean_degree, dtype=np.float64,
+                          seed=None, alpha=2.0, zipf=0.7):
+    """Graph-like rows: Pareto(alpha) row degrees of the given mean, keys
+    drawn with Zipf(zipf) popularity over a random permutation of the keys
+    (hub columns spread over the key range). Repeated keys in a row merge,
+    so the stored mean is somewhat below `mean_degree`."""
+    rng = np.random.default_rng(seed)
+    scale = mean_degree * (alpha - 1) / alpha  # Pareto(alpha, 1) mean is alpha/(alpha-1)
+    degree = np.clip(np.rint(scale * (rng.pareto(alpha, rows) + 1.0)), 1, cols)
+    degree = degree.astype(np.int64)
+    weights = np.arange(1, cols + 1, dtype=np.float64) ** -zipf
+    weights /= weights.sum()
+    keys = rng.permutation(cols)[
+        rng.choice(cols, size=int(degree.sum()), p=weights)]
+    row_of = np.repeat(np.arange(rows, dtype=np.int64), degree)
+    flat = np.unique(row_of * cols + keys)
+    indptr = np.zeros(rows + 1, dtype=np.int64)
+    np.cumsum(np.bincount(flat // cols, minlength=rows), out=indptr[1:])
+    mat = csr_matrix(
+        (_random_values(rng, flat.size, dtype), flat % cols, indptr),
+        shape=(rows, cols))
+    return as_spalm_csr(mat, dtype)
+
+
+def generate_fixed_rows_csr(rows, cols, per_row, dtype=np.float64, seed=None):
+    """Every row holds `per_row` distinct keys, uniform over [0, cols)."""
+    rng = np.random.default_rng(seed)
+    keys = np.sort(np.stack(
+        [rng.choice(cols, per_row, replace=False) for _ in range(rows)]),
+        axis=1)
+    indptr = np.arange(0, rows * per_row + 1, per_row, dtype=np.int64)
+    mat = csr_matrix(
+        (_random_values(rng, rows * per_row, dtype), keys.ravel(), indptr),
+        shape=(rows, cols))
+    return as_spalm_csr(mat, dtype)
+
+
+# asl stage inputs: square n x n, R and S drawn independently. Uniform rows
+# at these densities hold fewer than asl_subrow_write_entries (16) entries
+# per subrow at 512, so the rule considers longer slices; the power-law
+# pairs stand in for the graph-like inputs on which the model overrated
+# longer slices (slice_length_rule.h).
+ASL_UNIFORM_DENSITIES = (0.002, 0.005, 0.01, 0.02)
+ASL_POWERLAW_DEGREES = (8, 32)
+
+
+def asl_cases(sizes):
+    """(name, n, kind, density or mean degree, seed) per asl input pair."""
+    seed = 1000
+    for n in sizes:
+        for density in ASL_UNIFORM_DENSITIES:
+            seed += 2
+            yield f"u{n}_d{density:g}", n, "uniform", density, seed
+        for degree in ASL_POWERLAW_DEGREES:
+            seed += 2
+            yield f"p{n}_k{degree}", n, "powerlaw", degree, seed
+
+
+def make_asl_pair(n, kind, param, seed, dtype):
+    if kind == "uniform":
+        R = generate_uniform_csr(n, n, param, dtype=dtype, seed=seed)
+        S = generate_uniform_csr(n, n, param, dtype=dtype, seed=seed + 1)
+        return as_spalm_csr(R, dtype), as_spalm_csr(S, dtype)
+    return (generate_powerlaw_csr(n, n, param, dtype=dtype, seed=seed),
+            generate_powerlaw_csr(n, n, param, dtype=dtype, seed=seed + 1))
+
+
+def run_asl_stage(args, lib, dtype, calibration_path):
+    """Stage "asl": asl_min_cost, the smallest modelled cost at which the
+    slice-length rule (auto_slice_length = 1) may lengthen.
+
+    For each synthetic pair and each of DD, SD and DS, one call without a
+    gate (asl_min_cost = 0) gives the rule's choice and its cost0. Where the
+    rule lengthens, the call is timed ([slice-mm-total]: slice preparation
+    plus multiplication) at the configured and at the chosen length. The
+    gate is then the cut on cost0 that minimises the geometric mean time
+    over all those cells (choose_min_cost)."""
+    sizes = [int(s) for s in args.asl_sizes.split(",")]
+    print(f"\n[asl] slice-length gate: sizes {sizes}, "
+          f"{args.warmup} warmup + {args.asl_trials} timed runs per length")
+    C = np.empty(max(sizes) ** 2, dtype=dtype)
+    rows = []
+    for name, n, kind, param, seed in asl_cases(sizes):
+        R, S = make_asl_pair(n, kind, param, seed, dtype)
+        print(f"  {name}: nnz R={R.nnz} S={S.nnz}")
+        for method in DENSE_METHODS:
+            _, out = run_dense(lib, R, S, C, method, dtype, args.threads,
+                               SLICE_MM_TOTAL_LABEL,
+                               extra={"asl_min_cost": 0})
+            try:
+                probe = parse_slice_length(out)
+            except ValueError as exc:
+                raise BenchmarkError(f"{name} {method}: {exc}") from exc
+            row = {"case": name, "method": method, "n": n,
+                   "nnz_r": R.nnz, "nnz_s": S.nnz}
+            if probe is None:
+                print(f"    {method}: rule did not run")
+                rows.append(row)
+                continue
+            configured, chosen, sides, cost0 = probe
+            row.update(configured=configured, chosen=chosen, sides=sides,
+                       cost0=cost0)
+            if chosen == configured:
+                print(f"    {method}: cost0={cost0:.3g} keeps {configured}")
+                rows.append(row)
+                continue
+
+            def at(length):
+                return lambda: run_dense(lib, R, S, C, method, dtype,
+                                         args.threads, SLICE_MM_TOTAL_LABEL,
+                                         slice_length=length)
+
+            t_base, t_long, _, _ = interleaved(
+                at(configured), at(chosen), args.warmup, args.asl_trials)
+            row.update(t_base=t_base, t_long=t_long)
+            print(f"    {method}: cost0={cost0:.3g} {configured}->{chosen} "
+                  f"{t_base * 1e3:.2f} -> {t_long * 1e3:.2f} ms "
+                  f"({t_long / t_base:.3f}x)")
+            rows.append(row)
+        del R, S
+    del C
+
+    timed = [r for r in rows if "t_base" in r]
+    out_dir = calibration_path.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if not timed:
+        print("[asl] the rule lengthened no input; asl_min_cost unchanged")
+        write_rows(out_dir / "asl_cells.csv", rows, ASL_COLUMNS)
+        return
+    cells = [(r["cost0"], r["t_base"], r["t_long"]) for r in timed]
+    min_cost, lengthened = calib.choose_min_cost(cells)
+    for i, r in enumerate(timed):
+        r["lengthened"] = int(i in lengthened)
+    write_rows(out_dir / "asl_cells.csv", rows, ASL_COLUMNS)
+
+    base_sum = sum(c[1] for c in cells)
+    gated_sum = sum(c[2] if i in lengthened else c[1]
+                    for i, c in enumerate(cells))
+    long_sum = sum(c[2] for c in cells)
+    gated_log = sum(math.log(c[2] / c[1]) for i, c in enumerate(cells)
+                    if i in lengthened)
+    print(f"\n[asl] {len(cells)} cells the rule lengthens without a gate; "
+          f"the gate keeps {len(lengthened)} lengthened")
+    print(f"  sum: base {base_sum * 1e3:.1f} ms, ungated "
+          f"{long_sum * 1e3:.1f} ms, gated {gated_sum * 1e3:.1f} ms; "
+          f"gated gmean {math.exp(gated_log / len(cells)):.3f}x of base")
+    if min_cost == calib.NEVER_MIN_COST:
+        note = "no synthetic input ran faster longer: never lengthen"
+    else:
+        note = f"{len(lengthened)} of {len(cells)} lengthened cells kept"
+    print(f"  asl_min_cost = {calib.format_value(min_cost)} ({note})")
+    if len(cells) < 6:
+        print(f"  warning: only {len(cells)} cells; add --asl-sizes")
+    calib.update_calibration(
+        calibration_path, {"asl_min_cost": min_cost},
+        f"find_thresholds.py asl {time.strftime('%Y-%m-%d')}, "
+        f"threads={args.threads}: {note}")
+    print(f"Updated {calibration_path}")
+
+
+ASL_COLUMNS = ("case", "method", "n", "nnz_r", "nnz_s", "configured",
+               "chosen", "sides", "cost0", "t_base", "t_long", "lengthened")
+
+# rblock stage inputs: R with 12 * slices rows (one R slice per 12 rows, every
+# slice nonempty in every slice column), RBLOCK_KEYS keys per row over
+# RBLOCK_K keys; S with RBLOCK_S_ROWS rows. The kernel stays small, so the
+# per-call cost of mapping R's packing block dominates [mm-total]. The R
+# block holds min(192, slices) slices (tile_size_l3 / 12) of slice length x
+# 16 (DS) or 12 (DD) values: 0.75 to 48 MiB over these configurations.
+RBLOCK_CONFIGS = ((512, (16, 32, 48, 64, 96, 128, 160, 192)),
+                  (1024, (128, 192)),
+                  (2048, (128, 192)))
+RBLOCK_K = 4096
+RBLOCK_KEYS = 8
+RBLOCK_S_ROWS = 64
+RBLOCK_METHODS = ("DS", "DD")  # SD packs no R block
+RBLOCK_COLUMNS = ("method", "slice_length", "r_slices", "r_bytes", "r_huge",
+                  "t_huge", "t_never", "delta")
+
+
+def run_rblock_stage(args, lib, dtype, calibration_path):
+    """Stage "rblock": r_block_huge_bytes, the R packing block size from
+    which a huge-page mapping pays.
+
+    For each block size, DS and DD calls run alternately with the block on
+    huge pages (r_block_huge_bytes = 0) and never (-1). The difference of the
+    median [mm-total] times is fitted by a line in the block size; its zero,
+    rounded up to a whole MiB, is the threshold (huge_break_even). On the
+    8488C the mapping cost about 0.5 ms flat (one 2 MiB page zeroed in one
+    fault behind the packing barrier) and saved about 60 us per MiB at the
+    free (packing_buffers.h)."""
+    print(f"\n[rblock] R block huge pages: {args.warmup} warmup + "
+          f"{args.rblock_trials} timed runs per setting")
+    S = generate_fixed_rows_csr(RBLOCK_S_ROWS, RBLOCK_K, RBLOCK_KEYS,
+                                dtype=dtype, seed=7)
+    max_slices = max(max(n) for _, n in RBLOCK_CONFIGS)
+    C = np.empty(12 * max_slices * RBLOCK_S_ROWS, dtype=dtype)
+    rows, points = [], []
+    for sl, slice_counts in RBLOCK_CONFIGS:
+        for slices in slice_counts:
+            R = generate_fixed_rows_csr(12 * slices, RBLOCK_K, RBLOCK_KEYS,
+                                        dtype=dtype, seed=100 + slices)
+            for method in RBLOCK_METHODS:
+                def setting(value):
+                    return lambda: run_dense(
+                        lib, R, S, C, method, dtype, args.threads,
+                        MM_TOTAL_LABEL, slice_length=sl,
+                        extra={"r_block_huge_bytes": value})
+
+                t_huge, t_never, out_huge, out_never = interleaved(
+                    setting(0), setting(-1), args.warmup, args.rblock_trials)
+                try:
+                    r_bytes, r_huge = parse_r_block(out_huge)
+                    never_bytes, never_huge = parse_r_block(out_never)
+                except ValueError as exc:
+                    raise BenchmarkError(f"{method} {sl} {slices}: {exc}") \
+                        from exc
+                if never_huge or never_bytes != r_bytes:
+                    raise BenchmarkError(
+                        f"{method} {sl} {slices}: r_block_huge_bytes=-1 gave "
+                        f"r_bytes={never_bytes} r_huge={int(never_huge)}")
+                delta = t_huge - t_never
+                rows.append({"method": method, "slice_length": sl,
+                             "r_slices": slices, "r_bytes": r_bytes,
+                             "r_huge": int(r_huge), "t_huge": t_huge,
+                             "t_never": t_never, "delta": delta})
+                if r_huge:
+                    points.append((r_bytes, delta))
+                print(f"  {method} sl={sl:4d} slices={slices:3d} "
+                      f"R={r_bytes / calib.MIB:6.2f} MiB huge={int(r_huge)}  "
+                      f"{t_never * 1e3:.3f} -> {t_huge * 1e3:.3f} ms "
+                      f"({delta * 1e3:+.3f})")
+            del R
+
+    out_dir = calibration_path.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    write_rows(out_dir / "rblock_cells.csv", rows, RBLOCK_COLUMNS)
+    if len({b for b, _ in points}) < 2:
+        print("[rblock] fewer than two block sizes were mapped (huge pages "
+              "unavailable?); r_block_huge_bytes unchanged")
+        return
+    value, (a, b) = calib.huge_break_even(points)
+    print(f"\n[rblock] t_huge - t_never = {a * 1e3:+.3f} ms "
+          f"{b * 1e3:+.4f} ms/MiB over {len(points)} mapped cells")
+    if value < 0:
+        note = "mapping never paid: never"
+    else:
+        note = f"break-even {value / calib.MIB:.0f} MiB"
+    print(f"  r_block_huge_bytes = {value} ({note})")
+    calib.update_calibration(
+        calibration_path, {"r_block_huge_bytes": value},
+        f"find_thresholds.py rblock {time.strftime('%Y-%m-%d')}, "
+        f"threads={args.threads}: {note}")
+    print(f"Updated {calibration_path}")
+
+
+def write_rows(path, rows, columns):
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Saved {path}")
+
+
+STAGES = ("table", "rblock", "asl")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Find algorithm decision thresholds and the "
+                    "calibration.txt defaults")
+    parser.add_argument("--stages", default=",".join(STAGES),
+                        help="Comma-separated subset of table, rblock, asl "
+                             "(default: all; always run in that order)")
+    parser.add_argument("--size", type=int, default=2048,
+                        help="Square matrix dimension (default: 2048)")
+    parser.add_argument("--step", type=int, default=1,
+                        help="Bucket step size for sampling (default: 5)")
+    parser.add_argument("--dtype", choices=["float32", "float64"],
+                        default="float32")
+    parser.add_argument("--slice-length", type=int, default=1024,
+                        help="Slice length / BK (default: 1024)")
+    parser.add_argument("--num-buckets", type=int, default=100)
+    parser.add_argument("--platform", choices=["cpu"], default="cpu",
+                        help="Target platform (default: cpu)")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Output dir (default: parameters/<platform>/<type>/)")
+    parser.add_argument("--warmup", type=int, default=1,
+                        help="Warmup runs before timing (default: 1)")
+    parser.add_argument("--trials", type=int, default=3,
+                        help="Timed runs, keep best (default: 3)")
+    parser.add_argument("--threads", type=int, default=4,
+                        help="CPU threads (default: 4, CPU platform only)")
+    parser.add_argument("--early-stop", type=int, default=3,
+                        help="Consecutive non-winner tests to stop a row "
+                             "(default: 3)")
+    parser.add_argument("--log-buckets", action="store_true", default=False,
+                        help="Use logarithmic bucket spacing")
+    parser.add_argument("--curvature", type=int, default=50,
+                        help="Log curvature parameter C (int, default 50 "
+                             "=> ~10%% of buckets below 1%% density)")
+    parser.add_argument("--calibration-file", type=str, default=None,
+                        help="calibration.txt the rblock and asl stages "
+                             "update (default: parameters/<platform>/<type>/"
+                             "calibration.txt, the one the library reads)")
+    parser.add_argument("--asl-sizes", default="2048,4096,8192,16384",
+                        help="Square sizes of the asl stage's inputs "
+                             "(default: 2048,4096,8192,16384)")
+    parser.add_argument("--asl-trials", type=int, default=3,
+                        help="Timed runs per slice length, asl stage "
+                             "(default: 3)")
+    parser.add_argument("--rblock-trials", type=int, default=15,
+                        help="Timed runs per setting, rblock stage "
+                             "(default: 15)")
+    args = parser.parse_args()
+
+    stages = [s.strip() for s in args.stages.split(",") if s.strip()]
+    unknown = sorted(set(stages) - set(STAGES))
+    if unknown or not stages:
+        parser.error(f"--stages: unknown {unknown}; choose from {STAGES}")
+    dtype = np.float32 if args.dtype == "float32" else np.float64
+    type_name = "float" if dtype == np.float32 else "double"
+    calibration_path = Path(args.calibration_file) if args.calibration_file \
+        else SCRIPT_DIR / "parameters" / args.platform / type_name / \
+        "calibration.txt"
+
+    lib = load_so("spalm.so")
+    # rblock before asl: the asl stage's timings then use the R block
+    # threshold this run measured, as the library will.
+    for stage in STAGES:
+        if stage not in stages:
+            continue
+        if stage == "table":
+            run_table_stage(args, lib, dtype)
+        elif stage == "rblock":
+            run_rblock_stage(args, lib, dtype, calibration_path)
+        else:
+            run_asl_stage(args, lib, dtype, calibration_path)
 
     print("\nDone!")
 

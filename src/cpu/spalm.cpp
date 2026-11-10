@@ -904,6 +904,7 @@ static constexpr const char *kKnownConfKeys[] = {
     "asl_min_cost_ratio", "asl_max_levels", "r_block_huge_bytes",
     "s_blocks_huge_bytes", "ss_column_block_min_cols",
     "ss_column_block_cache_divisor", "log_candidate_work",
+    "ss_page_huge_entries", "calibration_file",
     // DuckDB operator (duckdb-spalm)
     "result_base_offset", "result_compact_rows", "result_fresh_mapping",
     "result_huge_pages", "result_parallel_zero", "result_prefault",
@@ -948,6 +949,7 @@ static void print_conf(
               << " ds_aligned_panels=" << o.ds_aligned_panels
               << " r_block_huge_bytes=" << o.r_block_huge_bytes
               << " s_blocks_huge_bytes=" << o.s_blocks_huge_bytes
+              << " ss_page_huge_entries=" << o.ss_page_huge_entries
               << " ss_contiguous=" << o.ss_contiguous
               << " ss_column_blocks=" << o.ss_column_blocks
               << " ss_column_block_min_cols=" << o.ss_column_block_min_cols
@@ -966,6 +968,30 @@ static void print_conf(
         any = true;
     }
     if (any) std::cout << std::endl;
+}
+
+// One line on calibration.txt: the file read (or none), the keys this call
+// took from it (those not given to spalm()), and keys it does not use.
+static void print_calibration(
+    const calibration_values &c, const int n, const char **keys
+) {
+    std::cout << "[calibration] file=" << (c.path.empty() ? "none" : c.path)
+              << " used=";
+    bool any = false;
+    for (const auto &[key, value] : c.values) {
+        bool given = false;
+        for (int i = 0; i < n; i++) given |= strcmp(keys[i], key.c_str()) == 0;
+        if (given) continue;
+        std::cout << (any ? "," : "") << key;
+        any = true;
+    }
+    if (!any) std::cout << "-";
+    if (!c.ignored.empty()) {
+        std::cout << " ignored=";
+        for (size_t i = 0; i < c.ignored.size(); i++)
+            std::cout << (i ? "," : "") << c.ignored[i];
+    }
+    std::cout << std::endl;
 }
 
 // sparse_out: the result goes there as row blocks (spalm_sparse()); ret
@@ -1033,9 +1059,23 @@ static int spalm_impl(
         return invalid("M * N is too large for 32-bit result offsets");
     }
 
-    auto get_str = [&](const char *key, const char *def) -> const char * {
+    auto get_key = [&](const char *key) -> const char * {
         for (int i = 0; i < n; i++)
             if (strcmp(keys[i], key) == 0) return vals[i];
+        return nullptr;
+    };
+    // Per-machine defaults of the calibrated keys (slice_decision.h): a key
+    // given here wins, then calibration.txt, then the built-in default.
+    calibration_values calibration;
+    {
+        const char *file = get_key("calibration_file");
+        if (!read_calibration(type, "cpu", file ? file : "", calibration)) {
+            return SPALM_CONFIG_ERROR;
+        }
+    }
+    auto get_str = [&](const char *key, const char *def) -> const char * {
+        if (const char *v = get_key(key)) return v;
+        if (const char *v = calibration.find(key)) return v;
         return def;
     };
     auto get_int = [&](const char *key, int def) -> int {
@@ -1137,14 +1177,18 @@ static int spalm_impl(
         get_ll("r_block_huge_bytes", options.r_block_huge_bytes);
     options.s_blocks_huge_bytes =
         get_ll("s_blocks_huge_bytes", options.s_blocks_huge_bytes);
+    options.ss_page_huge_entries =
+        get_ll("ss_page_huge_entries", options.ss_page_huge_entries);
     const long long column_block_min_cols =
         get_ll("ss_column_block_min_cols", options.ss_column_block_min_cols);
     const long long column_block_cache_divisor = get_ll(
         "ss_column_block_cache_divisor", options.ss_column_block_cache_divisor
     );
     if (!bad_number.empty()) {
-        std::cerr << "spalm: " << bad_number << " is not a valid number"
-                  << std::endl;
+        std::cerr << "spalm: " << bad_number << " is not a valid number";
+        if (!get_key(bad_number.c_str()) && calibration.find(bad_number.c_str()))
+            std::cerr << " (in " << calibration.path << ")";
+        std::cerr << std::endl;
         return SPALM_INVALID_ARGUMENT;
     }
     if (options.cost_weight_ss < 0 || options.cost_weight_sd < 0 ||
@@ -1171,10 +1215,11 @@ static int spalm_impl(
         return invalid("asl_max_levels must be 1, 2 or 3");
     }
     options.asl_max_levels = static_cast<int>(asl_max_levels);
-    if (options.r_block_huge_bytes < -1 || options.s_blocks_huge_bytes < -1) {
+    if (options.r_block_huge_bytes < -1 || options.s_blocks_huge_bytes < -1 ||
+        options.ss_page_huge_entries < -1) {
         return invalid(
-            "r_block_huge_bytes and s_blocks_huge_bytes must be -1 (never) or "
-            "at least 0"
+            "r_block_huge_bytes, s_blocks_huge_bytes and ss_page_huge_entries "
+            "must be -1 (never) or at least 0"
         );
     }
     if (column_block_min_cols < 1 || column_block_min_cols > INT_MAX ||
@@ -1236,6 +1281,7 @@ static int spalm_impl(
         options, init_method, bucket_method, thresholds_file, slice_length,
         tile_size_l2, tile_size_l3, n, keys
     );
+    print_calibration(calibration, n, keys);
     // std::cout << "Tile size join dim: " << tile_size_join_dim << std::endl;
     std::cout << "Tile size L2: " << tile_size_l2 << std::endl;
     std::cout << "Tile size L3: " << tile_size_l3 << std::endl;

@@ -111,4 +111,33 @@ bool read_tile_sizes(
     int &tile_size_l2, int &tile_size_l3
 );
 
+// Per-machine defaults measured on synthetic inputs (calibration.txt, written
+// by find_thresholds.py and calibrate_run.py): "key: value" lines, '#'
+// comments. Only the keys in kCalibratedKeys are used; values stay text and
+// are parsed like the same spalm() keys, which win over the file.
+inline constexpr const char *kCalibratedKeys[] = {
+    "asl_min_cost", "r_block_huge_bytes", "ss_page_huge_entries"
+};
+struct calibration_values {
+    // The file read; empty when there was none.
+    std::string path;
+    std::vector<std::pair<std::string, std::string>> values;
+    // Keys of the file that are not calibrated keys (ignored).
+    std::vector<std::string> ignored;
+
+    const char *find(const char *key) const {
+        for (const auto &[k, v] : values)
+            if (k == key) return v.c_str();
+        return nullptr;
+    }
+};
+// file: "" = parameters/<platform>/<type>/calibration.txt next to the
+// library, read if it exists; "none" = no file; anything else = that file,
+// which must exist. False (with a message) when an explicit file cannot be
+// opened or a line is not "key: value" or repeats a key.
+bool read_calibration(
+    const int type, const char *platform, const char *file,
+    calibration_values &out
+);
+
 #endif
