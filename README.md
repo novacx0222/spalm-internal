@@ -96,6 +96,7 @@ counts as one); anything else, or a value out of range, returns `1`.
 | `s_blocks_huge_bytes` | `2097152` | integer: the S packing blocks of all workers share one huge-page mapping from this total on (never below 2 MiB); `-1` never |
 | `ss_column_block_min_cols` | `256` | integer >= 1: fewest output columns per SS column block (automatic or explicit `ss_column_blocks`) |
 | `ss_column_block_cache_divisor` | `3` | integer >= 1: automatic SS column blocks size each block's part of S^T to the shared cache divided by this |
+| `log_candidate_work` | `0` | `1`: diagnostics for comparing whole-call alternatives offline (`include/candidate_work.h`), printed after the MM cost lines; decisions and results do not change. `[candidate-features]`: M, N, K after key compaction, slice length and heights, stored entries per side, `flops` (multiply-adds of the product: the sum over keys of R entries x S entries), `row_bound` (the sum over R rows of min(N, the row's multiply-adds): an upper bound on result entries), slices per side, and slice pairs that share a column. `[candidate-work] <table> bucket\|nnz ss= sd= ds= dd=`: the cost model for the decision table as loaded (`table`, before the whole-call rules), with every pair SS (`all_ss`), and after `set_to_all_dense()` (`all_dense`). `bucket` is the cost model itself (so `table bucket` repeats the MM cost lines); `nnz` uses each density bucket's stored entries instead of its representative count |
 
 Every call prints one `[conf] ...` line with the effective settings (after
 the thresholds file, the `init_method` variant and the tile sizes), and a
@@ -141,6 +142,7 @@ stages overlap, so only totals at the same level may be compared or added.
 | `[1-slice-…]`, `[2-slice-…]` | building the slice structures of R (1) and S (2): `subrow-csr`, `subrow-csc`, `csc` (plus `-cumulative`) |
 | `[slice-prepare-total]` | both slice structures |
 | `[mm-select-total]` | cost model over all slice columns |
+| `[candidate-work-time]` | `log_candidate_work = 1` only: the counts and the three tables' work; inside `[mm-total]` |
 | `[sparse-sparse-…]`, `[dense-dense-…]` | kernel stages; `[sparse-sparse-sparse-mm-time]` and `[dense-dense-dense-mm-time]` are the kernel times used by `find_thresholds.py` |
 | `[mm-total]` | cost model + multiplication |
 | `[slice-mm-total]` | slicing + cost model + multiplication |

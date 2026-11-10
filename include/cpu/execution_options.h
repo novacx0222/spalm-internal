@@ -87,4 +87,10 @@ struct cpu_execution_options {
     // ss_column_blocks count.
     int ss_column_block_min_cols = 256;
     int ss_column_block_cache_divisor = 3;
+
+    // Diagnostics: print "[candidate-features]" and "[candidate-work]" lines
+    // (candidate_work.h) after the cost model, for comparing whole-call
+    // alternatives offline. Decisions and results do not change; the counts
+    // take one pass over each input (key: log_candidate_work, 0 or 1).
+    bool log_candidate_work = false;
 };

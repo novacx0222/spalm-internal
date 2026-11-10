@@ -711,6 +711,94 @@ template <class T> void check_sparse_or_dense() {
     unlink(table.c_str());
 }
 
+// log_candidate_work = 1 on a 24 x 256 R (rows 0-11: one entry each, rows
+// 12-23: full) and a full 32 x 256 S, slice length 256, with the
+// write_thresholds_file() table (R bucket < 50: SS, else DD). R's first
+// slice holds 12 entries but is bucket 0, whose representative count is 1:
+// so "bucket" and "nnz" differ there. Without the key nothing is printed,
+// and the result is the same either way.
+template <class T> void check_candidate_work() {
+    constexpr int type = sizeof(T) == sizeof(float) ? 0 : 1;
+    const int M = 24, K = 256, N = 32;
+    std::vector<int> ri{0}, rj, si{0}, sj;
+    std::vector<T> rv, sv;
+    for (int r = 0; r < M; ++r) {
+        for (int k = 0; k < K; ++k) {
+            if (r < 12 && k != r) continue;
+            rj.push_back(k);
+            rv.push_back(T(1));
+        }
+        ri.push_back(int(rj.size()));
+    }
+    for (int s = 0; s < N; ++s) {
+        for (int k = 0; k < K; ++k) {
+            sj.push_back(k);
+            sv.push_back(T(1));
+        }
+        si.push_back(int(sj.size()));
+    }
+    const std::string table = write_thresholds_file();
+    auto run = [&](const char *log_work, std::vector<T> &out) {
+        std::vector<const char *> keys{"threads", "slice_length",
+                                       "init_method", "thresholds_file",
+                                       "auto_sparse_ratio"},
+            vals{"2", "256", "no_fallback", table.c_str(), "0"};
+        if (log_work) {
+            keys.push_back("log_candidate_work");
+            vals.push_back(log_work);
+        }
+        out.assign(size_t(M) * N, T(0));
+        int status = -1;
+        const std::string log = capture_stdout([&] {
+            status = spalm(
+                type, ri.data(), rj.data(), rv.data(), si.data(), sj.data(),
+                sv.data(), M, K, N, false, out.data(), nullptr, nullptr,
+                nullptr, int(keys.size()), keys.data(), vals.data()
+            );
+        });
+        assert(status == SPALM_OK);
+        return log;
+    };
+    std::vector<T> with, without, off;
+    const std::string log = run("1", with);
+    const std::string plain = run(nullptr, without);
+    const std::string zero = run("0", off);
+    assert(with == without && off == without);
+    for (const std::string *l : {&plain, &zero}) {
+        assert(count(*l, "[candidate-") == 0);
+        assert(count(*l, " log_candidate_work=0\n") == 1);
+    }
+    assert(count(log, " log_candidate_work=1\n") == 1);
+    // S has 2 slices of 16 rows in double, 1 of 32 in float.
+    const bool fl = type == 0;
+    const std::string features =
+        std::string("[candidate-features] M=24 N=32 K=256 sl=256 mr=12 nr=") +
+        (fl ? "32" : "16") +
+        " nnz_r=3084 nnz_s=8192 flops=98688 row_bound=768 r_slices=2 "
+        "s_slices=" +
+        (fl ? "1" : "2") + " slice_pairs=" + (fl ? "2" : "4") + "\n";
+    assert(count(log, features) == 1);
+    const char *lines[] = {
+        "[candidate-work] table bucket ss=32 sd=0 ds=0 dd=98304\n",
+        "[candidate-work] table nnz ss=384 sd=0 ds=0 dd=98304\n",
+        "[candidate-work] all_ss bucket ss=98336 sd=0 ds=0 dd=0\n",
+        "[candidate-work] all_ss nnz ss=98688 sd=0 ds=0 dd=0\n",
+        "[candidate-work] all_dense bucket ss=0 sd=0 ds=0 dd=196608\n",
+        "[candidate-work] all_dense nnz ss=0 sd=0 ds=0 dd=196608\n",
+    };
+    for (const char *l : lines) assert(count(log, l) == 1);
+    assert(count(log, "[candidate-work] ") == 6);
+    // "table bucket" repeats the cost lines.
+    assert(count(log, "\nSPARSE MM cost: 32\n") == 1);
+    assert(count(log, "\nDENSE-DENSE MM cost: 98304\n") == 1);
+    assert(count(log, "[candidate-work-time] ") == 1);
+    // The table is restored: the call still runs mixed.
+    assert(count(log, "[backend] spalm-internal sparse=1 dense=1") == 1);
+    assert(count(plain, "[backend] spalm-internal sparse=1 dense=1") == 1);
+    check_timing_format(log);
+    unlink(table.c_str());
+}
+
 int main() {
     check_methods<float>();
     check_methods<double>();
@@ -718,10 +806,12 @@ int main() {
     check_tunables<double>();
     check_sparse_or_dense<float>();
     check_sparse_or_dense<double>();
+    check_candidate_work<float>();
+    check_candidate_work<double>();
     std::cout << "PASS: forced SPALM and MKL methods through the C API, "
                  "backend lines, timing labels and format; tunables: "
                  "defaults, parsing, validation, [conf] lines, thresholds "
                  "file and their effect on the automatic dispatch; "
                  "spalm_sparse_or_dense: result choice, requests, zeroing "
-                 "and failures\n";
+                 "and failures; log_candidate_work lines\n";
 }

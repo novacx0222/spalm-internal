@@ -18,6 +18,7 @@
 
 #include "cpu/dense_dense_matmul.h"
 #include "cpu/execution_options.h"
+#include "candidate_work.h"
 #include "csr_preparation.h"
 #include "huge_pages.h"
 #include "method_dispatch.h"
@@ -368,6 +369,65 @@ struct dense_result_request {
     bool called = false;
 };
 
+// log_candidate_work = 1: the inputs for comparing whole-call alternatives
+// offline (candidate_work.h), printed after the MM cost lines and before the
+// whole-call rules. Three decision tables: "table" as loaded (the rules have
+// not changed it yet), "all_ss" (every slice pair SS) and "all_dense" (what
+// set_to_all_dense() makes of it). For each, "bucket" is mm_check() itself,
+// so "table bucket" repeats the MM cost lines, and "nnz" counts each
+// bucket's stored entries. The global table is restored before returning.
+template <typename T>
+static void log_candidate_work(
+    const int *Ri, const int *Rj, const int M, const int *Si, const int *Sj,
+    const int N, const int K, ss_matrix<T> &R_ssm, ss_matrix<T> &S_ssm,
+    const int threads
+) {
+    const auto begin = std::chrono::high_resolution_clock::now();
+    const auto f =
+        candidate_work::count_features(Ri, Rj, M, Si, Sj, N, K, threads);
+    unsigned long long r_slices, s_slices, pairs;
+    candidate_work::slice_counts(R_ssm, S_ssm, r_slices, s_slices, pairs);
+    std::cout << "[candidate-features] M=" << M << " N=" << N << " K=" << K
+              << " sl=" << R_ssm.sl << " mr=" << R_ssm.sh
+              << " nr=" << S_ssm.sh << " nnz_r=" << Ri[M]
+              << " nnz_s=" << Si[N] << " flops=" << f.flops
+              << " row_bound=" << f.row_bound << " r_slices=" << r_slices
+              << " s_slices=" << s_slices << " slice_pairs=" << pairs
+              << std::endl;
+    const int nb = num_buckets;
+    const std::vector<uint8_t> table(ss_upper.get(), ss_upper.get() + nb + 1);
+    const std::vector<uint8_t> all_ss(nb + 1, (uint8_t) (nb + 1));
+    const std::vector<uint8_t> all_dense(nb + 1, (uint8_t) 0);
+    const std::pair<const char *, const std::vector<uint8_t> *> tables[] = {
+        {"table", &table}, {"all_ss", &all_ss}, {"all_dense", &all_dense}
+    };
+    for (const auto &[name, up] : tables) {
+        std::copy(up->begin(), up->end(), ss_upper.get());
+        unsigned long long c[4] = {};
+        for (int col = 0; col < R_ssm.s_csc_mat.cols; ++col) {
+            unsigned long long ss = 0, sd = 0, ds = 0, dd = 0;
+            mm_check(col, R_ssm, S_ssm, ss, sd, ds, dd);
+            c[0] += ss;
+            c[1] += sd;
+            c[2] += ds;
+            c[3] += dd;
+        }
+        const auto w = candidate_work::nnz_work(R_ssm, S_ssm, up->data());
+        auto round = [](double x) { return (unsigned long long) std::llround(x); };
+        std::cout << "[candidate-work] " << name << " bucket ss=" << c[0]
+                  << " sd=" << c[1] << " ds=" << c[2] << " dd=" << c[3]
+                  << std::endl;
+        std::cout << "[candidate-work] " << name << " nnz ss=" << round(w.ss)
+                  << " sd=" << round(w.sd) << " ds=" << round(w.ds)
+                  << " dd=" << round(w.dd) << std::endl;
+    }
+    std::copy(table.begin(), table.end(), ss_upper.get());
+    print_time(
+        "[candidate-work-time]",
+        std::chrono::high_resolution_clock::now() - begin
+    );
+}
+
 // Accumulates R * S^T into the caller's zero-initialized ret; with
 // options.result_zeroed false, ret holds garbage and every element is written
 // (see cpu_execution_options).
@@ -636,6 +696,9 @@ int spalm_matmul(
     std::cout << "DENSE-SPARSE MM cost: " << dense_sparse_mm_cost << std::endl;
     std::cout << "DENSE-DENSE MM cost: " << dense_dense_mm_cost << std::endl;
     print_time("[mm-select-total]", end - total_start);
+    if (options.log_candidate_work) {
+        log_candidate_work(Ri, Rj, M, Si, Sj, N, K, R_ssm, S_ssm, threads);
+    }
 
     if (total_dense_mm_cost) {
         do_dense_mm = true;
@@ -789,7 +852,7 @@ static constexpr const char *kKnownConfKeys[] = {
     "thresholds_file", "asl_min_cost", "asl_subrow_write_entries",
     "asl_min_cost_ratio", "asl_max_levels", "r_block_huge_bytes",
     "s_blocks_huge_bytes", "ss_column_block_min_cols",
-    "ss_column_block_cache_divisor",
+    "ss_column_block_cache_divisor", "log_candidate_work",
     // DuckDB operator (duckdb-spalm)
     "result_base_offset", "result_compact_rows", "result_fresh_mapping",
     "result_huge_pages", "result_parallel_zero", "result_prefault",
@@ -840,7 +903,8 @@ static void print_conf(
               << " ss_column_block_cache_divisor="
               << o.ss_column_block_cache_divisor
               << " ss_output_page_entries=" << o.ss_output_page_entries
-              << " result_zeroed=" << o.result_zeroed << std::endl;
+              << " result_zeroed=" << o.result_zeroed
+              << " log_candidate_work=" << o.log_candidate_work << std::endl;
     bool any = false;
     for (int i = 0; i < n; i++) {
         bool known = false;
@@ -942,6 +1006,7 @@ static int spalm_impl(
     options.ds_aligned_panels = get_int("ds_aligned_panels", 1) != 0;
     // An explicit slice_length is used as given.
     options.result_zeroed = get_int("result_zeroed", 1) != 0;
+    options.log_candidate_work = get_int("log_candidate_work", 0) != 0;
     options.auto_slice_length = get_str("slice_length", nullptr) == nullptr
                                     ? get_int("auto_slice_length", 1)
                                     : 0;
