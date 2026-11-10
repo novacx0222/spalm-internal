@@ -13,21 +13,35 @@
 // SuiteSparse run: "[mm-total]" minus "[dense-dense-total-dense-mm-time]"),
 // where small SD and DD calls take 1-4 ms in all.
 //
-// Here a block of at least 2 MiB is a huge-page mapping (huge_pages.h): one
-// fault per 2 MiB and a cheap unmap. The S blocks of all workers share one
-// such mapping, reserved up front: address space only, a worker's pages are
-// backed when it first packs. Smaller blocks, and every block off Linux or
-// when mmap fails, come from posix_memalign as before.
+// Here the S blocks of all workers share one huge-page mapping (huge_pages.h)
+// when they reach 2 MiB together: one fault per 2 MiB and a cheap unmap. It
+// is reserved up front, address space only; a worker's pages are backed when
+// it first packs. R's block is a huge-page mapping from kRBlockHugeBytes on.
+// Smaller blocks, and every block off Linux or when mmap fails, come from
+// posix_memalign as before.
 //
-// Measured on the 8488C (30 threads, 10 SuiteSparse matrices, SD/DS/DD, 5
-// interleaved runs against v25): the free after the multiplication drops to
-// 0.1-0.7 ms. At 2048 the library call took 0.84x in gmean (0.98x in sum).
-// At 512 it is unchanged (0.995x): a huge page is zeroed in one fault, by one
-// thread, so first touch costs about what the free saved (small DD and DS
-// kernels up to 0.9 ms longer, small SD shorter). Exception: SD at 2048 on
-// femlab_ns3da and snap_cit_hepph took 1.03x; each worker's S block is then
-// the size of the 2 MiB L2, and contiguous physical pages may map it less
-// favourably (not measured further).
+// Measured on the 8488C (30 threads, SD/DS/DD). Against v25 with R from
+// 2 MiB on (v26):
+//   - 10 SuiteSparse matrices, 5 interleaved runs: the free after the
+//     multiplication dropped to 0.1-0.7 ms, and at 2048 the library call took
+//     0.84x in gmean (0.98x in sum).
+//   - All 170 SuiteSparse matrices at 512: SD 0.84x, DD 0.99x, DS 1.06x.
+//     Wherever R was mapped, the kernel took 0.47-0.59 ms longer whatever
+//     its size. R is zeroed and packed by all threads in one loop that ends
+//     in a barrier, and one 2 MiB page is zeroed in a single fault, by one
+//     thread. The free saved only about 60 us per MiB of R (0.2 ms at
+//     2-4 MiB, 0.6 ms at 8-13 MiB), so R pays from about 8 MiB on: at 512,
+//     at least 128 R slices in one slice column for DS, 171 for DD (12
+//     values per row); a block holds up to 192.
+//     The S blocks showed no such cost: workers touch them first in their
+//     own tasks, not behind a barrier.
+//   - R from kRBlockHugeBytes on, against v26 (12 SuiteSparse matrices, 5
+//     interleaved runs, 512): DS calls with R below 8 MiB took 0.87x (kernel
+//     -0.48 ms, free +0.31 ms). DD calls there stayed within noise (1.02x;
+//     small DD calls vary by up to 1.3x between runs of the same library).
+//   - SD at 2048 on femlab_ns3da and snap_cit_hepph took 1.03x. Each
+//     worker's S block is then the size of the 2 MiB L2, and contiguous
+//     physical pages may map it less favourably (not measured further).
 
 #include <cstddef>
 #include <cstdint>
@@ -45,15 +59,22 @@ inline constexpr size_t kAlignment = 64;
 // Each worker's S block starts on its own 4 KiB page.
 inline constexpr size_t kBlockAlignment = 4096;
 
+// R's block is a huge-page mapping from this size on (see the top).
+inline constexpr size_t kRBlockHugeBytes = size_t(8) << 20;
+// No huge-page mapping at any size.
+inline constexpr size_t kNoHuge = SIZE_MAX;
+
 // `count` values, kAlignment-aligned, uninitialized: a huge-page mapping
-// from spalm_huge::kHugeBytes on (if `huge`), posix_memalign otherwise or
-// if the mapping fails. Empty on failure; never throws, so workers may call
-// it inside a parallel region.
+// from `huge_from` bytes on (never below spalm_huge::kHugeBytes),
+// posix_memalign otherwise or if the mapping fails. Empty on failure; never
+// throws, so workers may call it inside a parallel region.
 template <typename T>
-spalm_huge::array<T> try_make_buffer(size_t count, bool huge = true) {
+spalm_huge::array<T> try_make_buffer(
+    size_t count, size_t huge_from = spalm_huge::kHugeBytes
+) {
     if (count == 0 || count > SIZE_MAX / sizeof(T)) return {};
     const size_t bytes = count * sizeof(T);
-    if (huge && bytes >= spalm_huge::kHugeBytes) {
+    if (bytes >= huge_from && bytes >= spalm_huge::kHugeBytes) {
         spalm_huge::mapping m;
         if (void *p = spalm_huge::map_huge(bytes, m)) {
             return spalm_huge::array<T>(
@@ -65,9 +86,14 @@ spalm_huge::array<T> try_make_buffer(size_t count, bool huge = true) {
     if (posix_memalign(&p, kAlignment, bytes) != 0) return {};
     return spalm_huge::array<T>(static_cast<T *>(p), spalm_huge::deleter{});
 }
+// A bool here would silently become a size of 0 or 1 byte: do not compile.
+template <typename T> spalm_huge::array<T> try_make_buffer(size_t, bool) = delete;
 
-template <typename T> spalm_huge::array<T> make_buffer(size_t count) {
-    auto buffer = try_make_buffer<T>(count);
+template <typename T>
+spalm_huge::array<T> make_buffer(
+    size_t count, size_t huge_from = spalm_huge::kHugeBytes
+) {
+    auto buffer = try_make_buffer<T>(count, huge_from);
     if (!buffer) throw std::bad_alloc();
     return buffer;
 }
@@ -107,7 +133,7 @@ template <typename T> class worker_blocks {
             return nullptr;
         if (shared_) return shared_.get() + static_cast<size_t>(worker) * stride_;
         auto &own = own_[worker];
-        if (!own) own = try_make_buffer<T>(count_, false);
+        if (!own) own = try_make_buffer<T>(count_, kNoHuge);
         return own.get();
     }
 

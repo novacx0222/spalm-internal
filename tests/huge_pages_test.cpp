@@ -205,6 +205,13 @@ bool aligned_to(const void *p, size_t alignment) {
     return reinterpret_cast<uintptr_t>(p) % alignment == 0;
 }
 
+// The threshold is a size; a bool must not convert to one.
+template <typename B>
+concept takes_threshold = requires(B b) { spalm_packing::try_make_buffer<double>(size_t(1), b); };
+static_assert(takes_threshold<size_t>);
+static_assert(!takes_threshold<bool>);
+static_assert(spalm_packing::kRBlockHugeBytes >= spalm_huge::kHugeBytes);
+
 // Packing buffers of the dense-path kernels (packing_buffers.h).
 void check_packing() {
     using namespace spalm_packing;
@@ -223,9 +230,28 @@ void check_packing() {
         if (kLinux) check(aligned(a.get()) && advised(a.get()), "large packing buffer: huge pages");
         fill(a.get(), n * sizeof(double), 12);
         check(same(a.get(), n * sizeof(double), 12), "large packing buffer: usable");
-        auto b = try_make_buffer<double>(n, false);
+        auto b = try_make_buffer<double>(n, kNoHuge);
         check(b && !spalm_huge::is_mapped(b) && aligned_to(b.get(), kAlignment),
               "large packing buffer without huge pages: posix_memalign");
+    }
+    {
+        // R's block: huge pages only from kRBlockHugeBytes on.
+        const size_t below = kRBlockHugeBytes / sizeof(double) - 16;
+        const size_t at = kRBlockHugeBytes / sizeof(double);
+        auto a = make_buffer<double>(below, kRBlockHugeBytes);
+        auto b = make_buffer<double>(at, kRBlockHugeBytes);
+        check(!spalm_huge::is_mapped(a) && aligned_to(a.get(), kAlignment),
+              "R block below kRBlockHugeBytes: posix_memalign");
+        check(spalm_huge::is_mapped(b) == kLinux && aligned_to(b.get(), kAlignment),
+              "R block from kRBlockHugeBytes: mapping on Linux only");
+        if (kLinux) check(aligned(b.get()) && advised(b.get()), "R block from kRBlockHugeBytes: huge pages");
+        fill(a.get(), below * sizeof(double), 13);
+        fill(b.get(), at * sizeof(double), 14);
+        check(same(a.get(), below * sizeof(double), 13) && same(b.get(), at * sizeof(double), 14),
+              "R blocks: usable");
+        // A threshold below 2 MiB still maps nothing smaller than 2 MiB.
+        auto c = try_make_buffer<double>(1000, size_t(0));
+        check(c && !spalm_huge::is_mapped(c), "threshold 0: small buffer still posix_memalign");
     }
     check(!try_make_buffer<double>(0), "empty packing buffer: none");
     check(!try_make_buffer<double>(SIZE_MAX / 4), "oversized packing buffer: none");

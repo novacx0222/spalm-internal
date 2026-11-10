@@ -259,10 +259,12 @@ void dense_dense_matmul(
               << " fixed_alg=" << policy.fixed_alg
               << " sd_ds_full_rows=" << full_rows << " r_stride=" << r_stride
               << std::endl;
-    // Huge pages from 2 MiB on (packing_buffers.h).
+    // Huge pages from kRBlockHugeBytes on (packing_buffers.h).
     spalm_huge::array<T> R_packed_mem;
     if (policy.pack_r) {
-        R_packed_mem = spalm_packing::make_buffer<T>(R_block_size + pad);
+        R_packed_mem = spalm_packing::make_buffer<T>(
+            R_block_size + pad, spalm_packing::kRBlockHugeBytes
+        );
         std::memset(R_packed_mem.get() + R_block_size, 0, pad_bytes);
     }
     aligned_unique_ptr<BIT_DTYPE> R_bm;
