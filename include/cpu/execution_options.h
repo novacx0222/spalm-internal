@@ -41,4 +41,50 @@ struct cpu_execution_options {
     // 0 = pages growing from 64 Ki to 4 Mi entries. Small fixed pages are
     // for tests (key: ss_output_page_entries).
     long long ss_output_page_entries = 0;
+
+    // Tunables below default to the constants they replace, so a call
+    // without these keys behaves exactly as before. spalm_impl() validates
+    // them and prints the effective values on one "[conf]" line per call.
+
+    // Automatic dispatch (init_method "" and its variants; spalm.cpp). The
+    // per-kernel costs of the decision table are multiplied by these weights
+    // before the two rules below (cost units are not time: SS takes far
+    // longer per unit than DD). Keys: cost_weight_ss / _sd / _ds / _dd.
+    double cost_weight_ss = 1.0;
+    double cost_weight_sd = 1.0;
+    double cost_weight_ds = 1.0;
+    double cost_weight_dd = 1.0;
+    // Every slice pair goes to the dense kernels when the weighted SS cost is
+    // below this fraction of the weighted dense cost (key: auto_sparse_ratio;
+    // compared in float, as before).
+    double auto_sparse_ratio = 0.1;
+    // With fallback: MKL dense when the (unweighted) dense cost exceeds this
+    // fraction of M * K * N (key: auto_mkl_dense_ratio).
+    double auto_mkl_dense_ratio = 0.8;
+    // With fallback: MKL sparse when only SS slice pairs remain
+    // (key: auto_mkl_sparse_fallback, 0 or 1).
+    bool auto_mkl_sparse_fallback = true;
+
+    // Slice length rule, auto_slice_length = 1 (slice_length_rule.h).
+    // Keys: asl_min_cost, asl_subrow_write_entries, asl_min_cost_ratio,
+    // asl_max_levels (1 to 3: lengths up to 1x, 2x or 4x the configured).
+    double asl_min_cost = 3e9;
+    double asl_subrow_write_entries = 16.0;
+    double asl_min_cost_ratio = 0.9;
+    int asl_max_levels = 3;
+
+    // Packing buffers of SD/DS/DD (packing_buffers.h): R's block is a
+    // huge-page mapping from r_block_huge_bytes on, the S blocks of all
+    // workers share one from s_blocks_huge_bytes on (never below 2 MiB).
+    // -1: never (keys: r_block_huge_bytes, s_blocks_huge_bytes).
+    long long r_block_huge_bytes = 8LL << 20;
+    long long s_blocks_huge_bytes = 2LL << 20;
+
+    // Automatic SS column blocks (ss_column_blocks = -1): at least this many
+    // output columns per block, and each block's part of S^T sized to the
+    // shared cache divided by this (keys: ss_column_block_min_cols,
+    // ss_column_block_cache_divisor). The minimum also caps an explicit
+    // ss_column_blocks count.
+    int ss_column_block_min_cols = 256;
+    int ss_column_block_cache_divisor = 3;
 };

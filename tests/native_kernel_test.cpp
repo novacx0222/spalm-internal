@@ -98,12 +98,12 @@ static std::vector<T> reference(const csr &R, const csr &S, int K) {
 
 // unzeroed: the output starts as NaN and is passed with result_zeroed = 0,
 // so every element must be written; otherwise it starts at 1 and the
-// kernels must add to it.
+// kernels must add to it. With `log`, the library's stdout is kept there.
 template <typename T>
 static bool run_case(
     spalm_fn spalm, const char *label, const csr &R, const csr &S, int K,
     std::vector<std::pair<std::string, std::string>> options,
-    bool unzeroed = false
+    bool unzeroed = false, std::string *log = nullptr
 ) {
     constexpr int type = sizeof(T) == sizeof(float) ? 0 : 1;
     std::vector<T> rv(R.val.begin(), R.val.end()),
@@ -120,7 +120,9 @@ static bool run_case(
         vals.push_back(kv.second.c_str());
     }
     fflush(stdout);
-    const int saved = dup(1), null = open("/dev/null", O_WRONLY);
+    char log_path[] = "/tmp/spalm-native-log-XXXXXX";
+    const int saved = dup(1),
+              null = log ? mkstemp(log_path) : open("/dev/null", O_WRONLY);
     dup2(null, 1);
     const int status = spalm(
         type, ri.data(), rj.data(), rv.data(), si.data(), sj.data(), sv.data(),
@@ -131,6 +133,16 @@ static bool run_case(
     dup2(saved, 1);
     close(saved);
     close(null);
+    if (log) {
+        log->clear();
+        if (FILE *f = std::fopen(log_path, "r")) {
+            char buf[4096];
+            for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;)
+                log->append(buf, n);
+            std::fclose(f);
+        }
+        unlink(log_path);
+    }
     const auto expected = reference<T>(R, S, K);
     size_t bad = 0, first = 0;
     for (size_t i = 0; i < out.size(); ++i) {
@@ -441,6 +453,102 @@ int main(int argc, char **argv) {
             }
         }
     }
+    // Tunables (execution_options.h) that change what the kernels do:
+    // packing buffers always or never on huge pages, more SS column blocks,
+    // longer slices at any cost. Results must stay exact.
+    {
+        const int M = 61, N = 700, K = 2100;
+        const csr R =
+            make_csr(M, K, [&](int, int) { return u(rng) < 0.02; }, rng);
+        const csr S =
+            make_csr(N, K, [&](int, int) { return u(rng) < 0.02; }, rng);
+        using kv = std::vector<std::pair<std::string, std::string>>;
+        const kv sets[] = {
+            {{"r_block_huge_bytes", "0"}, {"s_blocks_huge_bytes", "0"}},
+            {{"r_block_huge_bytes", "-1"}, {"s_blocks_huge_bytes", "-1"}},
+            {{"ss_column_blocks", "5"}, {"ss_column_block_min_cols", "1"}},
+            {{"ss_column_blocks", "700"}, {"ss_column_block_min_cols", "1"}},
+            {{"ss_column_block_min_cols", "1"},
+             {"ss_column_block_cache_divisor", "1000"}},
+            {{"asl_min_cost", "0"}},
+            {{"asl_min_cost", "0"}, {"asl_max_levels", "2"},
+             {"asl_min_cost_ratio", "10"}, {"asl_subrow_write_entries", "1000"}},
+            {{"asl_min_cost", "0"}, {"asl_subrow_write_entries", "0"}},
+        };
+        for (const kv &set : sets) {
+            for (const char *method :
+                 {"sparse", "dense_left_spmm_inner_kernel",
+                  "dense_right_spmm_inner_kernel", "dense_bm_inner_kernel"}) {
+                for (const char *threads : {"1", "4"}) {
+                    kv o = {{"init_method", method}, {"threads", threads}};
+                    o.insert(o.end(), set.begin(), set.end());
+                    const std::string label = std::string("tunables/") + method;
+                    failures += !run_case<double>(spalm, label.c_str(), R, S, K, o);
+                    failures += !run_case<float>(spalm, label.c_str(), R, S, K, o);
+                    cases += 2;
+                }
+            }
+        }
+    }
+    // The automatic dispatch with a decision table from thresholds_file that
+    // sends slice pairs to all four kernels: R slices (12 rows) cycle
+    // through 1%, 30% and 60% density, S slices (16 rows) through 1%, 10%
+    // and 50%. R below bucket 5: SS; otherwise S below bucket 3: SS, below
+    // 20: DS, else SD (R below bucket 40) or DD. The SS pairs run on the
+    // mixed SS path, in the same call as the dense kernels.
+    {
+        char table[] = "/tmp/spalm-native-thresholds-XXXXXX";
+        const int fd = mkstemp(table);
+        assert(fd >= 0);
+        std::string text = "num_buckets: 100\nss_upper:";
+        for (int b = 0; b <= 100; ++b) text += b < 5 ? " 101" : " 3";
+        text += "\nri_upper:";
+        for (int b = 0; b <= 100; ++b) text += b < 5 ? " 0" : " 20";
+        text += "\nleft_dense_threshold: 40\ndense_mm_threshold: 0\n";
+        assert(write(fd, text.data(), text.size()) == ssize_t(text.size()));
+        close(fd);
+        const int M = 12 * 9 + 5, N = 16 * 9 + 7, K = 1100;
+        const double r_density[] = {0.01, 0.3, 0.6}, s_density[] = {0.01, 0.1, 0.5};
+        const csr R = make_csr(
+            M, K, [&](int r, int) { return u(rng) < r_density[(r / 12) % 3]; }, rng
+        );
+        const csr S = make_csr(
+            N, K, [&](int r, int) { return u(rng) < s_density[(r / 16) % 3]; }, rng
+        );
+        using kv = std::vector<std::pair<std::string, std::string>>;
+        struct auto_case {
+            kv conf;
+            const char *backend; // expected for double (float: S slices of 32)
+        } auto_cases[] = {
+            {{{"auto_sparse_ratio", "0"}}, "[backend] spalm-internal sparse=1 dense=1"},
+            {{{"auto_sparse_ratio", "0"}, {"cost_weight_ss", "30"},
+              {"cost_weight_dd", "0.5"}, {"ss_column_block_min_cols", "1"}},
+             "[backend] spalm-internal sparse=1 dense=1"},
+            {{{"auto_sparse_ratio", "0"}, {"slice_length", "128"}},
+             "[backend] spalm-internal sparse=1 dense=1"},
+            {{{"auto_sparse_ratio", "0"}, {"selective_packing", "0"}},
+             "[backend] spalm-internal sparse=1 dense=1"},
+            {{{"cost_weight_ss", "0"}}, "[backend] spalm-internal sparse=0 dense=1"},
+            {{{"dense_mm_threshold", "1e18"}}, "[backend] spalm-internal sparse=1 dense=0"},
+        };
+        for (const auto &c : auto_cases) {
+            for (const char *threads : {"1", "4"}) {
+                kv o = {{"init_method", "no_fallback"}, {"threads", threads},
+                        {"thresholds_file", table}};
+                o.insert(o.end(), c.conf.begin(), c.conf.end());
+                std::string log;
+                failures += !run_case<double>(spalm, "auto-table", R, S, K, o, false, &log);
+                if (log.find(c.backend) == std::string::npos ||
+                    log.find("[conf] init_method=no_fallback ") == std::string::npos) {
+                    std::printf("FAIL auto-table: expected '%s'\n", c.backend);
+                    ++failures;
+                }
+                failures += !run_case<float>(spalm, "auto-table", R, S, K, o);
+                cases += 2;
+            }
+        }
+        unlink(table);
+    }
     // result_zeroed = 0: the MKL backends overwrite the result, the SPALM
     // kernels and every zero-work exit get it zeroed by the library.
     {
@@ -547,7 +655,8 @@ int main(int argc, char **argv) {
         "column blocks x full "
         "rows x selective "
         "packing x SS contiguous x threads x slice length (fixed / automatic) "
-        "x float/double, plus uninitialized results for MKL and SPALM, and "
+        "x float/double, plus tunables, mixed SS and dense calls from a "
+        "thresholds file, uninitialized results for MKL and SPALM, and "
         "sparse output for SS and MKL sp2m), "
         "%d failed\n",
         failures ? "FAIL" : "PASS", cases, failures

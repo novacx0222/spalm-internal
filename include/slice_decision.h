@@ -91,8 +91,17 @@ void set_to_all_dense();
 
 MM_ALG get_alg(const int left_bucket, const int right_bucket);
 
+// Loads the decision table for the table-driven methods (auto and its
+// variants) and sets up the fixed tables of the forced ones. With a
+// non-empty thresholds_file that file is read instead of
+// parameters/<platform>/<type>/<buckets>/decision_thresholds.txt. A
+// dense_mm_threshold_override >= 0 replaces the file's dense_mm_threshold,
+// before the variants (dense, no_threshold) set it to 0. Neither applies to
+// the forced methods.
 bool init_decision_thresholds(
-    const char *thres_exec_method, const int type, const char *platform
+    const char *thres_exec_method, const int type, const char *platform,
+    const char *thresholds_file = nullptr,
+    long long dense_mm_threshold_override = -1
 );
 
 void free_bucket_info();

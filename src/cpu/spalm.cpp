@@ -1,6 +1,8 @@
 #include <algorithm>
 #include "path_utils.h"
 #include <chrono>
+#include <cctype>
+#include <cerrno>
 #include <climits>
 #include <cmath>
 #include <cstdlib>
@@ -10,6 +12,8 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "cpu/dense_dense_matmul.h"
@@ -245,6 +249,17 @@ static int run_mkl_sparse_output(
     return SPALM_OK;
 }
 
+// A decision-table cost times its kernel's weight (cost_weight_*), rounded
+// and capped at the largest value; weight 1 returns the cost unchanged.
+static unsigned long long weighted_cost(
+    const unsigned long long cost, const double weight
+) {
+    if (weight == 1.0) return cost;
+    const double x = std::nearbyint(weight * static_cast<double>(cost));
+    if (x >= 18446744073709551615.0) return ULLONG_MAX;
+    return x > 0 ? static_cast<unsigned long long>(x) : 0;
+}
+
 // Sides whose subrows the decision table multiplies with packed slices of
 // the other side: R for SD, S for DS, both for DD or mixed tables. Only SS
 // slice pairs: neither, and the slice length stays as configured.
@@ -262,21 +277,25 @@ static void sparse_sides(bool &r_sparse, bool &s_sparse) {
 static int choose_slice_length_by_counts(
     const int configured, const int *Ri, const int *Rj, const int M,
     const int *Si, const int *Sj, const int N, const int K,
-    const int r_height, const int s_height, const int threads
+    const int r_height, const int s_height, const int threads,
+    const slice_length_rule::params &rule
 ) {
     bool r_sparse = false, s_sparse = false;
     sparse_sides(r_sparse, s_sparse);
     if (!r_sparse && !s_sparse) return configured;
     // No length beyond K: it would only pad a single slice column.
-    const int levels = slice_length_rule::levels_within(configured, K);
+    const int levels =
+        slice_length_rule::levels_within(configured, K, rule.max_levels);
     if (levels == 1) return configured;
     const char *sides = r_sparse && s_sparse ? "RS" : r_sparse ? "R" : "S";
-    // Below kMinCost nothing is lengthened: inputs whose level-0 cost cannot
-    // reach it are not even counted.
+    // Below the minimum cost (asl_min_cost, default kMinCost) nothing is
+    // lengthened: inputs whose level-0 cost cannot reach it are not even
+    // counted.
     const double bound = slice_length_rule::cost0_bound(
-        Ri[M], M, r_height, Si[N], N, s_height, r_sparse, s_sparse
+        Ri[M], M, r_height, Si[N], N, s_height, r_sparse, s_sparse,
+        rule.subrow_write_entries
     );
-    if (bound < slice_length_rule::kMinCost) {
+    if (bound < rule.min_cost) {
         std::cout << "[slice-length] rule=counts configured=" << configured
                   << " chosen=" << configured << " sides=" << sides
                   << " cost0_bound=" << bound << " (not counted)" << std::endl;
@@ -289,7 +308,7 @@ static int choose_slice_length_by_counts(
     const auto s = slice_length_rule::count_columns(
         Si, Sj, N, K, configured, levels, s_height, threads
     );
-    const auto d = slice_length_rule::choose(r, s, r_sparse, s_sparse);
+    const auto d = slice_length_rule::choose(r, s, r_sparse, s_sparse, rule);
     const int length = configured << d.level;
     print_time(
         "[slice-length-count]",
@@ -497,9 +516,14 @@ int spalm_matmul(
 
     int sl = slice_length;
     if (options.auto_slice_length == 1) {
+        slice_length_rule::params rule;
+        rule.subrow_write_entries = options.asl_subrow_write_entries;
+        rule.min_cost_ratio = options.asl_min_cost_ratio;
+        rule.min_cost = options.asl_min_cost;
+        rule.max_levels = options.asl_max_levels;
         sl = choose_slice_length_by_counts(
             slice_length, Ri, Rj, M, Si, Sj, N, K, R_ik_slice_height,
-            S_ik_slice_height, threads
+            S_ik_slice_height, threads, rule
         );
     } else if (options.auto_slice_length == 2) {
         sl = choose_slice_length_by_density(slice_length, Ri, M, Si, N, K);
@@ -572,12 +596,34 @@ int spalm_matmul(
         do_dense_mm = true;
     }
 
-    float sparse_ratio_threshold = 0.1;
+    // The two rules below compare the costs weighted per kernel
+    // (cost_weight_*, default 1: the raw costs, exactly as before).
+    const unsigned long long weighted_sparse_mm_cost =
+        weighted_cost(sparse_mm_cost, options.cost_weight_ss);
+    unsigned long long weighted_dense_mm_cost = 0;
+    for (const auto [cost, weight] :
+         {std::pair{sparse_dense_mm_cost, options.cost_weight_sd},
+          std::pair{dense_sparse_mm_cost, options.cost_weight_ds},
+          std::pair{dense_dense_mm_cost, options.cost_weight_dd}}) {
+        const unsigned long long w = weighted_cost(cost, weight);
+        weighted_dense_mm_cost = w > ULLONG_MAX - weighted_dense_mm_cost
+                                     ? ULLONG_MAX
+                                     : weighted_dense_mm_cost + w;
+    }
+    if (options.cost_weight_ss != 1.0 || options.cost_weight_sd != 1.0 ||
+        options.cost_weight_ds != 1.0 || options.cost_weight_dd != 1.0) {
+        std::cout << "[weighted-cost] sparse=" << weighted_sparse_mm_cost
+                  << " dense=" << weighted_dense_mm_cost << std::endl;
+    }
 
-    if (total_dense_mm_cost < dense_mm_threshold && total_dense_mm_cost) {
+    // Float, as before (the product of an integer cost and a float).
+    const float sparse_ratio_threshold = (float) options.auto_sparse_ratio;
+
+    if (weighted_dense_mm_cost < dense_mm_threshold && total_dense_mm_cost) {
         do_dense_mm = false;
         do_sparse_mm = true;
-    } else if (sparse_mm_cost < total_dense_mm_cost * sparse_ratio_threshold) {
+    } else if (weighted_sparse_mm_cost <
+               weighted_dense_mm_cost * sparse_ratio_threshold) {
         do_dense_mm = true;
         do_sparse_mm = false;
         set_to_all_dense();
@@ -595,8 +641,9 @@ int spalm_matmul(
     int status = SPALM_OK;
     const auto backend = spalm_dispatch::select(
         force_mkl_dense, force_mkl_sparse, fallback,
-        total_dense_mm_cost > (unsigned long long) M * K * N * 0.8,
-        do_sparse_mm && !do_dense_mm
+        total_dense_mm_cost >
+            (unsigned long long) M * K * N * options.auto_mkl_dense_ratio,
+        do_sparse_mm && !do_dense_mm && options.auto_mkl_sparse_fallback
     );
     // Sparse output exists for the full SS path only (init_method sparse:
     // no dense slice pair, no fallback).
@@ -669,6 +716,86 @@ struct bucket_info_guard {
         );
     }
 };
+
+// Every key spalm() reads, and the keys the DuckDB operator reads itself
+// (it forwards all of spalm.conf except so_dir). Anything else is listed on
+// a "[conf-unused]" line, so a misspelled key shows in the log instead of
+// being ignored silently.
+static constexpr const char *kKnownConfKeys[] = {
+    // library
+    "init_method", "bucket_method", "threads", "prune_zeros", "compact_keys",
+    "selective_packing", "ss_contiguous", "sd_ds_full_rows",
+    "ss_column_blocks", "ds_aligned_panels", "result_zeroed",
+    "auto_slice_length", "ss_output_page_entries", "slice_length",
+    "tile_size_l2", "tile_size_l3", "cost_weight_ss", "cost_weight_sd",
+    "cost_weight_ds", "cost_weight_dd", "auto_sparse_ratio",
+    "auto_mkl_dense_ratio", "auto_mkl_sparse_fallback", "dense_mm_threshold",
+    "thresholds_file", "asl_min_cost", "asl_subrow_write_entries",
+    "asl_min_cost_ratio", "asl_max_levels", "r_block_huge_bytes",
+    "s_blocks_huge_bytes", "ss_column_block_min_cols",
+    "ss_column_block_cache_divisor",
+    // DuckDB operator (duckdb-spalm)
+    "result_base_offset", "result_compact_rows", "result_fresh_mapping",
+    "result_huge_pages", "result_parallel_zero", "result_prefault",
+    "result_mkl_skip_zero", "so_dir",
+};
+
+// One line with the effective settings of this call (after the thresholds
+// file, the variants of init_method and the tile_sizes.txt defaults), and
+// one with the keys nobody reads, if any.
+static void print_conf(
+    const cpu_execution_options &o, const char *init_method,
+    const char *bucket_method, const char *thresholds_file,
+    const int slice_length, const int tile_size_l2, const int tile_size_l3,
+    const int n, const char **keys
+) {
+    std::cout << "[conf] init_method=" << (init_method[0] ? init_method : "auto")
+              << " bucket_method="
+              << (bucket_method[0] ? bucket_method : "linear")
+              << " thresholds_file="
+              << (thresholds_file[0] ? thresholds_file : "default")
+              << " dense_mm_threshold=" << dense_mm_threshold
+              << " fallback=" << fallback
+              << " auto_sparse_ratio=" << o.auto_sparse_ratio
+              << " auto_mkl_dense_ratio=" << o.auto_mkl_dense_ratio
+              << " auto_mkl_sparse_fallback=" << o.auto_mkl_sparse_fallback
+              << " cost_weight_ss=" << o.cost_weight_ss
+              << " cost_weight_sd=" << o.cost_weight_sd
+              << " cost_weight_ds=" << o.cost_weight_ds
+              << " cost_weight_dd=" << o.cost_weight_dd
+              << " slice_length=" << slice_length
+              << " auto_slice_length=" << o.auto_slice_length
+              << " asl_min_cost=" << o.asl_min_cost
+              << " asl_subrow_write_entries=" << o.asl_subrow_write_entries
+              << " asl_min_cost_ratio=" << o.asl_min_cost_ratio
+              << " asl_max_levels=" << o.asl_max_levels
+              << " tile_size_l2=" << tile_size_l2
+              << " tile_size_l3=" << tile_size_l3
+              << " prune_zeros=" << o.prune_zeros
+              << " compact_keys=" << o.compact_keys
+              << " selective_packing=" << o.selective_packing
+              << " sd_ds_full_rows=" << o.sd_ds_full_rows
+              << " ds_aligned_panels=" << o.ds_aligned_panels
+              << " r_block_huge_bytes=" << o.r_block_huge_bytes
+              << " s_blocks_huge_bytes=" << o.s_blocks_huge_bytes
+              << " ss_contiguous=" << o.ss_contiguous
+              << " ss_column_blocks=" << o.ss_column_blocks
+              << " ss_column_block_min_cols=" << o.ss_column_block_min_cols
+              << " ss_column_block_cache_divisor="
+              << o.ss_column_block_cache_divisor
+              << " ss_output_page_entries=" << o.ss_output_page_entries
+              << " result_zeroed=" << o.result_zeroed << std::endl;
+    bool any = false;
+    for (int i = 0; i < n; i++) {
+        bool known = false;
+        for (const char *k : kKnownConfKeys)
+            if (strcmp(keys[i], k) == 0) known = true;
+        if (known) continue;
+        std::cout << (any ? "," : "[conf-unused] keys=") << keys[i];
+        any = true;
+    }
+    if (any) std::cout << std::endl;
+}
 
 // sparse_out: the result goes there as row blocks (spalm_sparse()); ret
 // is not used.
@@ -770,6 +897,122 @@ static int spalm_impl(
         return invalid("ss_column_blocks must be -1 (auto), 0, 1 or a count");
     }
 
+    // Tunables (execution_options.h), read strictly: the whole value must be
+    // a number (an integer where one is needed; 5e8 is accepted), and values
+    // out of range are rejected.
+    std::string bad_number;
+    auto parse_number = [&](const char *key, double &x) -> bool {
+        const char *v = get_str(key, nullptr);
+        if (!v) return false;
+        char *end = nullptr;
+        errno = 0;
+        x = std::strtod(v, &end);
+        while (end && *end && std::isspace(static_cast<unsigned char>(*end)))
+            ++end;
+        if (end == v || *end != '\0' || errno == ERANGE || !std::isfinite(x)) {
+            if (bad_number.empty()) bad_number = key;
+            return false;
+        }
+        return true;
+    };
+    auto get_double = [&](const char *key, double def) -> double {
+        double x = 0;
+        return parse_number(key, x) ? x : def;
+    };
+    auto get_ll = [&](const char *key, long long def) -> long long {
+        const char *v = get_str(key, nullptr);
+        if (!v) return def;
+        // Plain integers exactly; otherwise an integral number such as 5e8.
+        char *end = nullptr;
+        errno = 0;
+        const long long i = std::strtoll(v, &end, 10);
+        while (end && *end && std::isspace(static_cast<unsigned char>(*end)))
+            ++end;
+        if (end != v && *end == '\0' && errno != ERANGE) return i;
+        double x = 0;
+        if (!parse_number(key, x)) return def;
+        if (x != std::floor(x) || std::fabs(x) >= 9.2e18) {
+            if (bad_number.empty()) bad_number = key;
+            return def;
+        }
+        return static_cast<long long>(x);
+    };
+    options.cost_weight_ss = get_double("cost_weight_ss", options.cost_weight_ss);
+    options.cost_weight_sd = get_double("cost_weight_sd", options.cost_weight_sd);
+    options.cost_weight_ds = get_double("cost_weight_ds", options.cost_weight_ds);
+    options.cost_weight_dd = get_double("cost_weight_dd", options.cost_weight_dd);
+    options.auto_sparse_ratio =
+        get_double("auto_sparse_ratio", options.auto_sparse_ratio);
+    options.auto_mkl_dense_ratio =
+        get_double("auto_mkl_dense_ratio", options.auto_mkl_dense_ratio);
+    const long long mkl_sparse_fallback = get_ll("auto_mkl_sparse_fallback", 1);
+    options.auto_mkl_sparse_fallback = mkl_sparse_fallback != 0;
+    // -1: the thresholds file's value.
+    const long long dense_mm_threshold_override = get_ll("dense_mm_threshold", -1);
+    // Empty: parameters/cpu/<type>/<buckets>/decision_thresholds.txt.
+    const char *thresholds_file = get_str("thresholds_file", "");
+    options.asl_min_cost = get_double("asl_min_cost", options.asl_min_cost);
+    options.asl_subrow_write_entries =
+        get_double("asl_subrow_write_entries", options.asl_subrow_write_entries);
+    options.asl_min_cost_ratio =
+        get_double("asl_min_cost_ratio", options.asl_min_cost_ratio);
+    const long long asl_max_levels =
+        get_ll("asl_max_levels", options.asl_max_levels);
+    options.r_block_huge_bytes =
+        get_ll("r_block_huge_bytes", options.r_block_huge_bytes);
+    options.s_blocks_huge_bytes =
+        get_ll("s_blocks_huge_bytes", options.s_blocks_huge_bytes);
+    const long long column_block_min_cols =
+        get_ll("ss_column_block_min_cols", options.ss_column_block_min_cols);
+    const long long column_block_cache_divisor = get_ll(
+        "ss_column_block_cache_divisor", options.ss_column_block_cache_divisor
+    );
+    if (!bad_number.empty()) {
+        std::cerr << "spalm: " << bad_number << " is not a valid number"
+                  << std::endl;
+        return SPALM_INVALID_ARGUMENT;
+    }
+    if (options.cost_weight_ss < 0 || options.cost_weight_sd < 0 ||
+        options.cost_weight_ds < 0 || options.cost_weight_dd < 0) {
+        return invalid("cost_weight_ss/sd/ds/dd must be at least 0");
+    }
+    if (options.auto_sparse_ratio < 0 || options.auto_mkl_dense_ratio < 0) {
+        return invalid("auto_sparse_ratio and auto_mkl_dense_ratio must be at least 0");
+    }
+    if (mkl_sparse_fallback != 0 && mkl_sparse_fallback != 1) {
+        return invalid("auto_mkl_sparse_fallback must be 0 or 1");
+    }
+    if (dense_mm_threshold_override < -1) {
+        return invalid("dense_mm_threshold must be -1 (from the thresholds file) or at least 0");
+    }
+    if (options.asl_min_cost < 0 || options.asl_subrow_write_entries < 0 ||
+        options.asl_min_cost_ratio < 0) {
+        return invalid(
+            "asl_min_cost, asl_subrow_write_entries and asl_min_cost_ratio "
+            "must be at least 0"
+        );
+    }
+    if (asl_max_levels < 1 || asl_max_levels > slice_length_rule::kMaxLevels) {
+        return invalid("asl_max_levels must be 1, 2 or 3");
+    }
+    options.asl_max_levels = static_cast<int>(asl_max_levels);
+    if (options.r_block_huge_bytes < -1 || options.s_blocks_huge_bytes < -1) {
+        return invalid(
+            "r_block_huge_bytes and s_blocks_huge_bytes must be -1 (never) or "
+            "at least 0"
+        );
+    }
+    if (column_block_min_cols < 1 || column_block_min_cols > INT_MAX ||
+        column_block_cache_divisor < 1 || column_block_cache_divisor > INT_MAX) {
+        return invalid(
+            "ss_column_block_min_cols and ss_column_block_cache_divisor must "
+            "be at least 1"
+        );
+    }
+    options.ss_column_block_min_cols = static_cast<int>(column_block_min_cols);
+    options.ss_column_block_cache_divisor =
+        static_cast<int>(column_block_cache_divisor);
+
     std::cout << "SPALM MATMUL" << std::endl;
     std::cout << M << " " << K << " " << N << std::endl;
     std::cout << "THREADS: " << threads << std::endl;
@@ -785,7 +1028,9 @@ static int spalm_impl(
         );
     }
     bucket_info_guard bucket_info;
-    bool read_success = init_decision_thresholds(init_method, type, "cpu");
+    bool read_success = init_decision_thresholds(
+        init_method, type, "cpu", thresholds_file, dense_mm_threshold_override
+    );
     if (!read_success) {
         std::cerr << "Initialize decision thresholds." << std::endl;
         return SPALM_CONFIG_ERROR;
@@ -812,6 +1057,10 @@ static int spalm_impl(
     if (tile_size_l2 < 1 || tile_size_l3 < 1) {
         return invalid("tile sizes must be positive");
     }
+    print_conf(
+        options, init_method, bucket_method, thresholds_file, slice_length,
+        tile_size_l2, tile_size_l3, n, keys
+    );
     // std::cout << "Tile size join dim: " << tile_size_join_dim << std::endl;
     std::cout << "Tile size L2: " << tile_size_l2 << std::endl;
     std::cout << "Tile size L3: " << tile_size_l3 << std::endl;

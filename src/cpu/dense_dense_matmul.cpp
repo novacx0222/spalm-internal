@@ -259,11 +259,13 @@ void dense_dense_matmul(
               << " fixed_alg=" << policy.fixed_alg
               << " sd_ds_full_rows=" << full_rows << " r_stride=" << r_stride
               << std::endl;
-    // Huge pages from kRBlockHugeBytes on (packing_buffers.h).
+    // Huge pages from r_block_huge_bytes on (default kRBlockHugeBytes,
+    // packing_buffers.h).
     spalm_huge::array<T> R_packed_mem;
     if (policy.pack_r) {
         R_packed_mem = spalm_packing::make_buffer<T>(
-            R_block_size + pad, spalm_packing::kRBlockHugeBytes
+            R_block_size + pad,
+            spalm_packing::huge_threshold(options.r_block_huge_bytes)
         );
         std::memset(R_packed_mem.get() + R_block_size, 0, pad_bytes);
     }
@@ -276,7 +278,7 @@ void dense_dense_matmul(
     );
 
     // Per-worker S packing blocks: slices of one huge-page mapping when they
-    // reach 2 MiB together, whose pages are backed only when a worker first
+    // reach s_blocks_huge_bytes (default 2 MiB) together, whose pages are backed only when a worker first
     // packs; otherwise allocated on a worker's first task (packing_buffers.h).
     // An allocation failure inside the parallel region must not throw (that
     // terminates the process): it is flagged, remaining tasks are skipped,
@@ -284,7 +286,8 @@ void dense_dense_matmul(
     const size_t S_block_size = (size_t) S_slices_per_agg_tile * sl * nr;
     const size_t S_bm_size = (size_t) S_slices_per_agg_tile * bm_words;
     spalm_packing::worker_blocks<T> S_packed_blocks(
-        policy.pack_s ? threads : 0, S_block_size + pad
+        policy.pack_s ? threads : 0, S_block_size + pad,
+        spalm_packing::huge_threshold(options.s_blocks_huge_bytes)
     );
     std::vector<T *> S_packed_mem_threads(threads, nullptr);
     std::vector<aligned_unique_ptr<BIT_DTYPE>> S_bm_threads(threads);

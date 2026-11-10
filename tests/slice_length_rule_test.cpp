@@ -260,9 +260,93 @@ static void check_limits() {
     std::cout << "limits as expected" << std::endl;
 }
 
+// The per-call parameters (spalm.conf keys asl_*): the defaults decide
+// exactly as the constants, and each parameter moves the decision the way
+// it should.
+static void check_params() {
+    // Default params are the constants.
+    const slr::params def;
+    assert(def.subrow_write_entries == slr::kSubrowWriteEntries);
+    assert(def.min_cost_ratio == slr::kMinCostRatio);
+    assert(def.min_cost == slr::kMinCost);
+    assert(def.max_levels == slr::kMaxLevels);
+    // max_levels caps the levels within K, clamped to [1, kMaxLevels].
+    assert(slr::levels_within(512, 100000, 1) == 1);
+    assert(slr::levels_within(512, 100000, 2) == 2);
+    assert(slr::levels_within(512, 100000, 3) == 3);
+    assert(slr::levels_within(512, 100000, 9) == 3);
+    assert(slr::levels_within(512, 100000, 0) == 1);
+    assert(slr::levels_within(512, 1500, 3) == 2);
+
+    std::mt19937 rng(31);
+    const auto a = uniform(rng, 2000, 16000, 0.01);
+    const auto b = uniform(rng, 400, 16000, 0.2);
+    const auto rc = counts(a, 512, 3, 12, 4), sc = counts(a, 512, 3, 16, 4);
+    const auto rb = counts(b, 512, 3, 12, 4), sb = counts(b, 512, 3, 16, 4);
+    auto same = [](const slr::decision &x, const slr::decision &y) {
+        if (x.level != y.level || x.cost0 != y.cost0) return false;
+        for (int l = 0; l < slr::kMaxLevels; ++l)
+            if (x.cost[l] != y.cost[l] || x.per_subrow[l] != y.per_subrow[l])
+                return false;
+        return true;
+    };
+    for (const auto *pair : {&rc, &rb}) {
+        const auto &r = *pair;
+        const auto &s = pair == &rc ? sc : sb;
+        for (int sides = 1; sides <= 3; ++sides) {
+            const bool rs = sides & 1, ss = sides & 2;
+            for (double mc : {0.0, slr::kMinCost}) {
+                slr::params p;
+                p.min_cost = mc;
+                // The min_cost overload and the params overload agree.
+                assert(same(slr::choose(r, s, rs, ss, mc), slr::choose(r, s, rs, ss, p)));
+            }
+            assert(same(slr::choose(r, s, rs, ss), slr::choose(r, s, rs, ss, def)));
+        }
+    }
+    slr::params p;
+    p.min_cost = 0;
+    // uniform 1%: 4x with the defaults and no minimum cost ...
+    assert(slr::choose(rc, sc, true, true, p).level == 2);
+    // ... 2x at most with max_levels 2, never longer with 1.
+    p.max_levels = 2;
+    assert(slr::choose(rc, sc, true, true, p).level == 1);
+    p.max_levels = 1;
+    assert(slr::choose(rc, sc, true, true, p).level == 0);
+    p.max_levels = 3;
+    // A minimum cost above the level-0 cost: not lengthened.
+    p.min_cost = slr::choose(rc, sc, true, true, p).cost0 * 1.01;
+    assert(slr::choose(rc, sc, true, true, p).level == 0);
+    p.min_cost = 0;
+    // A doubling must cut the cost below min_cost_ratio: the uniform 1%
+    // cost falls to about 0.63 of level 0 at 4x (0.8 at 2x).
+    p.min_cost_ratio = 0.5;
+    assert(slr::choose(rc, sc, true, true, p).level == 0);
+    p.min_cost_ratio = 0.9;
+    // Subrows of about 5 entries: not lengthened when 5 already counts as
+    // full (subrow_write_entries 4); the write cost shapes the model.
+    p.subrow_write_entries = 4;
+    assert(slr::choose(rc, sc, true, true, p).level == 0);
+    p.subrow_write_entries = 16;
+    // uniform 20% (100 entries per subrow) lengthens once a subrow write
+    // counts as more than its entries, and the ratio allows a rise.
+    assert(slr::choose(rb, sb, true, true, p).level == 0);
+    p.subrow_write_entries = 1000;
+    p.min_cost_ratio = 10;
+    assert(slr::choose(rb, sb, true, true, p).level == 2);
+    // The size bound uses the same write cost.
+    assert(slr::cost0_bound(1000, 100, 12, 2000, 200, 16, true, true, 0) <
+           slr::cost0_bound(1000, 100, 12, 2000, 200, 16, true, true));
+    assert(slr::cost0_bound(1000, 100, 12, 2000, 200, 16, true, true, 16) ==
+           slr::cost0_bound(1000, 100, 12, 2000, 200, 16, true, true));
+    assert(slr::side_cost(rc, sc, 0, 16) == slr::side_cost(rc, sc, 0));
+    std::cout << "params as expected" << std::endl;
+}
+
 int main() {
     check_counts_against_reference();
     check_decisions();
     check_limits();
+    check_params();
     return 0;
 }

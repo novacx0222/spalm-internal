@@ -61,13 +61,27 @@ inline constexpr double kMinCostRatio = 0.9;
 // all at least 3.3e9; the largest below, 2.4e9 (priebel_192bit DD), ran
 // the same at 2048 as at 512.
 inline constexpr double kMinCost = 3e9;
-// Lengths tried: base, 2 * base and 4 * base.
+// Lengths tried: base, 2 * base and 4 * base. Also the capacity of the
+// count tables below: params::max_levels may only lower it.
 inline constexpr int kMaxLevels = 3;
 
-// Levels to count: base << level stays within K (at least one level).
-inline int levels_within(const int base, const int K) {
+// The constants above, overridable per call (spalm.conf keys asl_*). The
+// defaults are the constants.
+struct params {
+    double subrow_write_entries = kSubrowWriteEntries;
+    double min_cost_ratio = kMinCostRatio;
+    double min_cost = kMinCost;
+    int max_levels = kMaxLevels; // 1 to kMaxLevels
+};
+
+// Levels to count: base << level stays within K (at least one level, at
+// most max_levels, clamped to [1, kMaxLevels]).
+inline int levels_within(
+    const int base, const int K, const int max_levels = kMaxLevels
+) {
+    const int cap = std::clamp(max_levels, 1, kMaxLevels);
     int levels = 1;
-    while (levels < kMaxLevels && base > 0 &&
+    while (levels < cap && base > 0 &&
            (static_cast<long long>(base) << levels) <= K)
         ++levels;
     return levels;
@@ -179,7 +193,8 @@ inline column_counts count_columns(
 // Modelled cost of multiplying the subrows of `sparse` with the packed
 // slices of `packed` at one level (see the top of this file).
 inline double side_cost(
-    const column_counts &sparse, const column_counts &packed, const int level
+    const column_counts &sparse, const column_counts &packed, const int level,
+    const double subrow_write_entries = kSubrowWriteEntries
 ) {
     double cost = 0;
     const auto &e = sparse.entries[level];
@@ -187,7 +202,7 @@ inline double side_cost(
     const auto &sl = packed.slices[level];
     for (size_t c = 0; c < e.size(); ++c)
         cost += static_cast<double>(sl[c]) *
-                (static_cast<double>(e[c]) + kSubrowWriteEntries * sr[c]);
+                (static_cast<double>(e[c]) + subrow_write_entries * sr[c]);
     return cost;
 }
 
@@ -197,11 +212,12 @@ inline double side_cost(
 inline double cost0_bound(
     const long long r_entries, const int r_rows, const int r_height,
     const long long s_entries, const int s_rows, const int s_height,
-    const bool r_sparse, const bool s_sparse
+    const bool r_sparse, const bool s_sparse,
+    const double subrow_write_entries = kSubrowWriteEntries
 ) {
     const double r_slices = r_height > 0 ? (r_rows + r_height - 1.0) / r_height : 0;
     const double s_slices = s_height > 0 ? (s_rows + s_height - 1.0) / s_height : 0;
-    const double per_entry = 1 + kSubrowWriteEntries;
+    const double per_entry = 1 + subrow_write_entries;
     return (r_sparse ? static_cast<double>(r_entries) * per_entry * std::ceil(s_slices) : 0.0) +
            (s_sparse ? static_cast<double>(s_entries) * per_entry * std::ceil(r_slices) : 0.0);
 }
@@ -224,17 +240,19 @@ struct decision {
 
 // r_sparse: R's subrows are multiplied with packed S (SD, DD); s_sparse:
 // S's subrows with packed R (DS, DD). Both count tables need the same
-// levels. Below min_cost at level 0 nothing is lengthened.
+// levels. Below p.min_cost at level 0 nothing is lengthened.
 inline decision choose(
     const column_counts &r, const column_counts &s, const bool r_sparse,
-    const bool s_sparse, const double min_cost = kMinCost
+    const bool s_sparse, const params &p
 ) {
     decision d;
-    const int levels = std::min(r.levels, s.levels);
+    const int levels = std::min(
+        {r.levels, s.levels, std::clamp(p.max_levels, 1, kMaxLevels)}
+    );
     double raw[kMaxLevels] = {};
     for (int l = 0; l < levels; ++l) {
-        raw[l] = (r_sparse ? side_cost(r, s, l) : 0.0) +
-                 (s_sparse ? side_cost(s, r, l) : 0.0);
+        raw[l] = (r_sparse ? side_cost(r, s, l, p.subrow_write_entries) : 0.0) +
+                 (s_sparse ? side_cost(s, r, l, p.subrow_write_entries) : 0.0);
         double e = 1e300;
         if (r_sparse) e = std::min(e, entries_per_subrow(r, l));
         if (s_sparse) e = std::min(e, entries_per_subrow(s, l));
@@ -243,12 +261,22 @@ inline decision choose(
     d.cost0 = raw[0];
     for (int l = 0; l < levels; ++l)
         d.cost[l] = raw[0] > 0 ? raw[l] / raw[0] : 1.0;
-    if ((!r_sparse && !s_sparse) || raw[0] < min_cost) return d;
+    if ((!r_sparse && !s_sparse) || raw[0] < p.min_cost) return d;
     while (d.level + 1 < levels &&
-           d.per_subrow[d.level] < kSubrowWriteEntries &&
-           raw[d.level + 1] <= kMinCostRatio * raw[d.level])
+           d.per_subrow[d.level] < p.subrow_write_entries &&
+           raw[d.level + 1] <= p.min_cost_ratio * raw[d.level])
         ++d.level;
     return d;
+}
+
+// The default constants, with only min_cost given.
+inline decision choose(
+    const column_counts &r, const column_counts &s, const bool r_sparse,
+    const bool s_sparse, const double min_cost = kMinCost
+) {
+    params p;
+    p.min_cost = min_cost;
+    return choose(r, s, r_sparse, s_sparse, p);
 }
 
 } // namespace slice_length_rule

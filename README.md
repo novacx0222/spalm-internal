@@ -76,6 +76,32 @@ are passed as key/value strings:
 | `slice_length`, `tile_size_l2`, `tile_size_l3` | override `parameters/cpu/<type>/tile_sizes.txt` |
 | `auto_slice_length` | for SD, DS and DD only, when `slice_length` is not given: `1` (default) lengthens the configured slice length up to 4x, at most to K, from exact counts of subrows and packed slices (`include/slice_length_rule.h`), and only for inputs whose modelled cost reaches `kMinCost` (below it the length is kept, and inputs too small to reach it are not counted); `0` keeps it; `2` is the earlier rule from global density alone, for comparison. One `[slice-length]` line gives the rule, the counts and the choice |
 
+Tunables. Each defaults to the constant it replaces, so leaving it out keeps
+the behaviour unchanged. Values must be numbers (integers where noted; `5e8`
+counts as one); anything else, or a value out of range, returns `1`.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `thresholds_file` | empty | decision table read by the automatic modes instead of `parameters/cpu/<type>/<buckets>/decision_thresholds.txt` |
+| `dense_mm_threshold` | `-1` (from the file) | integer >= 0: replaces the file's value (dense work below it: every slice pair on SS). The `dense` and `no_threshold` variants still set it to 0 |
+| `auto_sparse_ratio` | `0.1` | every slice pair goes dense when the SS cost is below this fraction of the dense cost (compared in float) |
+| `cost_weight_ss`, `cost_weight_sd`, `cost_weight_ds`, `cost_weight_dd` | `1` | >= 0: each kernel's cost is multiplied by its weight before the two rules above (cost units are not time). With a weight other than 1, a `[weighted-cost]` line gives the weighted costs |
+| `auto_mkl_dense_ratio` | `0.8` | with fallback: MKL dense when the (unweighted) dense cost exceeds this fraction of M·K·N |
+| `auto_mkl_sparse_fallback` | `1` | with fallback: `1` runs MKL sparse when only SS slice pairs remain, `0` keeps them on SPALM SS |
+| `asl_min_cost` | `3e9` | `auto_slice_length = 1`: smallest modelled cost that is lengthened at all (`kMinCost`) |
+| `asl_subrow_write_entries` | `16` | entries one subrow write costs, and the subrow length from which nothing is lengthened (`kSubrowWriteEntries`) |
+| `asl_min_cost_ratio` | `0.9` | a doubling must bring the modelled cost to at most this fraction (`kMinCostRatio`) |
+| `asl_max_levels` | `3` | integer 1 to 3: lengths tried, up to 1x, 2x or 4x the configured one |
+| `r_block_huge_bytes` | `8388608` | integer: SD/DS/DD pack R into a huge-page mapping from this size on (never below 2 MiB); `-1` never |
+| `s_blocks_huge_bytes` | `2097152` | integer: the S packing blocks of all workers share one huge-page mapping from this total on (never below 2 MiB); `-1` never |
+| `ss_column_block_min_cols` | `256` | integer >= 1: fewest output columns per SS column block (automatic or explicit `ss_column_blocks`) |
+| `ss_column_block_cache_divisor` | `3` | integer >= 1: automatic SS column blocks size each block's part of S^T to the shared cache divided by this |
+
+Every call prints one `[conf] ...` line with the effective settings (after
+the thresholds file, the `init_method` variant and the tile sizes), and a
+`[conf-unused] keys=...` line naming any key neither the library nor the
+DuckDB operator reads, so a misspelled key shows in the log.
+
 The four SPALM methods (`sparse`, `dense_*`) use one algorithm for every slice
 pair and never fall back to MKL. The two `FORCE_MKL_*` methods skip slicing and
 the cost model entirely and need no thresholds file. Automatic mode may fall

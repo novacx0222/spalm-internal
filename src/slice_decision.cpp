@@ -37,7 +37,8 @@ static void init_arrays(int nb) {
 }
 
 bool init_decision_thresholds(
-    const char *thres_exec_method, const int type, const char *platform
+    const char *thres_exec_method, const int type, const char *platform,
+    const char *thresholds_file, long long dense_mm_threshold_override
 ) {
     // Reset before the early-return modes too; otherwise a previous
     // "no_features" or forced-MKL call leaks into a later call.
@@ -116,21 +117,27 @@ bool init_decision_thresholds(
         return true;
     }
 
-    const std::string params_base = resolve_path_near_lib(
-        reinterpret_cast<void *>(&init_decision_thresholds), "../parameters",
-        "parameters"
-    );
-    const std::string type_dir = (type == 0) ? "/float" : "/double";
+    const bool custom_file = thresholds_file && thresholds_file[0] != '\0';
     const std::string bucket_dir =
         use_log_buckets ? ("log_" + std::to_string(DEFAULT_NUM_BUCKETS) + "_c" +
                            std::to_string(bucket_log_curvature))
                         : ("linear_" + std::to_string(DEFAULT_NUM_BUCKETS));
-    const std::string thres_path = params_base + "/" + platform + type_dir +
-                                   "/" + bucket_dir +
-                                   "/decision_thresholds.txt";
+    std::string thres_path;
+    if (custom_file) {
+        thres_path = thresholds_file;
+    } else {
+        const std::string params_base = resolve_path_near_lib(
+            reinterpret_cast<void *>(&init_decision_thresholds),
+            "../parameters", "parameters"
+        );
+        const std::string type_dir = (type == 0) ? "/float" : "/double";
+        thres_path = params_base + "/" + platform + type_dir + "/" +
+                     bucket_dir + "/decision_thresholds.txt";
+    }
     std::ifstream inputFile(thres_path);
     if (inputFile.is_open()) {
-        std::cout << "Loaded thresholds from: " << bucket_dir << std::endl;
+        std::cout << "Loaded thresholds from: "
+                  << (custom_file ? thres_path : bucket_dir) << std::endl;
     }
 
     if (!inputFile.is_open()) {
@@ -199,6 +206,9 @@ bool init_decision_thresholds(
     }
     fallback = true;
     no_features = false;
+    if (dense_mm_threshold_override >= 0)
+        dense_mm_threshold =
+            static_cast<unsigned long long>(dense_mm_threshold_override);
 
     if (strcmp(thres_exec_method, "dense") == 0) {
         dense_mm_threshold = 0;

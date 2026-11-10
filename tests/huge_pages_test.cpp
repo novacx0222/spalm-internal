@@ -306,6 +306,39 @@ void check_packing() {
               "no workers, empty or oversized blocks: none");
     }
     {
+        // s_blocks_huge_bytes: the shared mapping from that total on (the
+        // default is kSBlocksHugeBytes, 2 MiB), never with kNoHuge, and
+        // never below 2 MiB whatever the threshold.
+        static_assert(kSBlocksHugeBytes == spalm_huge::kHugeBytes);
+        const size_t count = 8 * 512 * 16 + 16; // 512 KiB + 128 bytes
+        const size_t total = 4 * (count * sizeof(double) + kBlockAlignment - 1) /
+                             kBlockAlignment * kBlockAlignment; // 4 workers
+        worker_blocks<double> def(4, count);
+        worker_blocks<double> at(4, count, total);
+        worker_blocks<double> above(4, count, total + 1);
+        worker_blocks<double> never(4, count, kNoHuge);
+        worker_blocks<double> zero(4, count, 0);
+        worker_blocks<double> small(1, 1000, 0);
+        check(def.shared() == kLinux && at.shared() == kLinux && zero.shared() == kLinux,
+              "S blocks up to the threshold: shared mapping on Linux only");
+        check(!above.shared() && !never.shared(), "S blocks below the threshold or never: own blocks");
+        check(!small.shared(), "S blocks below 2 MiB with threshold 0: own blocks");
+        int bad = 0;
+        for (auto *b : {&def, &at, &above, &never, &zero}) {
+            for (int w = 0; w < 4; ++w) {
+                double *x = b->get(w);
+                bad += x == nullptr || !aligned_to(x, kAlignment);
+                if (x) fill(x, count * sizeof(double), 40 + w);
+            }
+            for (int w = 0; w < 4; ++w) bad += !same(b->get(w), count * sizeof(double), 40 + w);
+        }
+        check(bad == 0, "S blocks at every threshold: usable and disjoint");
+        // The spalm.conf value: -1 is never.
+        check(huge_threshold(-1) == kNoHuge && huge_threshold(0) == 0 &&
+              huge_threshold(8 << 20) == kRBlockHugeBytes,
+              "huge_threshold: -1 never, else the value");
+    }
+    {
         worker_blocks<float> blocks(30, 8 * 2048 * 32 + 32);
         float *a = blocks.get(29);
         check(a != nullptr && blocks.shared() == kLinux, "float blocks: shared mapping on Linux only");

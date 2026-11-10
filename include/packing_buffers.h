@@ -60,9 +60,18 @@ inline constexpr size_t kAlignment = 64;
 inline constexpr size_t kBlockAlignment = 4096;
 
 // R's block is a huge-page mapping from this size on (see the top).
+// Default of the r_block_huge_bytes key.
 inline constexpr size_t kRBlockHugeBytes = size_t(8) << 20;
+// The S blocks of all workers share one mapping from this total on.
+// Default of the s_blocks_huge_bytes key.
+inline constexpr size_t kSBlocksHugeBytes = spalm_huge::kHugeBytes;
 // No huge-page mapping at any size.
 inline constexpr size_t kNoHuge = SIZE_MAX;
+
+// A spalm.conf byte threshold: -1 = never (kNoHuge), else the value.
+inline size_t huge_threshold(const long long bytes) {
+    return bytes < 0 ? kNoHuge : static_cast<size_t>(bytes);
+}
 
 // `count` values, kAlignment-aligned, uninitialized: a huge-page mapping
 // from `huge_from` bytes on (never below spalm_huge::kHugeBytes),
@@ -99,13 +108,15 @@ spalm_huge::array<T> make_buffer(
 }
 
 // One block of `count` values per worker, uninitialized. When the blocks
-// together reach spalm_huge::kHugeBytes they are slices of one huge-page
-// mapping, each starting kBlockAlignment-aligned; otherwise (or if that
-// mapping fails) each worker's block is allocated on its first get(), with
-// posix_memalign as before.
+// together reach `huge_from` (never below spalm_huge::kHugeBytes) they are
+// slices of one huge-page mapping, each starting kBlockAlignment-aligned;
+// otherwise (or if that mapping fails) each worker's block is allocated on
+// its first get(), with posix_memalign as before.
 template <typename T> class worker_blocks {
   public:
-    worker_blocks(int workers, size_t count)
+    worker_blocks(
+        int workers, size_t count, size_t huge_from = kSBlocksHugeBytes
+    )
         : count_(count), own_(workers > 0 ? workers : 0) {
         if (count_ == 0 || workers <= 0 || count_ > SIZE_MAX / sizeof(T))
             return;
@@ -115,7 +126,7 @@ template <typename T> class worker_blocks {
             (bytes + kBlockAlignment - 1) / kBlockAlignment * kBlockAlignment;
         if (stride > SIZE_MAX / static_cast<size_t>(workers)) return;
         const size_t total = stride * static_cast<size_t>(workers);
-        if (total < spalm_huge::kHugeBytes) return;
+        if (total < spalm_huge::kHugeBytes || total < huge_from) return;
         spalm_huge::mapping m;
         if (void *p = spalm_huge::map_huge(total, m)) {
             shared_ = spalm_huge::array<T>(

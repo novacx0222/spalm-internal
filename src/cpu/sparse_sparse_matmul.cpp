@@ -256,18 +256,21 @@ static size_t shared_cache_bytes() {
 // becomes many short jumps. Automatic: none when S^T already fits the
 // shared cache; else the fewest blocks whose part fits a third of it (the
 // rest holds the streamed R rows and output rows), at least 256 columns
-// each, and none when that is impossible.
+// each, and none when that is impossible. The 256 and the 3 are the
+// defaults of min_cols and cache_divisor (keys ss_column_block_min_cols and
+// ss_column_block_cache_divisor).
 static int ss_column_block_count(
     const int requested, const size_t entries, const size_t entry_bytes,
-    const int N
+    const int N, const int min_cols, const int cache_divisor
 ) {
-    const int max_blocks = std::max(1, N / 256);
+    const int max_blocks = std::max(1, N / std::max(1, min_cols));
     if (requested >= 0) return std::max(1, std::min(requested, max_blocks));
     const size_t cache = shared_cache_bytes();
     if (cache == 0) return 1;
     const size_t total = entries * entry_bytes;
     if (total <= cache) return 1;
-    const size_t target = cache / 3;
+    const size_t target = cache / static_cast<size_t>(std::max(1, cache_divisor));
+    if (target == 0) return 1;
     const size_t blocks = (total + target - 1) / target;
     return blocks <= static_cast<size_t>(max_blocks) ? static_cast<int>(blocks)
                                                      : 1;
@@ -402,7 +405,8 @@ void sparse_sparse_matmul(
         const int K = R_ssm.csr_mat.cols;
         int blocks = ss_column_block_count(
             options.ss_column_blocks, static_cast<size_t>(transposed.entries),
-            sizeof(int) + sizeof(T), N
+            sizeof(int) + sizeof(T), N, options.ss_column_block_min_cols,
+            options.ss_column_block_cache_divisor
         );
         std::vector<int> block_starts;
         if (blocks > 1 &&
