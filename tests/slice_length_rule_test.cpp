@@ -5,11 +5,10 @@
 // SuiteSparse-like rows stay at the configured length. Then the two limits:
 // lengths within K, and nothing lengthened below kMinCost (the 16000 grid's
 // uniform_1 is above it, the same rows at 2000 x 16000 below), with the
-// size bound that skips counting. Last, the packing term (v34).
+// size bound that skips counting.
 #include "slice_length_rule.h"
 
 #include <cassert>
-#include <cmath>
 #include <iostream>
 #include <random>
 #include <set>
@@ -87,22 +86,21 @@ static void check_counts_against_reference() {
             const int cols = (m.cols + len - 1) / len;
             assert((int) c.entries[l].size() == cols);
             std::vector<long long> e(cols), sr(cols);
+            std::vector<std::set<int>> sl(cols);
             for (int r = 0; r < m.rows; ++r) {
                 std::set<int> seen;
                 for (int k = m.ptr[r]; k < m.ptr[r + 1]; ++k) {
                     const int col = m.idx[k] / len;
                     ++e[col];
                     seen.insert(col);
+                    sl[col].insert(r / height);
                 }
                 for (int col : seen) ++sr[col];
             }
-            assert(c.height == height && c.base == base);
             for (int col = 0; col < cols; ++col) {
                 assert(c.entries[l][col] == e[col]);
                 assert(c.subrows[l][col] == sr[col]);
-                // The slicing packs a column's subrows height at a time.
-                assert(slr::packed_slices(c, l, col) ==
-                       (sr[col] + height - 1) / height);
+                assert(c.slices[l][col] == (long long) sl[col].size());
             }
         }
     }
@@ -113,7 +111,7 @@ static void check_counts_against_reference() {
     empty.ptr.assign(6, 0);
     const auto c = counts(empty, 512, 3, 12, 4);
     assert(c.entries[0].size() == 2 && c.entries[2].size() == 1);
-    assert(c.subrows[0][0] == 0 && slr::packed_slices(c, 2, 0) == 0);
+    assert(c.subrows[0][0] == 0 && c.slices[2][0] == 0);
     std::cout << "counts match the reference" << std::endl;
 }
 
@@ -345,123 +343,10 @@ static void check_params() {
     std::cout << "params as expected" << std::endl;
 }
 
-// Graph-like rows with locality: `per_row` distinct keys from a window of
-// `width` keys (wrapping) around a random centre per row.
-static test_csr clustered(
-    std::mt19937 &rng, int rows, int cols, int per_row, int width
-) {
-    test_csr m;
-    m.rows = rows;
-    m.cols = cols;
-    std::uniform_int_distribution<int> centre(0, cols - 1), offset(0, width - 1);
-    for (int r = 0; r < rows; ++r) {
-        std::set<int> keys;
-        const int c = centre(rng);
-        while ((int) keys.size() < per_row) keys.insert((c + offset(rng)) % cols);
-        m.idx.insert(m.idx.end(), keys.begin(), keys.end());
-        m.ptr.push_back(static_cast<int>(m.idx.size()));
-    }
-    return m;
-}
-
-// Packing (v34): weight 0 decides as before, with the packed values only
-// logged. With a weight, clustered rows whose packed values grow with the
-// length (32 keys in windows of 4096: 3.8 entries per subrow at 512, packing
-// 1.5x at 2x and 2x at 4x) stop short of 4x, SD at the configured length;
-// uniform 1% rows, whose packing is small and the same at every length,
-// still go to 4x. The minimum cost applies to the multiplication cost.
-// Thin clustered rows (4 keys in windows of 2048, like gnutella05) stay at
-// the configured length at any weight: counted as sliced, their cost rises
-// with the length.
-static void check_packing() {
-    std::mt19937 rng(43);
-    // A double call on the 8488C: R packed at 16 values per key (DS) or 12
-    // (DD), S at 16, tiles 128 / 2304, 30 threads.
-    auto schedule = [](bool rs, bool ss) {
-        slr::packing p;
-        p.pack_s = rs;
-        p.pack_r = ss;
-        p.r_stride = rs ? 12 : 16;
-        p.threads = 30;
-        return p;
-    };
-    {
-        const auto a = clustered(rng, 8192, 8192, 4, 2048);
-        const auto b = clustered(rng, 8192, 8192, 4, 2048);
-        std::cout << "4 keys per row in windows of 2048, 8192 x 8192"
-                  << std::endl;
-        assert(levels_for(a, b) == std::make_tuple(0, 0, 0));
-    }
-    struct named {
-        const char *name;
-        test_csr r, s;
-        bool uniform;
-    };
-    const named inputs[] = {
-        {"uniform 1%, 2000 x 16000", uniform(rng, 2000, 16000, 0.01),
-         uniform(rng, 2000, 16000, 0.01), true},
-        {"32 keys per row in windows of 4096, 8192 x 8192",
-         clustered(rng, 8192, 8192, 32, 4096),
-         clustered(rng, 8192, 8192, 32, 4096), false},
-    };
-    for (const auto &in : inputs) {
-        const auto rc = counts(in.r, 512, 3, 12, 4);
-        const auto sc = counts(in.s, 512, 3, 16, 4);
-        std::cout << in.name << std::endl;
-        for (int sides = 1; sides <= 3; ++sides) {
-            const bool rs = sides & 1, ss = sides & 2;
-            const auto pack = schedule(rs, ss);
-            slr::params p;
-            p.min_cost = 0;
-            const auto plain = slr::choose(rc, sc, rs, ss, p);
-            const auto zero = slr::choose(rc, sc, rs, ss, p, &pack);
-            // Weight 0: the same decision and costs, packed values logged,
-            // at least as many at every longer length.
-            assert(plain.level == 2 && zero.level == 2);
-            assert(zero.cost0 == plain.cost0 && zero.cost0 == zero.mult[0]);
-            for (int l = 0; l < 3; ++l) {
-                assert(zero.cost[l] == plain.cost[l]);
-                assert(zero.mult[l] == plain.mult[l]);
-                assert(plain.packed[l] == 0 && zero.packed[l] > 0);
-            }
-            p.pack_value_entries = 2.0;
-            const auto two = slr::choose(rc, sc, rs, ss, p, &pack);
-            std::cout << "    " << (sides == 1 ? "SD" : sides == 2 ? "DS" : "DD")
-                      << " mult " << zero.mult[0] << "," << zero.mult[1] << ","
-                      << zero.mult[2] << " packed " << zero.packed[0] << ","
-                      << zero.packed[1] << "," << zero.packed[2] << "  level "
-                      << two.level << " at 2 entries per packed value"
-                      << std::endl;
-            if (in.uniform) {
-                assert(two.level == 2);
-                for (int l = 1; l < 3; ++l)
-                    assert(std::fabs(zero.packed[l] / zero.packed[0] - 1) < 0.02);
-            } else {
-                assert(two.level < 2 && (sides != 1 || two.level == 0));
-                assert(zero.packed[2] > 1.3 * zero.packed[0]);
-            }
-            assert(two.cost0 == zero.cost0 && two.mult[2] == zero.mult[2]);
-            const double w0 = zero.mult[0] + 2.0 * zero.packed[0];
-            const double want = (zero.mult[1] + 2.0 * zero.packed[1]) / w0;
-            assert(std::fabs(two.cost[1] - want) <= 1e-12 * want);
-            // The minimum cost compares the multiplication cost.
-            p.min_cost = zero.mult[0];
-            assert(slr::choose(rc, sc, rs, ss, p, &pack).level == two.level);
-            p.min_cost = zero.mult[0] * 1.01;
-            assert(slr::choose(rc, sc, rs, ss, p, &pack).level == 0);
-        }
-    }
-    // Default params leave packing out.
-    assert(slr::params{}.pack_value_entries == slr::kPackValueEntries &&
-           slr::kPackValueEntries == 0.0);
-    std::cout << "packing as expected" << std::endl;
-}
-
 int main() {
     check_counts_against_reference();
     check_decisions();
     check_limits();
     check_params();
-    check_packing();
     return 0;
 }

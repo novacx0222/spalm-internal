@@ -2,10 +2,7 @@
 // (exact, sampled, and a long row from column tests), the per-table work and slice
 // pairs, and the dense path's packing schedule (a copy of the loops of
 // dense_dense_matmul()). Every count must be the same for 1 and 3 threads.
-// Also the slice-length rule's packed values (slice_length_rule.h), from
-// counts of the CSR alone, against that schedule on the slices themselves.
 #include "candidate_work.h"
-#include "slice_length_rule.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -368,75 +365,13 @@ static void check_long_row() {
     assert(brute_entries(R, S, K) == 64);
 }
 
-// slice_length_rule::packed_values() at each level (lengths are powers of
-// two, as the slicing shifts keys), from the CSR counts,
-// equals the packing schedule of the matrices sliced at that length: R
-// slices x length x r_stride plus S slice packs x length x s_stride, for
-// either side alone and both, several tile sizes and thread counts.
-static void check_rule_packing() {
-    namespace slr = slice_length_rule;
-    std::mt19937 rng(19);
-    struct shape {
-        int M, N, K, base;
-        std::vector<double> dr, ds;
-        int band;
-    };
-    const std::vector<shape> shapes = {
-        {300, 200, 1000, 64, {0.003, 0.01}, {0.002, 0.02}, 24},
-        {500, 700, 900, 128, {0.004}, {0.01, 0.0}, 16},
-        {120, 90, 700, 32, {0.05, 0.3}, {0.2}, 12},
-    };
-    for (const shape &sh : shapes) {
-        csr_data R = random_csr(sh.M, sh.K, sh.dr, sh.band, rng);
-        csr_data S = random_csr(sh.N, sh.K, sh.ds, sh.band, rng);
-        const int levels = slr::levels_within(sh.base, sh.K);
-        assert(levels == 3);
-        const auto rc = slr::count_columns(R.ptr.data(), R.idx.data(), R.rows,
-                                           sh.K, sh.base, levels, 12, 3);
-        const auto sc = slr::count_columns(S.ptr.data(), S.idx.data(), S.rows,
-                                           sh.K, sh.base, levels, 16, 3);
-        for (int l = 0; l < levels; ++l) {
-            const int sl = sh.base << l;
-            ss_matrix<double> Rm, Sm;
-            build(R, sh.K, sl, 12, Rm, 2);
-            build(S, sh.K, sl, 16, Sm, 2);
-            for (const auto &tiles : {std::pair{128, 2304}, std::pair{16, 24},
-                                      std::pair{40, 60}}) {
-                for (int threads : {1, 5, 30}) {
-                    const auto d = cw::dense_schedule_counts(
-                        Rm, Sm, tiles.first, tiles.second, threads);
-                    for (int sides = 1; sides <= 3; ++sides) {
-                        slr::packing p;
-                        p.pack_r = sides & 1;
-                        p.pack_s = sides & 2;
-                        p.r_stride = p.pack_s ? 12 : 16;
-                        p.tile_size_l2 = tiles.first;
-                        p.tile_size_l3 = tiles.second;
-                        p.threads = threads;
-                        const double want =
-                            (double) sl *
-                            ((p.pack_r ? (double) d.r_packs * p.r_stride : 0.0) +
-                             (p.pack_s ? (double) d.s_packs * p.s_stride : 0.0));
-                        assert(slr::packed_values(rc, sc, l, p) == want);
-                    }
-                }
-            }
-        }
-        // Nothing packed: no values.
-        slr::packing none;
-        assert(slr::packed_values(rc, sc, 0, none) == 0.0);
-    }
-}
-
 int main() {
     assert(init_decision_thresholds("sparse", 1, "cpu"));
     check_random();
     check_constant_ratio();
     check_long_row();
-    check_rule_packing();
     std::cout << "PASS: candidate_work counts against brute force (features, "
                  "result entries exact and sampled, a long row, work and "
                  "slice pairs per table, dense packing schedule), the same "
-                 "for 1 and 3 threads; the slice-length rule's packed values "
-                 "match that schedule\n";
+                 "for 1 and 3 threads\n";
 }

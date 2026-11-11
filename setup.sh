@@ -35,11 +35,8 @@ Build libraries (in container):
 
 Threshold finding:
   find-thresholds [args...]   Run find_thresholds.py in the container.
-                      Outputs go to parameters/: decision_thresholds.txt (stage
-                      table) and calibration.txt (stages rblock, asl).
-                      Pass any find_thresholds.py options.
+                      Outputs go to parameters/. Pass any find_thresholds.py options.
                       Example: ./setup.sh find-thresholds --dtype float32
-                      Example: ./setup.sh find-thresholds --dtype float64 --stages rblock,asl
 
 Other:
   help               Show this message.

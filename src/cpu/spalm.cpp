@@ -264,44 +264,13 @@ static unsigned long long weighted_cost(
 // Sides whose subrows the decision table multiplies with packed slices of
 // the other side: R for SD, S for DS, both for DD or mixed tables. Only SS
 // slice pairs: neither, and the slice length stays as configured.
-static void used_algorithms(bool (&used)[4]) {
-    for (bool &u : used) u = false;
+static void sparse_sides(bool &r_sparse, bool &s_sparse) {
+    bool used[4] = {};
     for (int left = 0; left <= num_buckets; ++left)
         for (int right = 0; right <= num_buckets; ++right)
             used[get_alg(left, right)] = true;
-}
-
-static void sparse_sides(bool &r_sparse, bool &s_sparse) {
-    bool used[4];
-    used_algorithms(used);
     r_sparse = used[DENSE_DENSE_LEFT_INNER_KERNEL] || used[DENSE_DENSE];
     s_sparse = used[DENSE_DENSE_RIGHT_INNER_KERNEL] || used[DENSE_DENSE];
-}
-
-// What dense_dense_matmul() will pack for this decision table
-// (get_dense_packing_policy() there): with selective packing, R for DS and
-// DD, S for SD and DD; R at 16 values per key when only DS reads it.
-static slice_length_rule::packing dense_packing(
-    const cpu_execution_options &options, const int r_height,
-    const int s_height, const int tile_size_l2, const int tile_size_l3,
-    const int threads
-) {
-    bool used[4];
-    used_algorithms(used);
-    const bool selective = options.selective_packing;
-    slice_length_rule::packing p;
-    p.pack_r = !selective || used[DENSE_DENSE] ||
-               used[DENSE_DENSE_RIGHT_INNER_KERNEL];
-    p.pack_s = !selective || used[DENSE_DENSE] ||
-               used[DENSE_DENSE_LEFT_INNER_KERNEL];
-    const bool bitmaps = !selective || used[DENSE_DENSE];
-    p.r_stride =
-        options.ds_aligned_panels && p.pack_r && !bitmaps ? 16 : r_height;
-    p.s_stride = s_height;
-    p.tile_size_l2 = tile_size_l2;
-    p.tile_size_l3 = tile_size_l3;
-    p.threads = threads;
-    return p;
 }
 
 // auto_slice_length = 1: the slice length from exact counts of subrows and
@@ -310,8 +279,7 @@ static int choose_slice_length_by_counts(
     const int configured, const int *Ri, const int *Rj, const int M,
     const int *Si, const int *Sj, const int N, const int K,
     const int r_height, const int s_height, const int threads,
-    const slice_length_rule::params &rule,
-    const slice_length_rule::packing &pack
+    const slice_length_rule::params &rule
 ) {
     bool r_sparse = false, s_sparse = false;
     sparse_sides(r_sparse, s_sparse);
@@ -341,34 +309,21 @@ static int choose_slice_length_by_counts(
     const auto s = slice_length_rule::count_columns(
         Si, Sj, N, K, configured, levels, s_height, threads
     );
-    const auto d =
-        slice_length_rule::choose(r, s, r_sparse, s_sparse, rule, &pack);
+    const auto d = slice_length_rule::choose(r, s, r_sparse, s_sparse, rule);
     const int length = configured << d.level;
     print_time(
         "[slice-length-count]",
         std::chrono::high_resolution_clock::now() - begin
     );
-    // cost: with packing, relative to the configured length; cost0: the
-    // multiplication cost there (the minimum cost's measure); mult and
-    // packed: per length, what find_thresholds.py replays the rule on for
-    // other weights (10 digits, so the replay decides as the library does).
-    auto list = [levels](const double *x, const int digits) {
-        const auto saved = std::cout.precision(digits);
-        for (int l = 0; l < levels; ++l) std::cout << (l ? "," : "") << x[l];
-        std::cout.precision(saved);
-    };
     std::cout << "[slice-length] rule=counts configured=" << configured
               << " chosen=" << length << " sides=" << sides
               << " entries_per_subrow=";
-    list(d.per_subrow, 10);
+    for (int l = 0; l < levels; ++l)
+        std::cout << (l ? "," : "") << d.per_subrow[l];
     std::cout << " cost=";
-    list(d.cost, 6);
-    std::cout << " cost0=" << d.cost0 << " mult=";
-    list(d.mult, 10);
-    std::cout << " packed=";
-    list(d.packed, 10);
-    std::cout << " pack_value_entries=" << rule.pack_value_entries
-              << std::endl;
+    for (int l = 0; l < levels; ++l)
+        std::cout << (l ? "," : "") << d.cost[l];
+    std::cout << " cost0=" << d.cost0 << std::endl;
     return length;
 }
 
@@ -718,15 +673,10 @@ int spalm_matmul(
         rule.subrow_write_entries = options.asl_subrow_write_entries;
         rule.min_cost_ratio = options.asl_min_cost_ratio;
         rule.min_cost = options.asl_min_cost;
-        rule.pack_value_entries = options.asl_pack_value_entries;
         rule.max_levels = options.asl_max_levels;
         sl = choose_slice_length_by_counts(
             slice_length, Ri, Rj, M, Si, Sj, N, K, R_ik_slice_height,
-            S_ik_slice_height, threads, rule,
-            dense_packing(
-                options, R_ik_slice_height, S_ik_slice_height, tile_size_l2,
-                tile_size_l3, threads
-            )
+            S_ik_slice_height, threads, rule
         );
     } else if (options.auto_slice_length == 2) {
         sl = choose_slice_length_by_density(slice_length, Ri, M, Si, N, K);
@@ -951,11 +901,9 @@ static constexpr const char *kKnownConfKeys[] = {
     "cost_weight_ds", "cost_weight_dd", "auto_sparse_ratio",
     "auto_mkl_dense_ratio", "auto_mkl_sparse_fallback", "dense_mm_threshold",
     "thresholds_file", "asl_min_cost", "asl_subrow_write_entries",
-    "asl_min_cost_ratio", "asl_pack_value_entries", "asl_max_levels",
-    "r_block_huge_bytes",
+    "asl_min_cost_ratio", "asl_max_levels", "r_block_huge_bytes",
     "s_blocks_huge_bytes", "ss_column_block_min_cols",
     "ss_column_block_cache_divisor", "log_candidate_work",
-    "ss_page_huge_entries", "calibration_file",
     // DuckDB operator (duckdb-spalm)
     "result_base_offset", "result_compact_rows", "result_fresh_mapping",
     "result_huge_pages", "result_parallel_zero", "result_prefault",
@@ -990,7 +938,6 @@ static void print_conf(
               << " asl_min_cost=" << o.asl_min_cost
               << " asl_subrow_write_entries=" << o.asl_subrow_write_entries
               << " asl_min_cost_ratio=" << o.asl_min_cost_ratio
-              << " asl_pack_value_entries=" << o.asl_pack_value_entries
               << " asl_max_levels=" << o.asl_max_levels
               << " tile_size_l2=" << tile_size_l2
               << " tile_size_l3=" << tile_size_l3
@@ -1001,7 +948,6 @@ static void print_conf(
               << " ds_aligned_panels=" << o.ds_aligned_panels
               << " r_block_huge_bytes=" << o.r_block_huge_bytes
               << " s_blocks_huge_bytes=" << o.s_blocks_huge_bytes
-              << " ss_page_huge_entries=" << o.ss_page_huge_entries
               << " ss_contiguous=" << o.ss_contiguous
               << " ss_column_blocks=" << o.ss_column_blocks
               << " ss_column_block_min_cols=" << o.ss_column_block_min_cols
@@ -1020,30 +966,6 @@ static void print_conf(
         any = true;
     }
     if (any) std::cout << std::endl;
-}
-
-// One line on calibration.txt: the file read (or none), the keys this call
-// took from it (those not given to spalm()), and keys it does not use.
-static void print_calibration(
-    const calibration_values &c, const int n, const char **keys
-) {
-    std::cout << "[calibration] file=" << (c.path.empty() ? "none" : c.path)
-              << " used=";
-    bool any = false;
-    for (const auto &[key, value] : c.values) {
-        bool given = false;
-        for (int i = 0; i < n; i++) given |= strcmp(keys[i], key.c_str()) == 0;
-        if (given) continue;
-        std::cout << (any ? "," : "") << key;
-        any = true;
-    }
-    if (!any) std::cout << "-";
-    if (!c.ignored.empty()) {
-        std::cout << " ignored=";
-        for (size_t i = 0; i < c.ignored.size(); i++)
-            std::cout << (i ? "," : "") << c.ignored[i];
-    }
-    std::cout << std::endl;
 }
 
 // sparse_out: the result goes there as row blocks (spalm_sparse()); ret
@@ -1111,23 +1033,9 @@ static int spalm_impl(
         return invalid("M * N is too large for 32-bit result offsets");
     }
 
-    auto get_key = [&](const char *key) -> const char * {
+    auto get_str = [&](const char *key, const char *def) -> const char * {
         for (int i = 0; i < n; i++)
             if (strcmp(keys[i], key) == 0) return vals[i];
-        return nullptr;
-    };
-    // Per-machine defaults of the calibrated keys (slice_decision.h): a key
-    // given here wins, then calibration.txt, then the built-in default.
-    calibration_values calibration;
-    {
-        const char *file = get_key("calibration_file");
-        if (!read_calibration(type, "cpu", file ? file : "", calibration)) {
-            return SPALM_CONFIG_ERROR;
-        }
-    }
-    auto get_str = [&](const char *key, const char *def) -> const char * {
-        if (const char *v = get_key(key)) return v;
-        if (const char *v = calibration.find(key)) return v;
         return def;
     };
     auto get_int = [&](const char *key, int def) -> int {
@@ -1223,26 +1131,20 @@ static int spalm_impl(
         get_double("asl_subrow_write_entries", options.asl_subrow_write_entries);
     options.asl_min_cost_ratio =
         get_double("asl_min_cost_ratio", options.asl_min_cost_ratio);
-    options.asl_pack_value_entries =
-        get_double("asl_pack_value_entries", options.asl_pack_value_entries);
     const long long asl_max_levels =
         get_ll("asl_max_levels", options.asl_max_levels);
     options.r_block_huge_bytes =
         get_ll("r_block_huge_bytes", options.r_block_huge_bytes);
     options.s_blocks_huge_bytes =
         get_ll("s_blocks_huge_bytes", options.s_blocks_huge_bytes);
-    options.ss_page_huge_entries =
-        get_ll("ss_page_huge_entries", options.ss_page_huge_entries);
     const long long column_block_min_cols =
         get_ll("ss_column_block_min_cols", options.ss_column_block_min_cols);
     const long long column_block_cache_divisor = get_ll(
         "ss_column_block_cache_divisor", options.ss_column_block_cache_divisor
     );
     if (!bad_number.empty()) {
-        std::cerr << "spalm: " << bad_number << " is not a valid number";
-        if (!get_key(bad_number.c_str()) && calibration.find(bad_number.c_str()))
-            std::cerr << " (in " << calibration.path << ")";
-        std::cerr << std::endl;
+        std::cerr << "spalm: " << bad_number << " is not a valid number"
+                  << std::endl;
         return SPALM_INVALID_ARGUMENT;
     }
     if (options.cost_weight_ss < 0 || options.cost_weight_sd < 0 ||
@@ -1259,21 +1161,20 @@ static int spalm_impl(
         return invalid("dense_mm_threshold must be -1 (from the thresholds file) or at least 0");
     }
     if (options.asl_min_cost < 0 || options.asl_subrow_write_entries < 0 ||
-        options.asl_min_cost_ratio < 0 || options.asl_pack_value_entries < 0) {
+        options.asl_min_cost_ratio < 0) {
         return invalid(
-            "asl_min_cost, asl_subrow_write_entries, asl_min_cost_ratio and "
-            "asl_pack_value_entries must be at least 0"
+            "asl_min_cost, asl_subrow_write_entries and asl_min_cost_ratio "
+            "must be at least 0"
         );
     }
     if (asl_max_levels < 1 || asl_max_levels > slice_length_rule::kMaxLevels) {
         return invalid("asl_max_levels must be 1, 2 or 3");
     }
     options.asl_max_levels = static_cast<int>(asl_max_levels);
-    if (options.r_block_huge_bytes < -1 || options.s_blocks_huge_bytes < -1 ||
-        options.ss_page_huge_entries < -1) {
+    if (options.r_block_huge_bytes < -1 || options.s_blocks_huge_bytes < -1) {
         return invalid(
-            "r_block_huge_bytes, s_blocks_huge_bytes and ss_page_huge_entries "
-            "must be -1 (never) or at least 0"
+            "r_block_huge_bytes and s_blocks_huge_bytes must be -1 (never) or "
+            "at least 0"
         );
     }
     if (column_block_min_cols < 1 || column_block_min_cols > INT_MAX ||
@@ -1335,7 +1236,6 @@ static int spalm_impl(
         options, init_method, bucket_method, thresholds_file, slice_length,
         tile_size_l2, tile_size_l3, n, keys
     );
-    print_calibration(calibration, n, keys);
     // std::cout << "Tile size join dim: " << tile_size_join_dim << std::endl;
     std::cout << "Tile size L2: " << tile_size_l2 << std::endl;
     std::cout << "Tile size L3: " << tile_size_l3 << std::endl;
