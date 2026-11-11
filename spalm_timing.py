@@ -78,6 +78,59 @@ def parse_slice_length(text):
     return int(configured), int(chosen), sides, value
 
 
+def _float_list(rest, name, line):
+    match = re.search(rf" {name}=(\S+)", rest)
+    if match is None:
+        raise ValueError(f"no {name}= in {line!r}")
+    try:
+        values = [float(x) for x in match.group(1).split(",")]
+    except ValueError:
+        raise ValueError(f"malformed {name}= in {line!r}") from None
+    if not all(math.isfinite(v) and v >= 0 for v in values):
+        raise ValueError(f"invalid {name}= in {line!r}")
+    return values
+
+
+def parse_slice_length_levels(text):
+    """The counts rule's line with its per-length lists (v34), or None when
+    the rule did not run: a dict with configured, chosen, sides, cost0,
+    per_subrow, mult and packed (one value per length tried, the configured
+    first) and pack_value_entries. A line without them ("(not counted)", or
+    a library before v34) raises ValueError."""
+    match = _single(text, _SLICE_LENGTH_LINE, "[slice-length]")
+    if match is None:
+        return None
+    configured, chosen, sides, rest = match.groups()
+    line = match.group(0)
+    if " cost0=" not in rest:
+        raise ValueError(f"slice length not counted: {line!r}")
+    out = {"configured": int(configured), "chosen": int(chosen),
+           "sides": sides,
+           "cost0": _float_list(rest, "cost0", line)[0],
+           "per_subrow": _float_list(rest, "entries_per_subrow", line),
+           "mult": _float_list(rest, "mult", line),
+           "packed": _float_list(rest, "packed", line),
+           "pack_value_entries":
+               _float_list(rest, "pack_value_entries", line)[0]}
+    levels = len(out["mult"])
+    if len(out["packed"]) != levels or len(out["per_subrow"]) != levels:
+        raise ValueError(f"lists of different lengths in {line!r}")
+    if out["chosen"] not in [out["configured"] << l for l in range(levels)]:
+        raise ValueError(f"chosen is not a length tried: {line!r}")
+    return out
+
+
+_CONF_NUMBER = r"\[conf\] .* {key}=(\S+)"
+
+
+def parse_conf_number(text, key):
+    """A numeric setting of the call's "[conf]" line."""
+    matches = re.findall(_CONF_NUMBER.format(key=re.escape(key)), text)
+    if len(matches) != 1:
+        raise ValueError(f"{key}: {len(matches)} [conf] values")
+    return float(matches[0])
+
+
 def parse_r_block(text):
     """(r_bytes, r_huge) of the dense path's packing-buffers line."""
     match = _single(text, _BUFFERS_LINE, "[dense-packing-buffers]")

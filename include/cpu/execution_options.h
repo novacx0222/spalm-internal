@@ -67,10 +67,12 @@ struct cpu_execution_options {
 
     // Slice length rule, auto_slice_length = 1 (slice_length_rule.h).
     // Keys: asl_min_cost, asl_subrow_write_entries, asl_min_cost_ratio,
-    // asl_max_levels (1 to 3: lengths up to 1x, 2x or 4x the configured).
+    // asl_pack_value_entries (0: packing not modelled), asl_max_levels (1 to
+    // 3: lengths up to 1x, 2x or 4x the configured).
     double asl_min_cost = 3e9;
     double asl_subrow_write_entries = 16.0;
     double asl_min_cost_ratio = 0.9;
+    double asl_pack_value_entries = 0.0;
     int asl_max_levels = 3;
 
     // Packing buffers of SD/DS/DD (packing_buffers.h): R's block is a
@@ -85,8 +87,9 @@ struct cpu_execution_options {
     // never (key: ss_page_huge_entries).
     long long ss_page_huge_entries = 1LL << 21;
 
-    // asl_min_cost, r_block_huge_bytes and ss_page_huge_entries may also come
-    // from parameters/cpu/<type>/calibration.txt, written per machine by
+    // asl_min_cost, asl_pack_value_entries, r_block_huge_bytes and
+    // ss_page_huge_entries may also come from
+    // parameters/cpu/<type>/calibration.txt, written per machine by
     // find_thresholds.py and calibrate_run.py from synthetic inputs. A key
     // given to spalm() wins over the file, the file over these defaults
     // (keys: calibration_file = a path, or "none" to skip the file).

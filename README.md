@@ -77,7 +77,7 @@ are passed as key/value strings:
 | `compact_keys` | `1` (default) keeps only join keys used by both inputs and renumbers them densely, so every kernel and MKL backend runs on K' <= K; `0` disables it |
 | `bucket_method` | `linear_100` (default) or `log_100_cC` |
 | `slice_length`, `tile_size_l2`, `tile_size_l3` | override `parameters/cpu/<type>/tile_sizes.txt` |
-| `auto_slice_length` | for SD, DS and DD only, when `slice_length` is not given: `1` (default) lengthens the configured slice length up to 4x, at most to K, from exact counts of subrows and packed slices (`include/slice_length_rule.h`), and only for inputs whose modelled cost reaches `kMinCost` (below it the length is kept, and inputs too small to reach it are not counted); `0` keeps it; `2` is the earlier rule from global density alone, for comparison. One `[slice-length]` line gives the rule, the counts and the choice |
+| `auto_slice_length` | for SD, DS and DD only, when `slice_length` is not given: `1` (default) lengthens the configured slice length up to 4x, at most to K, from exact counts of the subrows of each slice column (a column's slices are its nonempty subrows, a slice height at a time) and, with `asl_pack_value_entries` > 0, of the values the dense path packs at each length (`include/slice_length_rule.h`), and only for inputs whose multiplication cost reaches `asl_min_cost` (below it the length is kept, and inputs too small to reach it are not counted); `0` keeps it; `2` is the earlier rule from global density alone, for comparison. One `[slice-length]` line gives the rule, the choice, and per length tried the entries per subrow, the modelled cost relative to the configured length (`cost=`), the multiplication cost (`mult=`, `cost0=` at the configured length) and the packed values (`packed=`) |
 
 Tunables. Each defaults to the constant it replaces, so leaving it out keeps
 the behaviour unchanged. Values must be numbers (integers where noted; `5e8`
@@ -91,9 +91,10 @@ counts as one); anything else, or a value out of range, returns `1`.
 | `cost_weight_ss`, `cost_weight_sd`, `cost_weight_ds`, `cost_weight_dd` | `1` | >= 0: each kernel's cost is multiplied by its weight before the two rules above (cost units are not time). With a weight other than 1, a `[weighted-cost]` line gives the weighted costs |
 | `auto_mkl_dense_ratio` | `0.8` | with fallback: MKL dense when the (unweighted) dense cost exceeds this fraction of M·K·N |
 | `auto_mkl_sparse_fallback` | `1` | with fallback: `1` runs MKL sparse when only SS slice pairs remain, `0` keeps them on SPALM SS |
-| `asl_min_cost` | `3e9` | `auto_slice_length = 1`: smallest modelled cost that is lengthened at all (`kMinCost`). Calibrated (see below) |
+| `asl_min_cost` | `3e9` | `auto_slice_length = 1`: smallest multiplication cost at the configured length that is lengthened at all (`kMinCost`). Calibrated (see below) |
 | `asl_subrow_write_entries` | `16` | entries one subrow write costs, and the subrow length from which nothing is lengthened (`kSubrowWriteEntries`) |
 | `asl_min_cost_ratio` | `0.9` | a doubling must bring the modelled cost to at most this fraction (`kMinCostRatio`) |
+| `asl_pack_value_entries` | `0` | >= 0: entries one packed value costs; the rule adds this times the values SD/DS/DD pack at each length (R once per slice, S once per R task) to the multiplication cost. `0` leaves packing out. Calibrated (see below) |
 | `asl_max_levels` | `3` | integer 1 to 3: lengths tried, up to 1x, 2x or 4x the configured one |
 | `r_block_huge_bytes` | `8388608` | integer: SD/DS/DD pack R into a huge-page mapping from this size on (never below 2 MiB); `-1` never. Calibrated (see below) |
 | `s_blocks_huge_bytes` | `2097152` | integer: the S packing blocks of all workers share one huge-page mapping from this total on (never below 2 MiB); `-1` never |
@@ -103,13 +104,16 @@ counts as one); anything else, or a value out of range, returns `1`.
 | `ss_column_block_cache_divisor` | `3` | integer >= 1: automatic SS column blocks size each block's part of S^T to the shared cache divided by this |
 | `log_candidate_work` | `0` | `1`: diagnostics for comparing whole-call alternatives offline (`include/candidate_work.h`), printed after the MM cost lines; decisions and results do not change. `[candidate-features]`: M, N, K after key compaction, slice length and heights, stored entries per side, `flops` (multiply-adds of the product: the sum over keys of R entries x S entries), `row_bound` (the sum over R rows of min(N, the row's multiply-adds): an upper bound on result entries), slices per side, and slice pairs that share a column. `[candidate-work] <table> bucket\|nnz ss= sd= ds= dd=`: the cost model for the decision table as loaded (`table`, before the whole-call rules), with every pair SS (`all_ss`), and after `set_to_all_dense()` (`all_dense`). `bucket` is the cost model itself (so `table bucket` repeats the MM cost lines); `nnz` uses each density bucket's stored entries instead of its representative count. `[candidate-entries] budget= estimate= exact= draws= rows= long_rows= visits=`: the result entries, twice, with budgets of 2^27 and 2^20 S entries read. Counted exactly when `flops` is at most the budget; otherwise estimated from R rows drawn in proportion to their row bound (standard error at most `row_bound` / (2 sqrt(draws))). A drawn row with more than 8 N multiply-adds (`long_rows`) is estimated from 64 of its result columns, each tested for a key in common with the row. `[candidate-pairs] <table> ss= sd= ds= dd= pack_r= pack_s= bitmaps= r_stride= fixed_alg=`: the slice pairs per kernel, and what the dense path would pack under that table. `[candidate-dense-schedule]`: the R slices the dense path packs (each once) and the S slices (once per R task), with their stored entries, and its (R task, S tile) tasks |
 
-Calibrated defaults: `asl_min_cost`, `r_block_huge_bytes` and
-`ss_page_huge_entries` are read from `parameters/cpu/<type>/calibration.txt`
+Calibrated defaults: `asl_min_cost`, `asl_pack_value_entries`,
+`r_block_huge_bytes` and `ss_page_huge_entries` are read from `parameters/cpu/<type>/calibration.txt`
 when that file exists (`key: value` lines, `#` comments; a repeated key or a
 line without a colon returns `2`, a bad value `1`). A key passed to `spalm()`
 wins over the file, the file over the built-in default. The file is
 per machine and not in the repository: `find_thresholds.py` writes
-`r_block_huge_bytes` and `asl_min_cost` (stages `rblock` and `asl`), and the
+`r_block_huge_bytes` (stage `rblock`) and `asl_pack_value_entries` with
+`asl_min_cost` (stage `asl`: uniform, power-law and clustered pairs, the
+weight and the gate chosen together so that no lengthened input runs over
+5% slower than at the configured length), and the
 DuckDB experiment script `calibrate_run.py --page-sweep` (not in this
 repository) writes `ss_page_huge_entries`, all measured on matrices they generate. One
 `[calibration] file=<path|none> used=<keys taken from it>` line follows the

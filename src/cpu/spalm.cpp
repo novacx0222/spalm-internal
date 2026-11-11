@@ -264,13 +264,44 @@ static unsigned long long weighted_cost(
 // Sides whose subrows the decision table multiplies with packed slices of
 // the other side: R for SD, S for DS, both for DD or mixed tables. Only SS
 // slice pairs: neither, and the slice length stays as configured.
-static void sparse_sides(bool &r_sparse, bool &s_sparse) {
-    bool used[4] = {};
+static void used_algorithms(bool (&used)[4]) {
+    for (bool &u : used) u = false;
     for (int left = 0; left <= num_buckets; ++left)
         for (int right = 0; right <= num_buckets; ++right)
             used[get_alg(left, right)] = true;
+}
+
+static void sparse_sides(bool &r_sparse, bool &s_sparse) {
+    bool used[4];
+    used_algorithms(used);
     r_sparse = used[DENSE_DENSE_LEFT_INNER_KERNEL] || used[DENSE_DENSE];
     s_sparse = used[DENSE_DENSE_RIGHT_INNER_KERNEL] || used[DENSE_DENSE];
+}
+
+// What dense_dense_matmul() will pack for this decision table
+// (get_dense_packing_policy() there): with selective packing, R for DS and
+// DD, S for SD and DD; R at 16 values per key when only DS reads it.
+static slice_length_rule::packing dense_packing(
+    const cpu_execution_options &options, const int r_height,
+    const int s_height, const int tile_size_l2, const int tile_size_l3,
+    const int threads
+) {
+    bool used[4];
+    used_algorithms(used);
+    const bool selective = options.selective_packing;
+    slice_length_rule::packing p;
+    p.pack_r = !selective || used[DENSE_DENSE] ||
+               used[DENSE_DENSE_RIGHT_INNER_KERNEL];
+    p.pack_s = !selective || used[DENSE_DENSE] ||
+               used[DENSE_DENSE_LEFT_INNER_KERNEL];
+    const bool bitmaps = !selective || used[DENSE_DENSE];
+    p.r_stride =
+        options.ds_aligned_panels && p.pack_r && !bitmaps ? 16 : r_height;
+    p.s_stride = s_height;
+    p.tile_size_l2 = tile_size_l2;
+    p.tile_size_l3 = tile_size_l3;
+    p.threads = threads;
+    return p;
 }
 
 // auto_slice_length = 1: the slice length from exact counts of subrows and
@@ -279,7 +310,8 @@ static int choose_slice_length_by_counts(
     const int configured, const int *Ri, const int *Rj, const int M,
     const int *Si, const int *Sj, const int N, const int K,
     const int r_height, const int s_height, const int threads,
-    const slice_length_rule::params &rule
+    const slice_length_rule::params &rule,
+    const slice_length_rule::packing &pack
 ) {
     bool r_sparse = false, s_sparse = false;
     sparse_sides(r_sparse, s_sparse);
@@ -309,21 +341,34 @@ static int choose_slice_length_by_counts(
     const auto s = slice_length_rule::count_columns(
         Si, Sj, N, K, configured, levels, s_height, threads
     );
-    const auto d = slice_length_rule::choose(r, s, r_sparse, s_sparse, rule);
+    const auto d =
+        slice_length_rule::choose(r, s, r_sparse, s_sparse, rule, &pack);
     const int length = configured << d.level;
     print_time(
         "[slice-length-count]",
         std::chrono::high_resolution_clock::now() - begin
     );
+    // cost: with packing, relative to the configured length; cost0: the
+    // multiplication cost there (the minimum cost's measure); mult and
+    // packed: per length, what find_thresholds.py replays the rule on for
+    // other weights (10 digits, so the replay decides as the library does).
+    auto list = [levels](const double *x, const int digits) {
+        const auto saved = std::cout.precision(digits);
+        for (int l = 0; l < levels; ++l) std::cout << (l ? "," : "") << x[l];
+        std::cout.precision(saved);
+    };
     std::cout << "[slice-length] rule=counts configured=" << configured
               << " chosen=" << length << " sides=" << sides
               << " entries_per_subrow=";
-    for (int l = 0; l < levels; ++l)
-        std::cout << (l ? "," : "") << d.per_subrow[l];
+    list(d.per_subrow, 10);
     std::cout << " cost=";
-    for (int l = 0; l < levels; ++l)
-        std::cout << (l ? "," : "") << d.cost[l];
-    std::cout << " cost0=" << d.cost0 << std::endl;
+    list(d.cost, 6);
+    std::cout << " cost0=" << d.cost0 << " mult=";
+    list(d.mult, 10);
+    std::cout << " packed=";
+    list(d.packed, 10);
+    std::cout << " pack_value_entries=" << rule.pack_value_entries
+              << std::endl;
     return length;
 }
 
@@ -673,10 +718,15 @@ int spalm_matmul(
         rule.subrow_write_entries = options.asl_subrow_write_entries;
         rule.min_cost_ratio = options.asl_min_cost_ratio;
         rule.min_cost = options.asl_min_cost;
+        rule.pack_value_entries = options.asl_pack_value_entries;
         rule.max_levels = options.asl_max_levels;
         sl = choose_slice_length_by_counts(
             slice_length, Ri, Rj, M, Si, Sj, N, K, R_ik_slice_height,
-            S_ik_slice_height, threads, rule
+            S_ik_slice_height, threads, rule,
+            dense_packing(
+                options, R_ik_slice_height, S_ik_slice_height, tile_size_l2,
+                tile_size_l3, threads
+            )
         );
     } else if (options.auto_slice_length == 2) {
         sl = choose_slice_length_by_density(slice_length, Ri, M, Si, N, K);
@@ -901,7 +951,8 @@ static constexpr const char *kKnownConfKeys[] = {
     "cost_weight_ds", "cost_weight_dd", "auto_sparse_ratio",
     "auto_mkl_dense_ratio", "auto_mkl_sparse_fallback", "dense_mm_threshold",
     "thresholds_file", "asl_min_cost", "asl_subrow_write_entries",
-    "asl_min_cost_ratio", "asl_max_levels", "r_block_huge_bytes",
+    "asl_min_cost_ratio", "asl_pack_value_entries", "asl_max_levels",
+    "r_block_huge_bytes",
     "s_blocks_huge_bytes", "ss_column_block_min_cols",
     "ss_column_block_cache_divisor", "log_candidate_work",
     "ss_page_huge_entries", "calibration_file",
@@ -939,6 +990,7 @@ static void print_conf(
               << " asl_min_cost=" << o.asl_min_cost
               << " asl_subrow_write_entries=" << o.asl_subrow_write_entries
               << " asl_min_cost_ratio=" << o.asl_min_cost_ratio
+              << " asl_pack_value_entries=" << o.asl_pack_value_entries
               << " asl_max_levels=" << o.asl_max_levels
               << " tile_size_l2=" << tile_size_l2
               << " tile_size_l3=" << tile_size_l3
@@ -1171,6 +1223,8 @@ static int spalm_impl(
         get_double("asl_subrow_write_entries", options.asl_subrow_write_entries);
     options.asl_min_cost_ratio =
         get_double("asl_min_cost_ratio", options.asl_min_cost_ratio);
+    options.asl_pack_value_entries =
+        get_double("asl_pack_value_entries", options.asl_pack_value_entries);
     const long long asl_max_levels =
         get_ll("asl_max_levels", options.asl_max_levels);
     options.r_block_huge_bytes =
@@ -1205,10 +1259,10 @@ static int spalm_impl(
         return invalid("dense_mm_threshold must be -1 (from the thresholds file) or at least 0");
     }
     if (options.asl_min_cost < 0 || options.asl_subrow_write_entries < 0 ||
-        options.asl_min_cost_ratio < 0) {
+        options.asl_min_cost_ratio < 0 || options.asl_pack_value_entries < 0) {
         return invalid(
-            "asl_min_cost, asl_subrow_write_entries and asl_min_cost_ratio "
-            "must be at least 0"
+            "asl_min_cost, asl_subrow_write_entries, asl_min_cost_ratio and "
+            "asl_pack_value_entries must be at least 0"
         );
     }
     if (asl_max_levels < 1 || asl_max_levels > slice_length_rule::kMaxLevels) {

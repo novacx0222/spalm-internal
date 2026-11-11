@@ -11,7 +11,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import spalm_calibration as calib  # noqa: E402
 from spalm_timing import (DENSE_MM_LABEL, SPARSE_MM_LABEL,  # noqa: E402
-                          parse_r_block, parse_slice_length, parse_time)
+                          parse_conf_number, parse_r_block,
+                          parse_slice_length, parse_slice_length_levels,
+                          parse_time)
 
 # One call's output as printed by print_time ("%s %.6f ms").
 OUTPUT = """SPALM MATMUL
@@ -79,6 +81,53 @@ class ParseSliceLengthTest(unittest.TestCase):
     def test_repeated_line_is_an_error(self):
         with self.assertRaises(ValueError):
             parse_slice_length(f"{self.LINE}\n{self.LINE}\n")
+
+
+class ParseSliceLengthLevelsTest(unittest.TestCase):
+    LINE = ("[slice-length] rule=counts configured=512 chosen=1024 sides=R "
+            "entries_per_subrow=1.73,2.49,3.5 cost=1,0.8,0.7 cost0=2.53e+08 "
+            "mult=253000000,186000000,140000000 "
+            "packed=263000000,268000000,268435456 pack_value_entries=0.5")
+
+    def test_counted(self):
+        d = parse_slice_length_levels(f"x\n{self.LINE}\n")
+        self.assertEqual((d["configured"], d["chosen"], d["sides"]),
+                         (512, 1024, "R"))
+        self.assertEqual(d["cost0"], 2.53e8)
+        self.assertEqual(d["per_subrow"], [1.73, 2.49, 3.5])
+        self.assertEqual(d["mult"], [2.53e8, 1.86e8, 1.4e8])
+        self.assertEqual(d["packed"], [2.63e8, 2.68e8, 268435456.0])
+        self.assertEqual(d["pack_value_entries"], 0.5)
+
+    def test_rule_did_not_run(self):
+        self.assertIsNone(parse_slice_length_levels("[mm-total] 1.0 ms\n"))
+
+    def test_lines_without_the_lists_are_errors(self):
+        for line in (
+                "[slice-length] rule=counts configured=512 chosen=512 sides=RS "
+                "cost0_bound=12 (not counted)",
+                # v33: no mult= or packed=
+                ParseSliceLengthTest.LINE):
+            with self.subTest(line=line), self.assertRaises(ValueError):
+                parse_slice_length_levels(line)
+
+    def test_inconsistent_lists_are_errors(self):
+        for old, new in ((" packed=263000000,", " packed="),
+                         (" mult=253000000,", " mult=nan,"),
+                         ("chosen=1024", "chosen=768")):
+            with self.subTest(old=old), self.assertRaises(ValueError):
+                parse_slice_length_levels(self.LINE.replace(old, new))
+
+    def test_conf_number(self):
+        conf = ("[conf] init_method=auto asl_min_cost=3e+09 "
+                "asl_subrow_write_entries=16 asl_min_cost_ratio=0.9 "
+                "asl_pack_value_entries=0 asl_max_levels=3\n")
+        self.assertEqual(parse_conf_number(conf, "asl_min_cost"), 3e9)
+        self.assertEqual(parse_conf_number(conf, "asl_min_cost_ratio"), 0.9)
+        with self.assertRaises(ValueError):
+            parse_conf_number(conf, "asl_missing")
+        with self.assertRaises(ValueError):
+            parse_conf_number(conf + conf, "asl_min_cost")
 
 
 class ParseRBlockTest(unittest.TestCase):
@@ -151,8 +200,16 @@ class ChooseMinCostTest(unittest.TestCase):
 
     def test_every_cell_faster_takes_the_lowest_cost(self):
         value, lengthened = calib.choose_min_cost([(3e9, 1, 0.9), (1e9, 1, 0.5)])
-        self.assertEqual(value, 1e9)
+        self.assertEqual(value, 1e9 * (1 - calib.LOWEST_CUT_MARGIN))
         self.assertEqual(lengthened, {0, 1})
+
+    def test_lowest_cut_stays_below_the_cost_as_written(self):
+        # cost0 logged as 1.17172e+07 may be 11717249.6 exactly: a cut
+        # written as the logged value would leave that cell at the base.
+        for logged in (1.17172e7, 9.99999e8, 1e9, 3.33333e9):
+            exact_low = logged * (1 - 5e-6)
+            value, _ = calib.choose_min_cost([(logged, 1, 0.5)])
+            self.assertLess(float(calib.format_value(value)), exact_low)
 
     def test_no_cell_faster_never_lengthens(self):
         value, lengthened = calib.choose_min_cost([(3e9, 1, 1.1), (1e9, 1, 1.0)])
@@ -187,6 +244,114 @@ class ChooseMinCostTest(unittest.TestCase):
         for cells in ([], [(1e9, 0, 1)], [(-1, 1, 1)], [(1e9, 1, math.nan)]):
             with self.subTest(cells=cells), self.assertRaises(ValueError):
                 calib.choose_min_cost(cells)
+
+
+def _cell(cost0, mult, packed, times, per_subrow=(2.0, 3.0, 4.0)):
+    return {"cost0": cost0, "mult": list(mult), "packed": list(packed),
+            "per_subrow": list(per_subrow)[:len(mult)],
+            "times": dict(enumerate(times))}
+
+
+class RuleLevelTest(unittest.TestCase):
+    def test_replays_the_library_rule(self):
+        # Weight 0: the multiplication cost alone, 0.75 then 0.8 of the
+        # previous length: both doublings.
+        args = ([2.0, 3.0, 4.0], [100.0, 75.0, 60.0], [10.0, 20.0, 40.0])
+        self.assertEqual(calib.rule_level(*args, 0.0, 16, 0.9), 2)
+        # Weight 1: 110 -> 95 (0.86) -> 100: one doubling.
+        self.assertEqual(calib.rule_level(*args, 1.0, 16, 0.9), 1)
+        # Weight 2: 120 -> 115 (0.96): none.
+        self.assertEqual(calib.rule_level(*args, 2.0, 16, 0.9), 0)
+        # Full subrows stop the doubling; the ratio bounds it.
+        self.assertEqual(calib.rule_level([20.0, 3.0, 4.0], *args[1:], 0.0,
+                                          16, 0.9), 0)
+        self.assertEqual(calib.rule_level(*args, 0.0, 16, 0.7), 0)
+        self.assertEqual(calib.rule_level([2.0], [100.0], [10.0], 0.0, 16,
+                                          0.9), 0)
+
+
+class ChoosePackAndGateTest(unittest.TestCase):
+    # Uniform-like: packing small and flat, 4x is faster. Thin-like: packing
+    # as large as the multiplication and growing, 4x is slower.
+    WINNER = ([100.0, 75.0, 60.0], [10.0, 10.0, 10.0], [1.0, 0.85, 0.7])
+    LOSER = ([100.0, 75.0, 60.0], [80.0, 95.0, 100.0], [1.0, 1.1, 1.3])
+
+    def test_weight_that_keeps_winners_and_stops_losers(self):
+        cells = [_cell(1e9, *self.WINNER), _cell(2e9, *self.LOSER),
+                 _cell(3e9, *self.WINNER), _cell(4e9, *self.LOSER)]
+        pick = calib.choose_pack_and_gate(cells, 16, 0.9)
+        # Losers: 100+80w -> 75+95w -> 60+100w: 4x up to w = 0.517, 2x up to
+        # 0.652, then the configured length. Winners: 4x up to w = 7.5.
+        # Weight 0 (and up to 0.5) lengthens the losers: never is the only
+        # safe gate. Weights 1, 2 and 4 keep the winners at 4x and the
+        # losers at 512 with the lowest gate; the middle one wins.
+        rows = {r["weight"]: r for r in pick["per_weight"]}
+        for w in (0.0, 0.0625, 0.125, 0.25, 0.5):
+            self.assertEqual(rows[w]["min_cost"], calib.NEVER_MIN_COST)
+            self.assertEqual(rows[w]["slower"], 2)
+        for w in (1.0, 2.0, 4.0):
+            self.assertEqual((rows[w]["lengthened"], rows[w]["slower"]),
+                             (2, 0))
+        self.assertGreater(rows[8.0]["score"], rows[2.0]["score"])
+        self.assertEqual(pick["weight"], 2.0)
+        self.assertEqual(pick["min_cost"], 1e9 * (1 - calib.LOWEST_CUT_MARGIN))
+        self.assertEqual(pick["levels"], [2, 0, 2, 0])
+
+    def test_no_loser_keeps_weight_zero_and_the_lowest_gate(self):
+        cells = [_cell(1e8 * (i + 1), *self.WINNER) for i in range(4)]
+        pick = calib.choose_pack_and_gate(cells, 16, 0.9)
+        self.assertEqual(pick["weight"], 0.0)
+        self.assertEqual(pick["min_cost"], 1e8 * (1 - calib.LOWEST_CUT_MARGIN))
+        self.assertEqual(pick["levels"], [2, 2, 2, 2])
+
+    def test_gate_above_a_small_slow_cell(self):
+        # A small cell that loses at any weight (flat packing) is left out by
+        # the gate, halfway between it and the next cost.
+        small = ([100.0, 75.0, 60.0], [10.0, 10.0, 10.0], [1.0, 1.2, 1.4])
+        cells = [_cell(1e6, *small), _cell(1e8, *self.WINNER),
+                 _cell(1e9, *self.WINNER)]
+        pick = calib.choose_pack_and_gate(cells, 16, 0.9)
+        self.assertEqual(pick["weight"], 0.0)
+        self.assertAlmostEqual(pick["min_cost"], math.sqrt(1e6 * 1e8))
+        self.assertEqual(pick["levels"], [0, 2, 2])
+
+    def test_unsafe_cell_above_every_gain_means_never(self):
+        big_loser = ([100.0, 75.0, 60.0], [10.0, 10.0, 10.0],
+                     [1.0, 1.1, 1.2])
+        cells = [_cell(1e8, *self.WINNER), _cell(1e10, *big_loser)]
+        pick = calib.choose_pack_and_gate(cells, 16, 0.9, weights=(0.0,))
+        self.assertEqual(pick["min_cost"], calib.NEVER_MIN_COST)
+        self.assertEqual(pick["levels"], [0, 0])
+
+    def test_slightly_slower_within_the_tolerance_is_safe(self):
+        cells = [_cell(1e8, [100.0, 75.0], [10.0, 10.0], [1.0, 1.04]),
+                 _cell(1e9, [100.0, 75.0], [10.0, 10.0], [1.0, 0.5])]
+        pick = calib.choose_pack_and_gate(cells, 16, 0.9, weights=(0.0,))
+        # Lengthening both is safe but the slower one only costs: the gate
+        # leaves it out.
+        self.assertEqual(pick["levels"], [0, 1])
+
+    def test_a_weight_picking_an_unmeasured_level_is_capped(self):
+        # Packed values that fall with the length: a weight lengthens
+        # further than weight 0 did; the longest measured level stands in.
+        cell = _cell(1e9, [100.0, 95.0, 70.0], [100.0, 40.0, 10.0],
+                     [1.0, 0.9])
+        pick = calib.choose_pack_and_gate([cell], 16, 0.9,
+                                          weights=(0.0, 1.0))
+        rows = {r["weight"]: r for r in pick["per_weight"]}
+        self.assertEqual(rows[0.0]["capped"], 0)
+        self.assertEqual(rows[1.0]["capped"], 1)
+        self.assertEqual(pick["levels"], [1])
+
+    def test_bad_cells(self):
+        with self.assertRaises(ValueError):
+            calib.choose_pack_and_gate([], 16, 0.9)
+        with self.assertRaises(ValueError):
+            calib.choose_pack_and_gate([_cell(1.0, [1.0], [1.0], [])], 16,
+                                       0.9)
+        with self.assertRaises(ValueError):
+            calib.choose_pack_and_gate(
+                [_cell(1.0, [1.0, 0.5], [1.0, 1.0], [1.0, 0.0])], 16, 0.9)
 
 
 class HugeBreakEvenTest(unittest.TestCase):

@@ -367,7 +367,7 @@ template <class T> void check_tunables() {
               "cost_weight_ds=1 cost_weight_dd=1 ",
               " auto_slice_length=1 asl_min_cost=3e+09 "
               "asl_subrow_write_entries=16 asl_min_cost_ratio=0.9 "
-              "asl_max_levels=3 ",
+              "asl_pack_value_entries=0 asl_max_levels=3 ",
               " r_block_huge_bytes=8388608 s_blocks_huge_bytes=2097152 "
               "ss_page_huge_entries=2097152 ",
               " ss_column_blocks=-1 ss_column_block_min_cols=256 "
@@ -394,6 +394,7 @@ template <class T> void check_tunables() {
         const std::string good = file(
             "# measured on synthetic inputs\n"
             "asl_min_cost: 5e9\n"
+            "asl_pack_value_entries: 1.5\n"
             "r_block_huge_bytes: 4194304  # 4 MiB\n"
             "\n"
             "ss_page_huge_entries: -1\n"
@@ -405,27 +406,29 @@ template <class T> void check_tunables() {
         assert(status == SPALM_OK && backend_calls == 1);
         std::string line = conf_line(log);
         for (const char *want :
-             {" asl_min_cost=5e+09 ", " r_block_huge_bytes=4194304 ",
-              " ss_page_huge_entries=-1 "})
+             {" asl_min_cost=5e+09 ", " asl_pack_value_entries=1.5 ",
+              " r_block_huge_bytes=4194304 ", " ss_page_huge_entries=-1 "})
             assert(line.find(want) != std::string::npos);
         assert(
             count(log, "[calibration] file=" + good +
-                           " used=asl_min_cost,r_block_huge_bytes,"
-                           "ss_page_huge_entries ignored=later_key\n") == 1
+                           " used=asl_min_cost,asl_pack_value_entries,"
+                           "r_block_huge_bytes,ss_page_huge_entries "
+                           "ignored=later_key\n") == 1
         );
         assert(count(log, "[conf-unused]") == 0);
         log = run(
             {{"init_method", "sparse"},
              {"calibration_file", good.c_str()},
              {"asl_min_cost", "1e10"},
+             {"asl_pack_value_entries", "0"},
              {"ss_page_huge_entries", "1048576"}},
             &status
         );
         assert(status == SPALM_OK && backend_calls == 1);
         line = conf_line(log);
         for (const char *want :
-             {" asl_min_cost=1e+10 ", " r_block_huge_bytes=4194304 ",
-              " ss_page_huge_entries=1048576 "})
+             {" asl_min_cost=1e+10 ", " asl_pack_value_entries=0 ",
+              " r_block_huge_bytes=4194304 ", " ss_page_huge_entries=1048576 "})
             assert(line.find(want) != std::string::npos);
         assert(
             count(log, "[calibration] file=" + good +
@@ -446,15 +449,17 @@ template <class T> void check_tunables() {
         const std::string not_number = file("r_block_huge_bytes: 1 MiB\n");
         const std::string out_of_range = file("ss_page_huge_entries: -2\n");
         const std::string negative_cost = file("asl_min_cost: -1\n");
+        const std::string negative_pack =
+            file("asl_pack_value_entries: -0.5\n");
         for (const std::string &bad :
-             {not_number, out_of_range, negative_cost}) {
+             {not_number, out_of_range, negative_cost, negative_pack}) {
             run({{"init_method", "sparse"}, {"calibration_file", bad.c_str()}},
                 &status);
             assert(status == SPALM_INVALID_ARGUMENT && backend_calls == 0);
         }
         for (const std::string &f :
              {no_colon, twice, empty_value, not_number, out_of_range,
-              negative_cost})
+              negative_cost, negative_pack})
             std::remove(f.c_str());
     }
     // Values are read and printed; 5e8 is an integer; misspelled keys are
@@ -470,6 +475,7 @@ template <class T> void check_tunables() {
              {"asl_min_cost", "1e10"},
              {"asl_subrow_write_entries", "8"},
              {"asl_min_cost_ratio", "0.75"},
+             {"asl_pack_value_entries", "0.25"},
              {"asl_max_levels", "2"},
              {"r_block_huge_bytes", "-1"},
              {"s_blocks_huge_bytes", "4194304"},
@@ -488,7 +494,8 @@ template <class T> void check_tunables() {
               "auto_mkl_sparse_fallback=0 cost_weight_ss=30 cost_weight_sd=1 "
               "cost_weight_ds=1 cost_weight_dd=0.5 ",
               " asl_min_cost=1e+10 asl_subrow_write_entries=8 "
-              "asl_min_cost_ratio=0.75 asl_max_levels=2 ",
+              "asl_min_cost_ratio=0.75 asl_pack_value_entries=0.25 "
+              "asl_max_levels=2 ",
               " r_block_huge_bytes=-1 s_blocks_huge_bytes=4194304 ",
               " ss_column_block_min_cols=64 ss_column_block_cache_divisor=4 "})
             assert(line.find(want) != std::string::npos);
@@ -511,6 +518,8 @@ template <class T> void check_tunables() {
         {{"asl_min_cost", "-1"}},
         {{"asl_subrow_write_entries", "-1"}},
         {{"asl_min_cost_ratio", "-0.5"}},
+        {{"asl_pack_value_entries", "-1"}},
+        {{"asl_pack_value_entries", "nan"}},
         {{"asl_max_levels", "0"}},
         {{"asl_max_levels", "4"}},
         {{"r_block_huge_bytes", "-2"}},

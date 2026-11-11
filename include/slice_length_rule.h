@@ -6,15 +6,19 @@
 // with every packed S slice of that column: per R entry, one packed row per
 // S slice, and per R subrow, one read-modify-write of its 16 outputs per S
 // slice. DS is the same with the sides swapped (packed R slices, S
-// subrows). Per slice column c, with n_S(c) the nonempty S slices:
+// subrows). A slice is not a fixed group of rows: the slicing packs the
+// nonempty subrows of each column, in row order, into slices of
+// slice-height subrows (create_slice_csc() in ss_mat.h), so column c has
+// n_S(c) = ceil(subrows_S(c) / height_S) slices (packed_slices()). Per
+// slice column c:
 //
 //     SD cost(c) = n_S(c) * (entries_R(c) + kSubrowWriteEntries * subrows_R(c))
 //
 // Doubling the slice length merges subrows (fewer writes) but also merges
-// the packed slices of two columns, so every entry is multiplied with the
-// slices of both: when S is spread thinly over the keys (most SuiteSparse
-// inputs), n_S(c) nearly doubles and the doubling adds work instead of
-// saving it. The rule therefore doubles only while
+// the slices of two columns, so every entry is multiplied with the slices
+// of both: when the subrows barely merge (rows spread thinly over the keys,
+// most SuiteSparse inputs), n_S(c) and entries_R(c) both double, and so
+// does the cost. The rule therefore doubles only while
 //   - the sparse side's subrows hold fewer than kSubrowWriteEntries entries
 //     on average (beyond that, encoder-1025 measured the configured 512 to be
 //     fastest: the saved writes no longer pay for longer packed panels), and
@@ -40,6 +44,30 @@
 // medium graph-like inputs still ran slower at 2048 (pajek_fa, gnutella05:
 // 1.1-1.4x library time), and a few just below kMinCost ran faster
 // (priebel_192bit DD and SD: 0.96-0.97x).
+//
+// v34 changed two things, both found on v26's SuiteSparse calls, where
+// graph-like inputs (gnutella05, pajek_fa) ran 1.1-1.5x slower at 2048 than
+// at 512 while the model expected 0.55-0.75:
+//   - Slices. Up to v33, n_S(c) counted the groups of height_S consecutive
+//     rows with a nonempty subrow in c, which the slicing does not form. On
+//     thinly spread inputs that count is near the number of row groups at
+//     every length, so the model saw the merged subrows and not the doubled
+//     slices; counted as sliced, the cost of such inputs rises with the
+//     length. On uniform inputs every group holds height_S subrows and the
+//     two counts agree. Costs (cost0 among them) are smaller than before on
+//     thin inputs; kMinCost was measured on the earlier count.
+//   - Packing. The multiplication cost leaves out the packing itself: every
+//     packed slice is zeroed and filled, length x stride values however few
+//     entries it holds (dense_dense_matmul.cpp), packed S slices once per R
+//     task. Per column that is n(c) x length x stride, which grows with the
+//     length when the subrows barely merge. In v26's gnutella05 calls the
+//     extra time at 2048 was all in the kernel phase (SD +1.2, DS +2.5, DD
+//     +3.6 ms of 4.9-6.7), with packing buffers 4x larger. Each length's
+//     cost adds pack_value_entries times its packed values
+//     (packed_values(), exact for the call's schedule). The weight is
+//     measured per machine on synthetic inputs (calibration.txt,
+//     find_thresholds.py asl); the built-in 0 leaves packing out. The
+//     minimum cost applies to the multiplication cost alone.
 
 #include <algorithm>
 #include <cmath>
@@ -61,6 +89,9 @@ inline constexpr double kMinCostRatio = 0.9;
 // all at least 3.3e9; the largest below, 2.4e9 (priebel_192bit DD), ran
 // the same at 2048 as at 512.
 inline constexpr double kMinCost = 3e9;
+// A packed value (one key of one row of a packed slice, zeroed and then
+// filled) costs this many multiplied entries. 0: packing is not modelled.
+inline constexpr double kPackValueEntries = 0.0;
 // Lengths tried: base, 2 * base and 4 * base. Also the capacity of the
 // count tables below: params::max_levels may only lower it.
 inline constexpr int kMaxLevels = 3;
@@ -71,6 +102,7 @@ struct params {
     double subrow_write_entries = kSubrowWriteEntries;
     double min_cost_ratio = kMinCostRatio;
     double min_cost = kMinCost;
+    double pack_value_entries = kPackValueEntries;
     int max_levels = kMaxLevels; // 1 to kMaxLevels
 };
 
@@ -87,28 +119,40 @@ inline int levels_within(
     return levels;
 }
 
-// Per slice column, for slice length base << level: stored entries,
-// nonempty subrows and nonempty slices (slice_height rows each).
+// Per slice column, for slice length base << level: stored entries and
+// nonempty subrows.
 struct column_counts {
     int levels = 0;
+    int base = 0;   // slice length of level 0
+    int height = 1; // slice height: subrows per slice
     std::vector<long long> entries[kMaxLevels];
     std::vector<long long> subrows[kMaxLevels];
-    std::vector<long long> slices[kMaxLevels];
 };
+
+// Slices of column c at a level, as the slicing forms them: its nonempty
+// subrows, height at a time.
+inline long long packed_slices(
+    const column_counts &x, const int level, const size_t c
+) {
+    return (x.subrows[level][c] + x.height - 1) / x.height;
+}
 
 inline int column_count(const int K, const long long length) {
     return static_cast<int>((K + length - 1) / length);
 }
 
 // One pass over a CSR with sorted keys in [0, K). Threads take contiguous
-// ranges of slices; each counts into its own arrays (bounded to 64 MiB in
-// all), which are summed at the end.
+// ranges of rows; each counts into its own arrays (bounded to 64 MiB in
+// all), which are summed at the end. slice_height is kept for
+// packed_slices().
 inline column_counts count_columns(
     const int *row_ptrs, const int *col_idxs, const int rows, const int K,
     const int base, const int levels, const int slice_height, const int threads
 ) {
     column_counts out;
     out.levels = std::clamp(levels, 1, kMaxLevels);
+    out.base = base;
+    out.height = std::max(slice_height, 1);
     int cols[kMaxLevels] = {};
     int offset[kMaxLevels] = {};
     int total = 0;
@@ -118,18 +162,16 @@ inline column_counts count_columns(
         total += cols[l];
         out.entries[l].assign(cols[l], 0);
         out.subrows[l].assign(cols[l], 0);
-        out.slices[l].assign(cols[l], 0);
     }
     if (rows <= 0 || total == 0) return out;
-    const int slice_count = (rows + slice_height - 1) / slice_height;
-    // Per thread: entries, subrows and slices as int (each at most nnz,
-    // which fits an int CSR) plus the last slice seen per column.
-    const size_t thread_bytes = static_cast<size_t>(total) * 4 * sizeof(int);
+    // Per thread: entries and subrows as int (each at most nnz, which fits
+    // an int CSR).
+    const size_t thread_bytes = static_cast<size_t>(total) * 2 * sizeof(int);
     const size_t budget = size_t(64) << 20;
     const int team = static_cast<int>(std::max<size_t>(
         1, std::min<size_t>(
                {static_cast<size_t>(std::max(threads, 1)),
-                static_cast<size_t>(slice_count),
+                static_cast<size_t>(rows),
                 std::max<size_t>(1, budget / thread_bytes)}
            )
     ));
@@ -144,33 +186,24 @@ inline column_counts count_columns(
         const int nt = 1;
 #endif
         std::vector<int> &cnt = local[tid];
-        cnt.assign(static_cast<size_t>(total) * 3, 0);
-        std::vector<int> last_slice(total, -1);
-        const int s0 = static_cast<int>((long long) slice_count * tid / nt);
-        const int s1 =
-            static_cast<int>((long long) slice_count * (tid + 1) / nt);
-        for (int s = s0; s < s1; ++s) {
-            const int r_end = std::min(rows, (s + 1) * slice_height);
-            for (int r = s * slice_height; r < r_end; ++r) {
-                int prev[kMaxLevels] = {-1, -1, -1};
-                for (int k = row_ptrs[r]; k < row_ptrs[r + 1]; ++k) {
-                    const int key = col_idxs[k];
-                    // Out-of-range keys are reported by the slicing later.
-                    if (key < 0 || key >= K) continue;
-                    // floor(key / (base << l)) == floor(key / base) >> l
-                    const int c0 = key / base;
-                    for (int l = 0; l < out.levels; ++l) {
-                        const int c = c0 >> l;
-                        const int i = offset[l] + c;
-                        ++cnt[i];
-                        if (c != prev[l]) {
-                            prev[l] = c;
-                            ++cnt[total + i];
-                        }
-                        if (last_slice[i] != s) {
-                            last_slice[i] = s;
-                            ++cnt[2 * total + i];
-                        }
+        cnt.assign(static_cast<size_t>(total) * 2, 0);
+        const int r0 = static_cast<int>((long long) rows * tid / nt);
+        const int r1 = static_cast<int>((long long) rows * (tid + 1) / nt);
+        for (int r = r0; r < r1; ++r) {
+            int prev[kMaxLevels] = {-1, -1, -1};
+            for (int k = row_ptrs[r]; k < row_ptrs[r + 1]; ++k) {
+                const int key = col_idxs[k];
+                // Out-of-range keys are reported by the slicing later.
+                if (key < 0 || key >= K) continue;
+                // floor(key / (base << l)) == floor(key / base) >> l
+                const int c0 = key / base;
+                for (int l = 0; l < out.levels; ++l) {
+                    const int c = c0 >> l;
+                    const int i = offset[l] + c;
+                    ++cnt[i];
+                    if (c != prev[l]) {
+                        prev[l] = c;
+                        ++cnt[total + i];
                     }
                 }
             }
@@ -183,7 +216,6 @@ inline column_counts count_columns(
                 const int i = offset[l] + c;
                 out.entries[l][c] += cnt[i];
                 out.subrows[l][c] += cnt[total + i];
-                out.slices[l][c] += cnt[2 * total + i];
             }
         }
     }
@@ -199,11 +231,74 @@ inline double side_cost(
     double cost = 0;
     const auto &e = sparse.entries[level];
     const auto &sr = sparse.subrows[level];
-    const auto &sl = packed.slices[level];
     for (size_t c = 0; c < e.size(); ++c)
-        cost += static_cast<double>(sl[c]) *
+        cost += static_cast<double>(packed_slices(packed, level, c)) *
                 (static_cast<double>(e[c]) + subrow_write_entries * sr[c]);
     return cost;
+}
+
+// What dense_dense_matmul() packs (its schedule, as counted by
+// candidate_work::dense_schedule_counts()). Only slice columns with slices
+// on both sides take part. R slices go in blocks of r_per_l3 =
+// min(ceil(tile_size_l3 / R height), the largest such R column), from the
+// start of each column; packed R (DS, DD) holds every R slice once. Each
+// block is split into R tasks: r_div = ceil(threads / S tiles), S tiles =
+// ceil(S slices of the column / s_per_tile), s_per_tile =
+// min(ceil(tile_size_l2 / S height), the largest such S column), and a
+// block of len slices makes ceil(len / ceil(len / r_div)) tasks; packed S
+// (SD, DD) holds every S slice of the column once per R task. A packed
+// slice is length x stride values (stride: the slice height, or 16 for R
+// when only DS reads it, ds_aligned_panels).
+struct packing {
+    bool pack_r = false, pack_s = false;
+    int r_stride = 12, s_stride = 16;
+    int tile_size_l2 = 128, tile_size_l3 = 2304;
+    int threads = 1;
+};
+
+// Values packed at one level (slice length r.base << level); slices as
+// packed_slices() counts them, with r's and s's heights.
+inline double packed_values(
+    const column_counts &r, const column_counts &s, const int level,
+    const packing &p
+) {
+    if (!p.pack_r && !p.pack_s) return 0.0;
+    const size_t cols =
+        std::min(r.subrows[level].size(), s.subrows[level].size());
+    long long max_r = 0, max_s = 0;
+    for (size_t c = 0; c < cols; ++c) {
+        const long long nr = packed_slices(r, level, c);
+        const long long ns = packed_slices(s, level, c);
+        if (!nr || !ns) continue;
+        max_r = std::max(max_r, nr);
+        max_s = std::max(max_s, ns);
+    }
+    if (!max_r || !max_s) return 0.0;
+    auto div_up = [](long long a, long long b) { return (a + b - 1) / b; };
+    const long long s_per_tile = std::max(
+        1LL, std::min<long long>(div_up(p.tile_size_l2, s.height), max_s)
+    );
+    const long long r_per_l3 = std::max(
+        1LL, std::min<long long>(div_up(p.tile_size_l3, r.height), max_r)
+    );
+    const long long threads = std::max(p.threads, 1);
+    long long r_packs = 0, s_packs = 0;
+    for (size_t c = 0; c < cols; ++c) {
+        const long long nr = packed_slices(r, level, c);
+        const long long ns = packed_slices(s, level, c);
+        if (!nr || !ns) continue;
+        r_packs += nr;
+        if (!p.pack_s) continue;
+        const long long r_div = div_up(threads, div_up(ns, s_per_tile));
+        for (long long b = 0; b < nr; b += r_per_l3) {
+            const long long len = std::min(r_per_l3, nr - b);
+            s_packs += div_up(len, div_up(len, r_div)) * ns;
+        }
+    }
+    const double length = static_cast<double>(r.base) * (1LL << level);
+    return length *
+           ((p.pack_r ? static_cast<double>(r_packs) * p.r_stride : 0.0) +
+            (p.pack_s ? static_cast<double>(s_packs) * p.s_stride : 0.0));
 }
 
 // An upper bound of the level-0 cost from sizes alone: per sparse-side
@@ -233,17 +328,21 @@ inline double entries_per_subrow(const column_counts &x, const int level) {
 
 struct decision {
     int level = 0;
-    double cost0 = 0;                      // modelled cost at level 0
-    double cost[kMaxLevels] = {};          // relative to level 0
+    double cost0 = 0;                      // multiplication cost at level 0
+    double cost[kMaxLevels] = {};          // with packing, relative to level 0
     double per_subrow[kMaxLevels] = {};    // entries per nonempty subrow
+    double mult[kMaxLevels] = {};          // multiplication cost
+    double packed[kMaxLevels] = {};        // packed values (packed_values())
 };
 
 // r_sparse: R's subrows are multiplied with packed S (SD, DD); s_sparse:
 // S's subrows with packed R (DS, DD). Both count tables need the same
-// levels. Below p.min_cost at level 0 nothing is lengthened.
+// levels. Each level costs its multiplication cost plus
+// p.pack_value_entries times its packed values (none without `pack`).
+// Below p.min_cost of multiplication at level 0 nothing is lengthened.
 inline decision choose(
     const column_counts &r, const column_counts &s, const bool r_sparse,
-    const bool s_sparse, const params &p
+    const bool s_sparse, const params &p, const packing *pack = nullptr
 ) {
     decision d;
     const int levels = std::min(
@@ -251,17 +350,20 @@ inline decision choose(
     );
     double raw[kMaxLevels] = {};
     for (int l = 0; l < levels; ++l) {
-        raw[l] = (r_sparse ? side_cost(r, s, l, p.subrow_write_entries) : 0.0) +
-                 (s_sparse ? side_cost(s, r, l, p.subrow_write_entries) : 0.0);
+        d.mult[l] =
+            (r_sparse ? side_cost(r, s, l, p.subrow_write_entries) : 0.0) +
+            (s_sparse ? side_cost(s, r, l, p.subrow_write_entries) : 0.0);
+        d.packed[l] = pack ? packed_values(r, s, l, *pack) : 0.0;
+        raw[l] = d.mult[l] + p.pack_value_entries * d.packed[l];
         double e = 1e300;
         if (r_sparse) e = std::min(e, entries_per_subrow(r, l));
         if (s_sparse) e = std::min(e, entries_per_subrow(s, l));
         d.per_subrow[l] = (r_sparse || s_sparse) ? e : 0.0;
     }
-    d.cost0 = raw[0];
+    d.cost0 = d.mult[0];
     for (int l = 0; l < levels; ++l)
         d.cost[l] = raw[0] > 0 ? raw[l] / raw[0] : 1.0;
-    if ((!r_sparse && !s_sparse) || raw[0] < p.min_cost) return d;
+    if ((!r_sparse && !s_sparse) || d.mult[0] < p.min_cost) return d;
     while (d.level + 1 < levels &&
            d.per_subrow[d.level] < p.subrow_write_entries &&
            raw[d.level + 1] <= p.min_cost_ratio * raw[d.level])

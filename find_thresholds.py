@@ -19,14 +19,16 @@ Produces (stage "table"):
   - algorithm_map.csv        (detailed timings)
   - algorithm_map.png        (heatmap visualization)
 
-Stages "rblock" and "asl" measure two defaults of calibration.txt
+Stages "rblock" and "asl" measure three defaults of calibration.txt
 (parameters/<platform>/<type>/, read by the library on every call; a key
 given to spalm() wins), on inputs generated here, never on SuiteSparse or
 grid matrices:
   - r_block_huge_bytes: the R packing block size from which a huge-page
     mapping pays (DS and DD, mapped against not mapped);
-  - asl_min_cost: the smallest modelled cost at which the slice-length rule
-    may lengthen (DD, SD and DS at the configured and the chosen length).
+  - asl_pack_value_entries and asl_min_cost: the slice-length rule's cost
+    of a packed value and the smallest multiplication cost at which it may
+    lengthen (DD, SD and DS at the configured and each longer length up to
+    the rule's choice, chosen together).
 Each writes its cells (rblock_cells.csv, asl_cells.csv) next to it.
 The third key, ss_page_huge_entries, is measured end to end through DuckDB
 (calibrate_run.py --page-sweep, an experiment script kept outside this
@@ -50,7 +52,8 @@ from wurlitzer import STDOUT, pipes
 import spalm_calibration as calib
 from spalm_timing import (DENSE_MM_LABEL, MM_TOTAL_LABEL,
                           SLICE_MM_TOTAL_LABEL, SPARSE_MM_LABEL,
-                          parse_r_block, parse_slice_length, parse_time)
+                          parse_conf_number, parse_r_block,
+                          parse_slice_length_levels, parse_time)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SPALM_BIN = SCRIPT_DIR / "bin"
@@ -638,25 +641,30 @@ def run_dense(lib, A_csr, B_csr, C, method, dtype, threads, label,
     return value, out
 
 
-def interleaved(run_a, run_b, warmup, trials):
-    """Median times of two settings, run alternately (a b, b a, ...) so that
-    drift over the stage hits both alike. Each run returns (seconds, out);
-    also returns the last output of each."""
+def interleaved_many(runs, warmup, trials):
+    """Median times of several settings, run in turn (forward, then
+    backward, ...) so that drift over the stage hits all alike. Each run
+    returns (seconds, out). Returns the medians and the last output of
+    each."""
     for _ in range(warmup):
-        run_a()
-        run_b()
-    times_a, times_b = [], []
-    out_a = out_b = None
+        for fn in runs:
+            fn()
+    times = [[] for _ in runs]
+    outs = [None] * len(runs)
     for t in range(trials):
-        order = ((run_a, times_a), (run_b, times_b))
-        for fn, times in (order if t % 2 == 0 else order[::-1]):
-            value, out = fn()
-            times.append(value)
-            if times is times_a:
-                out_a = out
-            else:
-                out_b = out
-    return calib.median(times_a), calib.median(times_b), out_a, out_b
+        order = range(len(runs)) if t % 2 == 0 else range(len(runs) - 1, -1, -1)
+        for i in order:
+            value, outs[i] = runs[i]()
+            times[i].append(value)
+    return [calib.median(x) for x in times], outs
+
+
+def interleaved(run_a, run_b, warmup, trials):
+    """interleaved_many for two settings: (median a, median b, out a, out
+    b)."""
+    (t_a, t_b), (out_a, out_b) = interleaved_many([run_a, run_b], warmup,
+                                                  trials)
+    return t_a, t_b, out_a, out_b
 
 
 def as_spalm_csr(mat, dtype):
@@ -713,74 +721,171 @@ def generate_fixed_rows_csr(rows, cols, per_row, dtype=np.float64, seed=None):
     return as_spalm_csr(mat, dtype)
 
 
-# asl stage inputs: square n x n, R and S drawn independently. Uniform rows
-# at these densities hold fewer than asl_subrow_write_entries (16) entries
-# per subrow at 512, so the rule considers longer slices; the power-law
-# pairs stand in for the graph-like inputs on which the model overrated
-# longer slices (slice_length_rule.h).
+def generate_clustered_csr(rows, cols, per_row, width, dtype=np.float64,
+                           seed=None):
+    """Graph-like rows with locality: each row draws `per_row` keys uniformly
+    from a window of `width` keys (wrapping at `cols`) around a random
+    centre of its own. Repeated keys in a row merge, so a row may hold
+    somewhat fewer."""
+    rng = np.random.default_rng(seed)
+    centre = rng.integers(0, cols, rows, dtype=np.int64)
+    keys = (np.repeat(centre, per_row) +
+            rng.integers(0, width, rows * per_row, dtype=np.int64)) % cols
+    row_of = np.repeat(np.arange(rows, dtype=np.int64), per_row)
+    flat = np.unique(row_of * cols + keys)
+    indptr = np.zeros(rows + 1, dtype=np.int64)
+    np.cumsum(np.bincount(flat // cols, minlength=rows), out=indptr[1:])
+    mat = csr_matrix(
+        (_random_values(rng, flat.size, dtype), flat % cols, indptr),
+        shape=(rows, cols))
+    return as_spalm_csr(mat, dtype)
+
+
+# asl stage inputs, R and S drawn independently, three families:
+#   - uniform rows, square n x n, at densities whose subrows hold fewer than
+#     asl_subrow_write_entries (16) entries at 512, so the rule considers
+#     longer slices; most gain from them (encoder-1025, the grid);
+#   - power-law rows (Pareto degrees, Zipf keys), square n x n;
+#   - clustered rows (n, K, keys per row, window): graph-like inputs whose
+#     keys merge into fewer subrows at longer lengths. Most are rows the
+#     rule lengthens and whose packed values grow with the length (3.8-8
+#     entries per subrow at 512), so the packing weight decides between
+#     1x, 2x and 4x; the 16384 x 32768 pair with 12 keys packs less at 2x
+#     than at 1x, so only a weight lengthens it. Four have a small K that is
+#     not a power of two (the last slice column pads every packed slice).
+#     The last, 4 keys in windows of 2048, is like gnutella05 (1.4 entries
+#     per subrow at 512): no weight lengthens it, so it is only probed.
 ASL_UNIFORM_DENSITIES = (0.002, 0.005, 0.01, 0.02)
 ASL_POWERLAW_DEGREES = (8, 32)
+ASL_CLUSTERED = ((8192, 8192, 32, 4096), (16384, 16384, 32, 4096),
+                 (16384, 16384, 64, 8192), (16384, 16384, 16, 2048),
+                 (8192, 8192, 24, 2048), (16384, 32768, 24, 4096),
+                 (16384, 32768, 12, 4096),
+                 (16384, 2560, 32, 2560), (16384, 3072, 24, 3072),
+                 (8192, 1536, 24, 1536), (16384, 6144, 32, 3072),
+                 (8192, 8192, 4, 2048))
+# Cells whose probe call took longer than this many seconds are timed
+# at most 3 times per length: their ratios are far from 1 and they take
+# most of the stage's time.
+ASL_LONG_CALL = 1.0
 
 
 def asl_cases(sizes):
-    """(name, n, kind, density or mean degree, seed) per asl input pair."""
+    """One dict per asl input pair: name, family, n (rows of R and of S), k
+    (keys), param (density, mean degree or keys per row), width (clustered
+    windows) and seed."""
     seed = 1000
     for n in sizes:
         for density in ASL_UNIFORM_DENSITIES:
             seed += 2
-            yield f"u{n}_d{density:g}", n, "uniform", density, seed
+            yield dict(name=f"u{n}_d{density:g}", family="uniform", n=n, k=n,
+                       param=density, width=0, seed=seed)
         for degree in ASL_POWERLAW_DEGREES:
             seed += 2
-            yield f"p{n}_k{degree}", n, "powerlaw", degree, seed
+            yield dict(name=f"p{n}_k{degree}", family="powerlaw", n=n, k=n,
+                       param=degree, width=0, seed=seed)
+    for n, k, per_row, width in ASL_CLUSTERED:
+        seed += 2
+        yield dict(name=f"c{n}x{k}_r{per_row}_w{width}", family="clustered",
+                   n=n, k=k, param=per_row, width=width, seed=seed)
 
 
-def make_asl_pair(n, kind, param, seed, dtype):
-    if kind == "uniform":
-        R = generate_uniform_csr(n, n, param, dtype=dtype, seed=seed)
-        S = generate_uniform_csr(n, n, param, dtype=dtype, seed=seed + 1)
+def make_asl_pair(case, dtype):
+    n, k, param, seed = case["n"], case["k"], case["param"], case["seed"]
+    if case["family"] == "uniform":
+        R = generate_uniform_csr(n, k, param, dtype=dtype, seed=seed)
+        S = generate_uniform_csr(n, k, param, dtype=dtype, seed=seed + 1)
         return as_spalm_csr(R, dtype), as_spalm_csr(S, dtype)
-    return (generate_powerlaw_csr(n, n, param, dtype=dtype, seed=seed),
-            generate_powerlaw_csr(n, n, param, dtype=dtype, seed=seed + 1))
+    if case["family"] == "powerlaw":
+        return (generate_powerlaw_csr(n, k, param, dtype=dtype, seed=seed),
+                generate_powerlaw_csr(n, k, param, dtype=dtype,
+                                      seed=seed + 1))
+    return (generate_clustered_csr(n, k, param, case["width"], dtype=dtype,
+                                   seed=seed),
+            generate_clustered_csr(n, k, param, case["width"], dtype=dtype,
+                                   seed=seed + 1))
+
+
+def _joined(values):
+    return ";".join(f"{v:.10g}" for v in values)
 
 
 def run_asl_stage(args, lib, dtype, calibration_path):
-    """Stage "asl": asl_min_cost, the smallest modelled cost at which the
-    slice-length rule (auto_slice_length = 1) may lengthen.
+    """Stage "asl": asl_pack_value_entries and asl_min_cost, the packing
+    weight of the slice-length rule (auto_slice_length = 1) and the
+    smallest multiplication cost at which it may lengthen.
 
-    For each synthetic pair and each of DD, SD and DS, one call without a
-    gate (asl_min_cost = 0) gives the rule's choice and its cost0. Where the
-    rule lengthens, the call is timed ([slice-mm-total]: slice preparation
-    plus multiplication) at the configured and at the chosen length, with
-    fresh buffers as in a DuckDB query (fix_mmap_threshold). The gate is
-    then the cut on cost0 that minimises the geometric mean time
-    over all those cells (choose_min_cost)."""
+    For each synthetic pair and each of DD, SD and DS, one call with packing
+    left out and no gate (both keys 0) gives the rule's choice and its
+    per-length counts: entries per subrow, multiplication cost and packed
+    values. The rule is replayed from them for each weight in
+    calib.PACK_WEIGHTS (checked against the library's choice at weight 0).
+    Where some weight lengthens, the call is timed ([slice-mm-total]: slice
+    preparation plus multiplication) at the configured length and every
+    longer one up to the longest choice, interleaved, with fresh buffers as
+    in a DuckDB query (fix_mmap_threshold). The weight and the gate are then
+    chosen together: the lowest geometric mean time over all those cells
+    among the choices that lengthen no cell more than 5% slower than at the
+    configured length (calib.choose_pack_and_gate)."""
     sizes = [int(s) for s in args.asl_sizes.split(",")]
-    print(f"\n[asl] slice-length gate: sizes {sizes}, "
-          f"{args.warmup} warmup + {args.asl_trials} timed runs per length")
-    C = np.empty(max(sizes) ** 2, dtype=dtype)
-    rows = []
-    for name, n, kind, param, seed in asl_cases(sizes):
-        R, S = make_asl_pair(n, kind, param, seed, dtype)
+    cases = list(asl_cases(sizes))
+    print(f"\n[asl] slice-length packing weight and gate: {len(cases)} input "
+          f"pairs (uniform and power-law at sizes {sizes}, "
+          f"{len(ASL_CLUSTERED)} clustered), {args.warmup} warmup + "
+          f"{args.asl_trials} timed runs per length (at most 3 for calls "
+          f"over {ASL_LONG_CALL:g} s)")
+    C = np.empty(max(c["n"] for c in cases) ** 2, dtype=dtype)
+    rows, cells = [], []
+    rule_params = None
+    for case in cases:
+        R, S = make_asl_pair(case, dtype)
+        name = case["name"]
         print(f"  {name}: nnz R={R.nnz} S={S.nnz}")
         for method in DENSE_METHODS:
-            _, out = run_dense(lib, R, S, C, method, dtype, args.threads,
-                               SLICE_MM_TOTAL_LABEL,
-                               extra={"asl_min_cost": 0})
+            t_probe, out = run_dense(
+                lib, R, S, C, method, dtype, args.threads,
+                SLICE_MM_TOTAL_LABEL,
+                extra={"asl_min_cost": 0, "asl_pack_value_entries": 0})
             try:
-                probe = parse_slice_length(out)
+                probe = parse_slice_length_levels(out)
+                params = (parse_conf_number(out, "asl_subrow_write_entries"),
+                          parse_conf_number(out, "asl_min_cost_ratio"))
             except ValueError as exc:
                 raise BenchmarkError(f"{name} {method}: {exc}") from exc
-            row = {"case": name, "method": method, "n": n,
-                   "nnz_r": R.nnz, "nnz_s": S.nnz}
+            if rule_params is None:
+                rule_params = params
+            elif params != rule_params:
+                raise BenchmarkError(
+                    f"{name} {method}: rule settings {params} differ from "
+                    f"{rule_params}")
+            row = {"case": name, "family": case["family"], "method": method,
+                   "n": case["n"], "k": case["k"], "nnz_r": R.nnz,
+                   "nnz_s": S.nnz}
             if probe is None:
                 print(f"    {method}: rule did not run")
                 rows.append(row)
                 continue
-            configured, chosen, sides, cost0 = probe
-            row.update(configured=configured, chosen=chosen, sides=sides,
-                       cost0=cost0)
-            if chosen == configured:
-                print(f"    {method}: cost0={cost0:.3g} keeps {configured}")
+            configured = probe["configured"]
+            level0 = (probe["chosen"] // configured).bit_length() - 1
+            if level0 != calib.rule_level(probe["per_subrow"], probe["mult"],
+                                          probe["packed"], 0.0, *params):
+                # Only a cost ratio within rounding of the limit can do this.
+                print(f"    warning: {method}: replaying the rule does not "
+                      f"give the library's choice {probe['chosen']}")
+            # Every length some weight picks (packed values need not grow
+            # with the length, so a weight may pick a longer one than 0).
+            top = max(calib.rule_level(probe["per_subrow"], probe["mult"],
+                                       probe["packed"], w, *params)
+                      for w in calib.PACK_WEIGHTS)
+            row.update(configured=configured, sides=probe["sides"],
+                       cost0=probe["cost0"],
+                       per_subrow=_joined(probe["per_subrow"]),
+                       mult=_joined(probe["mult"]),
+                       packed=_joined(probe["packed"]),
+                       probe_chosen=probe["chosen"])
+            if top == 0:
+                print(f"    {method}: cost0={probe['cost0']:.3g} keeps "
+                      f"{configured} at every weight")
                 rows.append(row)
                 continue
 
@@ -789,56 +894,87 @@ def run_asl_stage(args, lib, dtype, calibration_path):
                                          args.threads, SLICE_MM_TOTAL_LABEL,
                                          slice_length=length)
 
-            t_base, t_long, _, _ = interleaved(
-                at(configured), at(chosen), args.warmup, args.asl_trials)
-            row.update(t_base=t_base, t_long=t_long)
-            print(f"    {method}: cost0={cost0:.3g} {configured}->{chosen} "
-                  f"{t_base * 1e3:.2f} -> {t_long * 1e3:.2f} ms "
-                  f"({t_long / t_base:.3f}x)")
+            trials = args.asl_trials if t_probe <= ASL_LONG_CALL \
+                else min(args.asl_trials, 3)
+            times, _ = interleaved_many(
+                [at(configured << l) for l in range(top + 1)],
+                args.warmup, trials)
+            for level, t in enumerate(times):
+                row[f"t{level}"] = t
+            # mult[0] is cost0 with 10 digits (the line's cost0= has 6).
+            cells.append({"cost0": probe["mult"][0],
+                          "per_subrow": probe["per_subrow"],
+                          "mult": probe["mult"], "packed": probe["packed"],
+                          "times": dict(enumerate(times)), "row": row})
+            ratios = " ".join(f"{configured << l}: {t * 1e3:.2f} ms"
+                              f" ({t / times[0]:.3f}x)"
+                              for l, t in enumerate(times))
+            print(f"    {method}: cost0={probe['cost0']:.3g} packed/mult "
+                  f"{probe['packed'][0] / probe['mult'][0]:.2f}  {ratios}")
             rows.append(row)
         del R, S
     del C
 
-    timed = [r for r in rows if "t_base" in r]
     out_dir = calibration_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
-    if not timed:
-        print("[asl] the rule lengthened no input; asl_min_cost unchanged")
+    if not cells:
+        print("[asl] the rule lengthened no input; calibration unchanged")
         write_rows(out_dir / "asl_cells.csv", rows, ASL_COLUMNS)
         return
-    cells = [(r["cost0"], r["t_base"], r["t_long"]) for r in timed]
-    min_cost, lengthened = calib.choose_min_cost(cells)
-    for i, r in enumerate(timed):
-        r["lengthened"] = int(i in lengthened)
+    swe, ratio = rule_params
+    pick = calib.choose_pack_and_gate(cells, swe, ratio)
+    for cell, level in zip(cells, pick["levels"]):
+        cell["row"]["level"] = level
+        cell["row"]["lengthened"] = int(level > 0)
     write_rows(out_dir / "asl_cells.csv", rows, ASL_COLUMNS)
 
-    base_sum = sum(c[1] for c in cells)
-    gated_sum = sum(c[2] if i in lengthened else c[1]
-                    for i, c in enumerate(cells))
-    long_sum = sum(c[2] for c in cells)
-    gated_log = sum(math.log(c[2] / c[1]) for i, c in enumerate(cells)
-                    if i in lengthened)
-    print(f"\n[asl] {len(cells)} cells the rule lengthens without a gate; "
-          f"the gate keeps {len(lengthened)} lengthened")
-    print(f"  sum: base {base_sum * 1e3:.1f} ms, ungated "
-          f"{long_sum * 1e3:.1f} ms, gated {gated_sum * 1e3:.1f} ms; "
-          f"gated gmean {math.exp(gated_log / len(cells)):.3f}x of base")
+    print(f"\n[asl] {len(cells)} cells the rule lengthens at some weight "
+          f"without a gate; per weight, the best safe gate (no lengthened "
+          f"cell over {calib.SAFE_RATIO:g}x):")
+    print(f"  {'weight':>7s} {'gate':>10s} {'gmean':>6s} {'kept':>5s} "
+          f"{'slower':>7s}")
+    for r in pick["per_weight"]:
+        gate = "never" if r["min_cost"] == calib.NEVER_MIN_COST \
+            else f"{r['min_cost']:.3g}"
+        mark = "  <-" if r["weight"] == pick["weight"] else ""
+        capped = f"  ({r['capped']} capped)" if r["capped"] else ""
+        print(f"  {r['weight']:7g} {gate:>10s} "
+              f"{math.exp(r['score'] / len(cells)):6.3f} "
+              f"{r['lengthened']:5d} {r['slower']:7d}{mark}{capped}")
+    print("  (gmean: of time / time at the configured length over all "
+          f"{len(cells)} cells; kept: cells lengthened with that gate; "
+          "slower: cells the weight alone lengthens that ran over "
+          f"{calib.SAFE_RATIO:g}x)")
+    families = {}
+    for cell, level in zip(cells, pick["levels"]):
+        fam = families.setdefault(cell["row"]["family"], [0, 0, 0.0])
+        fam[0] += 1
+        fam[1] += level > 0
+        fam[2] += math.log(cell["times"][level] / cell["times"][0])
+    for fam, (n, kept, log_sum) in families.items():
+        print(f"  {fam:9s}: {kept} of {n} lengthened, gmean "
+              f"{math.exp(log_sum / n):.3f}")
+    weight, min_cost = pick["weight"], pick["min_cost"]
+    kept = sum(1 for x in pick["levels"] if x > 0)
     if min_cost == calib.NEVER_MIN_COST:
-        note = "no synthetic input ran faster longer: never lengthen"
+        note = "no safe gain on synthetic inputs: never lengthen"
     else:
-        note = f"{len(lengthened)} of {len(cells)} lengthened cells kept"
-    print(f"  asl_min_cost = {calib.format_value(min_cost)} ({note})")
+        note = f"{kept} of {len(cells)} lengthened cells kept"
+    print(f"  asl_pack_value_entries = {calib.format_value(weight)}, "
+          f"asl_min_cost = {calib.format_value(min_cost)} ({note})")
     if len(cells) < 6:
         print(f"  warning: only {len(cells)} cells; add --asl-sizes")
     calib.update_calibration(
-        calibration_path, {"asl_min_cost": min_cost},
+        calibration_path,
+        {"asl_pack_value_entries": weight, "asl_min_cost": min_cost},
         f"find_thresholds.py asl {time.strftime('%Y-%m-%d')}, "
         f"threads={args.threads}, {args.malloc}: {note}")
     print(f"Updated {calibration_path}")
 
 
-ASL_COLUMNS = ("case", "method", "n", "nnz_r", "nnz_s", "configured",
-               "chosen", "sides", "cost0", "t_base", "t_long", "lengthened")
+ASL_COLUMNS = ("case", "family", "method", "n", "k", "nnz_r", "nnz_s",
+               "configured", "sides", "cost0", "per_subrow", "mult", "packed",
+               "probe_chosen", "t0", "t1", "t2", "level", "lengthened")
 
 # rblock stage inputs: R with 12 * slices rows (one R slice per 12 rows, every
 # slice nonempty in every slice column), RBLOCK_KEYS keys per row over
@@ -988,9 +1124,9 @@ def main():
     parser.add_argument("--asl-sizes", default="2048,4096,8192,16384",
                         help="Square sizes of the asl stage's inputs "
                              "(default: 2048,4096,8192,16384)")
-    parser.add_argument("--asl-trials", type=int, default=3,
-                        help="Timed runs per slice length, asl stage "
-                             "(default: 3)")
+    parser.add_argument("--asl-trials", type=int, default=5,
+                        help="Timed runs per slice length, asl stage; calls "
+                             "over 1 s at most 3 (default: 5)")
     parser.add_argument("--rblock-trials", type=int, default=15,
                         help="Timed runs per setting, rblock stage "
                              "(default: 15)")

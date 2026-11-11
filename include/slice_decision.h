@@ -116,7 +116,8 @@ bool read_tile_sizes(
 // comments. Only the keys in kCalibratedKeys are used; values stay text and
 // are parsed like the same spalm() keys, which win over the file.
 inline constexpr const char *kCalibratedKeys[] = {
-    "asl_min_cost", "r_block_huge_bytes", "ss_page_huge_entries"
+    "asl_min_cost", "asl_pack_value_entries", "r_block_huge_bytes",
+    "ss_page_huge_entries"
 };
 struct calibration_values {
     // The file read; empty when there was none.

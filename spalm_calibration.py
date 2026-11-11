@@ -2,10 +2,11 @@
 
 calibration.txt (parameters/<platform>/<type>/calibration.txt, next to
 tile_sizes.txt) holds "key: value" lines that the library takes as the
-defaults of asl_min_cost, r_block_huge_bytes and ss_page_huge_entries; a key
-given to spalm() wins over the file (slice_decision.h). find_thresholds.py
-writes the first two, calibrate_run.py --page-sweep the third. Each writer
-replaces only its own lines and keeps the rest of the file.
+defaults of asl_min_cost, asl_pack_value_entries, r_block_huge_bytes and
+ss_page_huge_entries; a key given to spalm() wins over the file
+(slice_decision.h). find_thresholds.py writes the first three,
+calibrate_run.py --page-sweep the last. Each writer replaces only its own
+lines and keeps the rest of the file.
 
 No SuiteSparse or grid input is involved: every value here comes from
 matrices the scripts generate on the spot.
@@ -16,13 +17,15 @@ import os
 import sys
 from pathlib import Path
 
-CALIBRATED_KEYS = ("asl_min_cost", "r_block_huge_bytes", "ss_page_huge_entries")
+CALIBRATED_KEYS = ("asl_min_cost", "asl_pack_value_entries",
+                   "r_block_huge_bytes", "ss_page_huge_entries")
 
 HEADER = (
     "# Per-machine defaults measured on synthetic inputs; a key given to\n"
     "# spalm() (spalm.conf) wins over this file. Written by find_thresholds.py\n"
-    "# (asl_min_cost, r_block_huge_bytes) and calibrate_run.py --page-sweep\n"
-    "# (ss_page_huge_entries); each replaces only its own lines.\n"
+    "# (asl_min_cost, asl_pack_value_entries, r_block_huge_bytes) and\n"
+    "# calibrate_run.py --page-sweep (ss_page_huge_entries); each replaces\n"
+    "# only its own lines.\n"
 )
 
 # asl_min_cost when no synthetic input ran faster at the longer length: no
@@ -112,8 +115,8 @@ def choose_min_cost(cells):
 
     Returns (min_cost, lengthened): the value lies halfway (geometric mean)
     between the last cell kept at the base length and the first lengthened
-    one; the lowest cost0 when every cell is lengthened (nothing below it was
-    measured); NEVER_MIN_COST when none is. `lengthened` is the set of cell
+    one; just below the lowest cost0 when every cell is lengthened (nothing
+    below it was measured; LOWEST_CUT_MARGIN); NEVER_MIN_COST when none is. `lengthened` is the set of cell
     indices (into `cells`) the value lengthens.
     """
     if not cells:
@@ -135,15 +138,131 @@ def choose_min_cost(cells):
             best = j
     if best == n:
         return NEVER_MIN_COST, set()
-    lo = cells[order[best]][0]
-    prev = cells[order[best - 1]][0] if best > 0 else None
-    if prev is None:
-        value = lo
-    elif prev > 0:
-        value = math.sqrt(prev * lo)
+    return _cut_value([cells[i][0] for i in order], best), set(order[best:])
+
+
+# Weights tried for asl_pack_value_entries (multiplied entries per packed
+# value): 0 (packing left out, as before v34) and powers of two around the
+# range where the synthetic clustered inputs change their decision (0.5 to
+# 4).
+PACK_WEIGHTS = (0.0, 0.0625, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0)
+# A lengthened cell may be at most this much slower than at the configured
+# length (measurement noise); a cut that lengthens a slower one is unsafe.
+SAFE_RATIO = 1.05
+
+
+def rule_level(per_subrow, mult, packed, weight, subrow_write_entries,
+               min_cost_ratio):
+    """The level slice_length_rule::choose() picks without a gate, from the
+    per-length lists of its log line, for another packing weight: double
+    while the subrows hold fewer than subrow_write_entries entries and the
+    cost (multiplication + weight x packed values) drops to min_cost_ratio
+    of the previous length's or below."""
+    raw = [m + weight * p for m, p in zip(mult, packed)]
+    level = 0
+    while (level + 1 < len(raw) and per_subrow[level] < subrow_write_entries
+           and raw[level + 1] <= min_cost_ratio * raw[level]):
+        level += 1
+    return level
+
+
+# The cut below the lowest cost lies this fraction under it: the library
+# logs cost0 and find_thresholds.py writes asl_min_cost with 6 significant
+# digits each, so a cut at the logged cost could round to just above the
+# exact cost of that cell, which would then not be lengthened.
+LOWEST_CUT_MARGIN = 1e-4
+
+
+def _cut_value(costs, j):
+    """asl_min_cost that lengthens sorted costs[j:] and not costs[:j]."""
+    if j == len(costs):
+        return NEVER_MIN_COST
+    if j == 0:
+        return costs[0] * (1 - LOWEST_CUT_MARGIN)
+    prev, lo = costs[j - 1], costs[j]
+    return math.sqrt(prev * lo) if prev > 0 else lo / 2
+
+
+def choose_pack_and_gate(cells, subrow_write_entries, min_cost_ratio,
+                         weights=PACK_WEIGHTS, safe_ratio=SAFE_RATIO):
+    """asl_pack_value_entries and asl_min_cost, chosen together.
+
+    cells: dicts with cost0, per_subrow, mult, packed (the rule's per-length
+    lists) and times {level: seconds}, measured at level 0 and every level
+    up to the longest that any of `weights` picks. A level beyond the
+    measured ones is replaced by the longest measured (`capped` counts
+    them; find_thresholds.py measures them all).
+
+    For each weight the rule's level per cell is replayed (rule_level), and
+    for each gate (a cut between distinct cost0 values, or never) the cells
+    at or above it that the rule lengthens are lengthened. A gate is safe
+    when none of those is more than safe_ratio slower than at level 0. Of
+    the safe (weight, gate) pairs, the lowest sum of log(time / level-0
+    time) over all cells wins (the geometric mean); at one weight a tie goes
+    to the higher gate. Weights that tie: 0 if it is among them (no evidence
+    for packing), otherwise the middle one of the tied weights.
+
+    Returns a dict: weight, min_cost, levels (per cell, 0 if not
+    lengthened), and per_weight, one row per weight (weight, min_cost,
+    score, lengthened, slower: cells the rule alone would lengthen that are
+    more than safe_ratio slower, capped).
+    """
+    if not cells:
+        raise ValueError("no cells")
+    for c in cells:
+        if not c["times"].get(0, 0) > 0:
+            raise ValueError(f"no level-0 time: {c}")
+        if any(not t > 0 for t in c["times"].values()):
+            raise ValueError(f"bad time: {c}")
+    order = sorted(range(len(cells)), key=lambda i: cells[i]["cost0"])
+    costs = [cells[i]["cost0"] for i in order]
+    rows = []
+    for w in weights:
+        capped = 0
+        log_ratio = []
+        for i in order:
+            c = cells[i]
+            level = rule_level(c["per_subrow"], c["mult"], c["packed"], w,
+                               subrow_write_entries, min_cost_ratio)
+            top = max(c["times"])
+            if level > top:
+                capped += 1
+                level = top
+            log_ratio.append((level, math.log(c["times"][level] /
+                                              c["times"][0])))
+        slower = sum(1 for level, x in log_ratio
+                     if level > 0 and x > math.log(safe_ratio))
+        # Scan the cuts from the top: cells j.. are lengthened.
+        best_j, best_score = len(order), 0.0
+        score, safe = 0.0, True
+        for j in range(len(order) - 1, -1, -1):
+            level, x = log_ratio[j]
+            if level > 0:
+                score += x
+                safe = safe and x <= math.log(safe_ratio)
+            if not safe:
+                break
+            if j > 0 and costs[j - 1] == costs[j]:
+                continue  # no threshold separates equal costs
+            if score < best_score - 1e-12:
+                best_j, best_score = j, score
+        levels = [0] * len(cells)
+        for j in range(best_j, len(order)):
+            levels[order[j]] = log_ratio[j][0]
+        rows.append({"weight": w, "min_cost": _cut_value(costs, best_j),
+                     "score": best_score, "levels": levels,
+                     "lengthened": sum(1 for x in levels if x > 0),
+                     "slower": slower, "capped": capped})
+    best = min(r["score"] for r in rows)
+    tied = [r for r in rows if r["score"] <= best + 1e-12]
+    if any(r["weight"] == 0 for r in tied):
+        pick = next(r for r in tied if r["weight"] == 0)
     else:
-        value = lo / 2
-    return value, set(order[best:])
+        pick = tied[(len(tied) - 1) // 2]
+    return {"weight": pick["weight"], "min_cost": pick["min_cost"],
+            "levels": pick["levels"],
+            "per_weight": [{k: v for k, v in r.items() if k != "levels"}
+                           for r in rows]}
 
 
 def fit_line(points):
