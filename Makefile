@@ -8,11 +8,26 @@ endif
 
 CC = g++
 CFLAGS = -shared -fPIC -mavx -march=native --std=c++20
-# GNU OpenMP for the kernels and MKL (libmkl_gnu_thread), as DuckDB uses
-# libgomp: MKL's Intel threading layer loaded into such a process resolves
-# omp_get_thread_num() to libgomp, so every MKL thread acts as thread 0.
+# OpenMP runtime of the kernels and of MKL; DuckDB must load the same one
+# (SPALM_OMP_RUNTIME in duckdb-spalm/CMakeLists.txt).
+# - iomp5 (default): MKL's Intel threading layer (libmkl_intel_thread) and
+#   libiomp5, which also serves the GOMP_* calls that g++ -fopenmp emits.
+# - gomp: libmkl_gnu_thread and libgomp, as in m0-m3.
+# Never mix them: with libgomp in DuckDB and libiomp5 here, MKL's
+# omp_get_thread_num() resolved to libgomp, every MKL thread acted as
+# thread 0, MKL dense ran ~20x slower and MKL sparse crashed (05149e6).
+# Objects do not depend on this choice: make clean before switching.
+OMP_RUNTIME ?= iomp5
+ifeq ($(OMP_RUNTIME),iomp5)
+IOMP5_DIR ?= $(ONEAPI_ROOT)/compiler/latest/lib
+OMP_LIB = -L$(IOMP5_DIR) -liomp5
+MKL_LINK_TOOL = $(ONEAPI_ROOT)/mkl/latest/bin/mkl_link_tool --compiler=gnu_c --openmp=iomp5
+else ifeq ($(OMP_RUNTIME),gomp)
 OMP_LIB = -lgomp
 MKL_LINK_TOOL = $(ONEAPI_ROOT)/mkl/latest/bin/mkl_link_tool --compiler=gnu_c --openmp=gomp
+else
+$(error OMP_RUNTIME must be iomp5 or gomp, not '$(OMP_RUNTIME)')
+endif
 OPT_LEVEL ?= -O3
 SRC_DIR = src
 CPU_SRC_DIR = $(SRC_DIR)/cpu
