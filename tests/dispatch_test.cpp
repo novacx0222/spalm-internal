@@ -33,7 +33,16 @@ static void scalar_baseline(
 static void *test_dlopen(const char *, int) {
     return reinterpret_cast<void *>(1);
 }
-static void *test_dlsym(void *, const char *) {
+// run_baseline_openblas: the dense product, overwriting the result as a
+// GEMM with beta = 0 does. openblas_status is what it returns.
+static int scalar_openblas(
+    int, void *, void *, void *, const int, const int, const int, const int,
+    const int
+);
+static int openblas_status, openblas_calls, seen_openblas_huge;
+static void *test_dlsym(void *, const char *name) {
+    if (std::strcmp(name, "run_baseline_openblas") == 0)
+        return reinterpret_cast<void *>(&scalar_openblas);
     return reinterpret_cast<void *>(&scalar_baseline);
 }
 #define dlopen test_dlopen
@@ -115,6 +124,30 @@ static void scalar_baseline(
         );
 }
 
+template <class T>
+static void openblas_typed(void *rd, void *sd, void *output, int m, int k, int n) {
+    for (int r = 0; r < m; ++r)
+        for (int s = 0; s < n; ++s) {
+            T sum = 0;
+            for (int j = 0; j < k; ++j)
+                sum += static_cast<T *>(rd)[size_t(r) * k + j] *
+                       static_cast<T *>(sd)[size_t(s) * k + j];
+            static_cast<T *>(output)[size_t(r) * n + s] = sum;
+        }
+}
+static int scalar_openblas(
+    int type, void *rd, void *sd, void *output, const int m, const int k,
+    const int n, const int, const int huge_pages
+) {
+    ++backend_calls;
+    ++openblas_calls;
+    seen_openblas_huge = huge_pages;
+    if (openblas_status != 0) return openblas_status;
+    if (type == 0) openblas_typed<float>(rd, sd, output, m, k, n);
+    else openblas_typed<double>(rd, sd, output, m, k, n);
+    return 0;
+}
+
 // Captures everything written to stdout (std::cout and printf) by f().
 template <class F> static std::string capture_stdout(F f) {
     std::cout.flush();
@@ -173,6 +206,7 @@ template <class T> void check_methods() {
     const Case cases[] = {
         {"FORCE_MKL_DENSE", "[backend] mkl-dense (forced)", false},
         {"FORCE_MKL_SPARSE", "[backend] mkl-sparse (forced)", false},
+        {"FORCE_OPENBLAS_DENSE", "[backend] openblas-dense (forced)", false},
         {"sparse", "[backend] spalm-internal", true},
         {"dense_bm_inner_kernel", "[backend] spalm-internal", true},
         {"dense_left_spmm_inner_kernel", "[backend] spalm-internal", true},
@@ -212,16 +246,27 @@ template <class T> void check_methods() {
                 assert(count(log, label) == 1);
             assert(count(log, "[forced-backend-total]") == 0);
         } else {
-            // Forced MKL: no slices and no cost model.
+            // Forced baselines: no slices and no cost model.
+            const bool openblas =
+                std::strcmp(c.method, "FORCE_OPENBLAS_DENSE") == 0;
             assert(count(log, "[slice-prepare-total]") == 0);
             assert(count(log, "[mm-select-total]") == 0);
             assert(count(log, "[forced-backend-total]") == 1);
-            assert(count(log, "[mkl-call-total]") == 1);
+            assert(count(log, "[mkl-call-total]") == (openblas ? 0 : 1));
+            assert(count(log, "[openblas-call-total]") == (openblas ? 1 : 0));
+            // MKL dense and OpenBLAS dense share the dense inputs.
+            const bool dense = openblas ||
+                               std::strcmp(c.method, "FORCE_MKL_DENSE") == 0;
+            for (const char *label :
+                 {"[mkl-dense-input-allocate]", "[mkl-dense-input-fill]",
+                  "[mkl-dense-input-deallocate]"})
+                assert(count(log, label) == (dense ? 1 : 0));
         }
     }
     // No stored entry on one side: nothing reaches a backend.
     int empty[] = {0, 0, 0};
-    for (const char *method : {"FORCE_MKL_DENSE", "sparse"}) {
+    for (const char *method :
+         {"FORCE_MKL_DENSE", "FORCE_OPENBLAS_DENSE", "sparse"}) {
         const char *keys[] = {"init_method"};
         const char *vals[] = {method};
         T output[4] = {};
@@ -605,6 +650,8 @@ template <class T> void check_sparse_or_dense() {
          true, "[result-choice] dense (mkl-dense fallback)"},
         {{{"init_method", "FORCE_MKL_DENSE"}}, true,
          "[result-choice] dense (forced mkl-dense)"},
+        {{{"init_method", "FORCE_OPENBLAS_DENSE"}}, true,
+         "[result-choice] dense (forced openblas-dense)"},
         {{{"init_method", "dense_bm_inner_kernel"}}, true,
          "[result-choice] dense (all dense)"},
         {{{"init_method", "sparse"}}, false, "[result-choice] sparse (all SS)"},
@@ -832,9 +879,86 @@ template <class T> void check_candidate_work() {
     unlink(table.c_str());
 }
 
+// FORCE_OPENBLAS_DENSE: openblas_huge_pages reaches the backend, a failed
+// OpenBLAS call is SPALM_BASELINE_ERROR, an uninitialized result
+// (result_zeroed = 0) is overwritten without zeroing, as for MKL dense, and
+// there is no sparse output.
+template <class T> void check_openblas() {
+    constexpr int type = sizeof(T) == sizeof(float) ? 0 : 1;
+    int ri[] = {0, 3, 4}, rj[] = {0, 2, 3, 1};
+    T rv[] = {2, 6, -1, 3};
+    int si[] = {0, 3, 4}, sj[] = {0, 1, 3, 2};
+    T sv[] = {4, 8, 5, 7};
+    auto call = [&](std::vector<std::pair<const char *, const char *>> kv,
+                    T *output, int &status) {
+        std::vector<const char *> keys, vals;
+        for (auto &[k, v] : kv) {
+            keys.push_back(k);
+            vals.push_back(v);
+        }
+        return capture_stdout([&] {
+            status = spalm(
+                type, ri, rj, rv, si, sj, sv, 2, 4, 2, false, output, nullptr,
+                nullptr, nullptr, (int) keys.size(), keys.data(), vals.data()
+            );
+        });
+    };
+    const T expected[] = {3, 42, 24, 0};
+    for (const char *huge : {"0", "1"}) {
+        T output[4] = {T(777), T(777), T(777), T(777)};
+        int status = -1;
+        openblas_calls = 0;
+        seen_openblas_huge = -1;
+        const auto log = call(
+            {{"init_method", "FORCE_OPENBLAS_DENSE"},
+             {"openblas_huge_pages", huge},
+             {"result_zeroed", "0"}},
+            output, status
+        );
+        assert(status == SPALM_OK && openblas_calls == 1);
+        assert(seen_openblas_huge == (huge[0] == '1' ? 1 : 0));
+        for (int i = 0; i < 4; ++i) assert(output[i] == expected[i]);
+        assert(count(log, "[library-result-zero]") == 0);
+        assert(count(log, std::string("openblas_huge_pages=") + huge) == 1);
+    }
+    {
+        T output[4] = {};
+        int status = -1;
+        openblas_status = 1;
+        call({{"init_method", "FORCE_OPENBLAS_DENSE"}}, output, status);
+        openblas_status = 0;
+        assert(status == SPALM_BASELINE_ERROR);
+    }
+    {
+        T output[4] = {};
+        int status = -1;
+        openblas_calls = 0;
+        call({{"init_method", "FORCE_OPENBLAS_DENSE"},
+              {"openblas_huge_pages", "2"}},
+             output, status);
+        assert(status == SPALM_INVALID_ARGUMENT && openblas_calls == 0);
+    }
+    {
+        // No sparse output: spalm_sparse() refuses it before any work.
+        const char *keys[] = {"init_method"};
+        const char *vals[] = {"FORCE_OPENBLAS_DENSE"};
+        void *handle = reinterpret_cast<void *>(1);
+        openblas_calls = 0;
+        int status = -1;
+        capture_stdout([&] {
+            status = spalm_sparse(
+                type, ri, rj, rv, si, sj, sv, 2, 4, 2, 1, keys, vals, &handle
+            );
+        });
+        assert(status == SPALM_INVALID_ARGUMENT && openblas_calls == 0);
+    }
+}
+
 int main() {
     check_methods<float>();
     check_methods<double>();
+    check_openblas<float>();
+    check_openblas<double>();
     check_tunables<float>();
     check_tunables<double>();
     check_sparse_or_dense<float>();

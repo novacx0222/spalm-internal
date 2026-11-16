@@ -1,5 +1,5 @@
 # MKL is needed to build the libraries, not to run the portable tests.
-TEST_GOALS := test test-dispatch test-preparation test-sparse-output test-huge-pages test-thresholds test-slice-length test-kernels-native
+TEST_GOALS := test test-dispatch test-preparation test-sparse-output test-huge-pages test-thresholds test-slice-length test-kernels-native test-openblas
 ifneq ($(filter-out $(TEST_GOALS),$(or $(MAKECMDGOALS),default)),)
 ifndef ONEAPI_ROOT
 $(error ONEAPI_ROOT is not set. Please 'source set_intel_vars.sh'.)
@@ -69,15 +69,15 @@ $(BIN_DIR)/sparse_sparse_matmul.o: include/csr_preparation.h \
 	include/spalm_sparse_result.h include/huge_pages.h
 $(BIN_DIR)/dense_dense_matmul.o: include/cpu/dense_dense_matmul.h include/cpu/kernel.h \
 	include/packing_buffers.h include/huge_pages.h
-$(BIN_DIR)/run_baseline.so: include/util.h include/huge_pages.h
+$(BIN_DIR)/run_baseline.so: include/util.h include/huge_pages.h include/openblas_baseline.h
 
 # Portable tests: no AVX-512, MKL or built libraries; run from the repo root.
 # Needs a compiler with OpenMP, e.g. on macOS: make test CXX=g++-16
 TEST_CXXFLAGS ?= -std=c++20 -O1 -g -fopenmp -fsanitize=address,undefined -fno-omit-frame-pointer
 TEST_BIN_DIR ?= /tmp/spalm-tests
 PYTHON ?= python3
-.PHONY: test test-dispatch test-preparation test-sparse-output test-huge-pages test-thresholds test-slice-length
-test: test-dispatch test-preparation test-sparse-output test-huge-pages test-thresholds test-slice-length
+.PHONY: test test-dispatch test-preparation test-sparse-output test-huge-pages test-thresholds test-slice-length test-openblas
+test: test-dispatch test-preparation test-sparse-output test-huge-pages test-thresholds test-slice-length test-openblas
 
 # Forced methods, backend selection and timing output; the
 # log_candidate_work counts (candidate_work.h) against brute force.
@@ -141,3 +141,17 @@ test-slice-length:
 # Timing-label parser of find_thresholds.py (standard library only).
 test-thresholds:
 	$(PYTHON) -B -m unittest discover -s tests -p 'test_find_thresholds.py' -v
+
+# OpenBLAS baseline (openblas_baseline.h) against a fake libopenblas: load
+# checks (OpenMP build, patched build for huge pages, fixed setting), the
+# environment set before dlopen, and the GEMM call; plus the memory.c patch
+# (scripts/openblas_thp_patch.py) on a fixture.
+.PHONY: test-openblas
+test-openblas:
+	mkdir -p $(TEST_BIN_DIR)
+	$(CXX) -std=c++20 -O1 -g -fPIC -shared tests/fake_openblas.cpp -o $(TEST_BIN_DIR)/fake_openblas_omp.so -DFAKE_PARALLEL=2 -DFAKE_THP
+	$(CXX) -std=c++20 -O1 -g -fPIC -shared tests/fake_openblas.cpp -o $(TEST_BIN_DIR)/fake_openblas_plain.so -DFAKE_PARALLEL=2
+	$(CXX) -std=c++20 -O1 -g -fPIC -shared tests/fake_openblas.cpp -o $(TEST_BIN_DIR)/fake_openblas_pthreads.so -DFAKE_PARALLEL=1 -DFAKE_THP
+	$(CXX) $(CPPFLAGS) $(TEST_CXXFLAGS) -Iinclude tests/openblas_baseline_test.cpp $(LDFLAGS) -ldl -o $(TEST_BIN_DIR)/openblas_baseline_test
+	$(TEST_BIN_DIR)/openblas_baseline_test $(TEST_BIN_DIR)
+	$(PYTHON) -B -m unittest discover -s tests -p 'test_openblas_thp_patch.py' -v

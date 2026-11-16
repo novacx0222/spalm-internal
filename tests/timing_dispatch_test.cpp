@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cmath>
 #include <iostream>
+#include <string>
 
 int main() {
     using spalm_dispatch::Backend;
@@ -21,6 +22,12 @@ int main() {
                     select(true, false, fallback, dense, sparse) ==
                     Backend::MklDense
                 );
+                // OpenBLAS is forced only, and wins over the MKL flags
+                // (they are never set together).
+                assert(
+                    select(false, false, fallback, dense, sparse, true) ==
+                    Backend::OpenblasDense
+                );
                 const auto expected = !fallback ? Backend::Internal
                                       : dense   ? Backend::MklDense
                                       : sparse  ? Backend::MklSparse
@@ -31,6 +38,13 @@ int main() {
             }
         }
     }
+    using spalm_dispatch::is_dense_baseline;
+    assert(is_dense_baseline(Backend::MklDense));
+    assert(is_dense_baseline(Backend::OpenblasDense));
+    assert(!is_dense_baseline(Backend::MklSparse));
+    assert(!is_dense_baseline(Backend::Internal));
+    assert(std::string(spalm_dispatch::name(Backend::OpenblasDense)) ==
+           "openblas-dense");
     const float seconds =
         print_time("[test-duration]", std::chrono::nanoseconds(1234567));
     assert(std::abs(seconds - 0.001234567f) < 1e-9f);

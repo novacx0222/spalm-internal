@@ -6,6 +6,7 @@
 #include <i_malloc.h>
 #include "huge_pages.h"
 #include "mkl.h"
+#include "openblas_baseline.h"
 #include "util.h"
 
 // MKL allocates only through the function pointers of i_malloc.h, and
@@ -29,6 +30,11 @@ static void print_mkl_huge_pages() {
               << " blocks=" << spalm_huge::allocated_blocks()
               << " bytes=" << spalm_huge::allocated_bytes() << std::endl;
 }
+
+static int run_openblas(
+    int type, void *R, void *S, void *ret, int M, int K, int N, int threads,
+    bool huge_pages
+);
 
 // Writes C = R * S^T into ret, overwriting it: the GEMM and sparse x dense
 // calls use beta = 0 and mkl_sparse_?_spmmd computes C := A * B, so ret
@@ -245,50 +251,9 @@ extern "C" void run_baseline(
             // delete[] S_T;
         }
     } else if (baseline_name_str == "OpenBLAS") {
-        void *handle = dlopen(
-            resolve_path_near_lib(
-                reinterpret_cast<void *>(&run_baseline),
-                "../OpenBLAS-0.3.30/libopenblas.so",
-                "OpenBLAS-0.3.30/libopenblas.so"
-            )
-                .c_str(),
-            RTLD_LAZY
-        );
-        void (*cblas_dgemm_openblas)(
-            int, int, int, int, int, int, double, double *, int, double *, int,
-            double, double *, int
-        ) =
-            (void (*)(
-                int, int, int, int, int, int, double, double *, int, double *,
-                int, double, double *, int
-            )) dlsym(handle, "cblas_dgemm");
-        void (*cblas_sgemm_openblas)(
-            int, int, int, int, int, int, float, float *, int, float *, int,
-            float, float *, int
-        ) =
-            (void (*)(
-                int, int, int, int, int, int, float, float *, int, float *, int,
-                float, float *, int
-            )) dlsym(handle, "cblas_sgemm");
-
-        void (*openblas_set_threads)(int) =
-            (void (*)(int)) dlsym(handle, "openblas_set_num_threads");
-        openblas_set_threads(threads);
-
-        start = std::chrono::high_resolution_clock::now();
-        if (type == 0) {
-            cblas_sgemm_openblas(
-                CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0,
-                (float *) R, K, (float *) S, K, 0.0, (float *) ret, N
-            );
-        } else if (type == 1) {
-            cblas_dgemm_openblas(
-                CblasRowMajor, CblasNoTrans, CblasTrans, M, N, K, 1.0,
-                (double *) R, K, (double *) S, K, 0.0, (double *) ret, N
-            );
-        }
-        end = std::chrono::high_resolution_clock::now();
-        print_time("[mkl-dense-mm-time]", end - start);
+        // Kept for callers of the old name; FORCE_OPENBLAS_DENSE calls
+        // run_baseline_openblas, which also reports failures.
+        run_openblas(type, R, S, ret, M, K, N, threads, false);
     } else if (baseline_name_str == "MKL dense-dense") {
         int mem, buf;
         mem = mkl_mem_stat(&buf);
@@ -444,4 +409,33 @@ extern "C" int run_baseline_sparse_output(
 
 extern "C" void run_baseline_sparse_output_free(void *handle) {
     if (handle) mkl_sparse_destroy((sparse_matrix_t) handle);
+}
+
+// OpenBLAS dense-dense (init_method FORCE_OPENBLAS_DENSE): ret = R * S^T
+// from the dense R (M x K) and S (N x K) that spalm.so filled exactly as for
+// MKL dense-dense; see openblas_baseline.h. libopenblas is
+// OpenBLAS-0.3.30/libopenblas.so next to bin/ (scripts/build_openblas.sh).
+// huge_pages: openblas_huge_pages. Returns 0, or 1 after printing why.
+static int run_openblas(
+    int type, void *R, void *S, void *ret, int M, int K, int N, int threads,
+    bool huge_pages
+) {
+    const std::string relative =
+        std::string("../") + spalm_openblas::kVersionDir + "/libopenblas.so";
+    const std::string fallback =
+        std::string(spalm_openblas::kVersionDir) + "/libopenblas.so";
+    const std::string path = resolve_path_near_lib(
+        reinterpret_cast<void *>(&run_baseline), relative, fallback
+    );
+    return spalm_openblas::run(
+        path, type, R, S, ret, M, K, N, threads, huge_pages,
+        [](const char *label, auto elapsed) { print_time(label, elapsed); }
+    );
+}
+
+extern "C" int run_baseline_openblas(
+    int type, void *R, void *S, void *ret, const int M, const int K,
+    const int N, const int threads, const int huge_pages
+) {
+    return run_openblas(type, R, S, ret, M, K, N, threads, huge_pages != 0);
 }

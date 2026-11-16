@@ -13,6 +13,7 @@ bool fallback = true;
 bool no_features = false;
 bool force_mkl_dense = false;
 bool force_mkl_sparse = false;
+bool force_openblas_dense = false;
 
 int get_total_sparse_buckets() { return ss_upper[0]; }
 
@@ -45,10 +46,16 @@ bool init_decision_thresholds(
     no_features = false;
     force_mkl_dense = false;
     force_mkl_sparse = false;
-    // Forced MKL backends skip slicing and the cost model, so they need no
-    // calibrated thresholds; the arrays are only filled to stay well defined.
+    force_openblas_dense = false;
+    // Forced baselines (MKL, OpenBLAS) skip slicing and the cost model, so
+    // they need no calibrated thresholds; the arrays are only filled to stay
+    // well defined.
     const bool force_dense = strcmp(thres_exec_method, "FORCE_MKL_DENSE") == 0;
-    if (force_dense || strcmp(thres_exec_method, "FORCE_MKL_SPARSE") == 0) {
+    const bool force_sparse =
+        strcmp(thres_exec_method, "FORCE_MKL_SPARSE") == 0;
+    const bool force_openblas =
+        strcmp(thres_exec_method, "FORCE_OPENBLAS_DENSE") == 0;
+    if (force_dense || force_sparse || force_openblas) {
         init_arrays(DEFAULT_NUM_BUCKETS);
         std::fill(
             ss_upper.get(), ss_upper.get() + num_buckets + 1, (uint8_t) 0
@@ -60,7 +67,8 @@ bool init_decision_thresholds(
         dense_mm_threshold = 0;
         fallback = true;
         force_mkl_dense = force_dense;
-        force_mkl_sparse = !force_dense;
+        force_mkl_sparse = force_sparse;
+        force_openblas_dense = force_openblas;
         return true;
     }
     if (strcmp(thres_exec_method, "sparse") == 0) {

@@ -1,4 +1,4 @@
-// Mode flags are reset per call, forced MKL modes need no thresholds file,
+// Mode flags are reset per call, forced baselines need no thresholds file,
 // and slicing still borrows the caller's CSR.
 #include "ss_mat.h"
 
@@ -18,8 +18,13 @@ int main() {
     assert(force_mkl_dense && !force_mkl_sparse && fallback);
     assert(init_decision_thresholds("FORCE_MKL_SPARSE", 0, "no-such-platform"));
     assert(!force_mkl_dense && force_mkl_sparse && fallback);
+    assert(!force_openblas_dense && forced_baseline());
+    assert(init_decision_thresholds("FORCE_OPENBLAS_DENSE", 1, "no-such-platform"));
+    assert(force_openblas_dense && !force_mkl_dense && !force_mkl_sparse);
+    assert(forced_baseline());
     assert(init_decision_thresholds("sparse", 1, "cpu"));
-    assert(!force_mkl_dense && !force_mkl_sparse);
+    assert(!force_mkl_dense && !force_mkl_sparse && !force_openblas_dense);
+    assert(!forced_baseline());
 
     int offsets[] = {0, 2, 3};
     int columns[] = {0, 2, 1};

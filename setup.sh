@@ -32,6 +32,9 @@ Running in container:
 Build libraries (in container):
     build-libs         Compile all .so files (baseline, spalm).
     build-libs clean   Remove compiled .so and object files.
+    build-openblas     Download (pinned, sha256-checked), patch and build
+                       OpenBLAS 0.3.30 for FORCE_OPENBLAS_DENSE into
+                       OpenBLAS-0.3.30/libopenblas.so (scripts/build_openblas.sh).
 
 Threshold finding:
   find-thresholds [args...]   Run find_thresholds.py in the container.
@@ -66,6 +69,10 @@ case "$COMMAND" in
             echo "Building CPU libraries..."
             docker_run make baseline spalm
         fi
+        ;;
+    build-openblas)
+        echo "Building OpenBLAS (scripts/build_openblas.sh)..."
+        docker_run bash scripts/build_openblas.sh
         ;;
     find-thresholds)
         docker_run python find_thresholds.py "$@"

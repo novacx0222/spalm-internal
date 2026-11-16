@@ -36,7 +36,7 @@ enum spalm_status : int {
     SPALM_OK = 0,
     SPALM_INVALID_ARGUMENT = 1, // bad type, dimensions, threads or options
     SPALM_CONFIG_ERROR = 2,     // missing/invalid threshold or tile files
-    SPALM_BASELINE_ERROR = 3,   // run_baseline.so could not be loaded
+    SPALM_BASELINE_ERROR = 3,   // run_baseline.so or OpenBLAS could not be loaded
     SPALM_INTERNAL_ERROR = 4,   // exception, e.g. out of memory
 };
 
@@ -75,6 +75,14 @@ using run_baseline_sparse_output_fn = int (*)(
 );
 using run_baseline_sparse_output_free_fn = void (*)(void *);
 
+// OpenBLAS dense-dense (run_baseline_openblas): ret = R * S^T from the dense
+// R (M x K) and S (N x K). Returns 0, or nonzero (after printing why) when
+// libopenblas cannot be loaded or used.
+using run_baseline_openblas_fn = int (*)(
+    int, void *, void *, void *, const int, const int, const int, const int,
+    const int
+);
+
 // Returns nullptr (after printing why) if the MKL baseline cannot be loaded.
 // The library stays loaded for the process lifetime (unloading MKL corrupts
 // its thread pool); a successful lookup is cached, a failure is retried.
@@ -108,6 +116,15 @@ static run_baseline_fn load_run_baseline() {
     return cached;
 }
 
+static run_baseline_openblas_fn load_run_baseline_openblas() {
+    static run_baseline_openblas_fn cached = nullptr;
+    if (!cached)
+        cached = load_baseline_symbol<run_baseline_openblas_fn>(
+            "run_baseline_openblas"
+        );
+    return cached;
+}
+
 struct baseline_sparse_output {
     run_baseline_sparse_output_fn run = nullptr;
     run_baseline_sparse_output_free_fn free = nullptr;
@@ -126,16 +143,29 @@ static baseline_sparse_output load_baseline_sparse_output() {
     return cached;
 }
 
-// Runs the whole multiplication with an MKL backend (forced or fallback).
+// Runs the whole multiplication with a baseline backend: MKL (forced or
+// fallback) or OpenBLAS (forced). MKL dense and OpenBLAS dense share
+// everything but the GEMM call: the dense inputs, their fill and release,
+// and the stage labels ([mkl-dense-input-*]), so the two compare on the
+// library alone.
 template <typename T>
-int run_mkl_backend(
+int run_baseline_backend(
     spalm_dispatch::Backend backend, int type, int *Ri, int *Rj, T *Rv, int *Si,
-    int *Sj, T *Sv, int M, int K, int N, T *ret, int threads
+    int *Sj, T *Sv, int M, int K, int N, T *ret, int threads,
+    const cpu_execution_options &options
 ) {
+    const bool openblas = backend == spalm_dispatch::Backend::OpenblasDense;
     const run_baseline_fn baseline = load_run_baseline();
     if (!baseline) return SPALM_BASELINE_ERROR;
-    if (backend == spalm_dispatch::Backend::MklDense) {
-        std::cout << "Fallback: MKL dense-dense" << std::endl;
+    run_baseline_openblas_fn openblas_gemm = nullptr;
+    if (openblas) {
+        openblas_gemm = load_run_baseline_openblas();
+        if (!openblas_gemm) return SPALM_BASELINE_ERROR;
+    }
+    if (spalm_dispatch::is_dense_baseline(backend)) {
+        std::cout << (openblas ? "Forced: OpenBLAS dense-dense"
+                               : "Fallback: MKL dense-dense")
+                  << std::endl;
         auto start = std::chrono::high_resolution_clock::now();
         // make_unique<T[]> value-initialized both inputs on one thread (about
         // 1.85 s for two 16000 x 16000 doubles). Allocate them uninitialized;
@@ -164,14 +194,27 @@ int run_mkl_backend(
         // Zeroing included since inner-v6.
         print_time("[mkl-dense-input-fill]", end - start);
         start = end;
-        baseline(
-            type, "MKL dense-dense", Ri, Rj, (void *) Rv, (void *) R.get(), Si,
-            Sj, (void *) Sv, (void *) S.get(), (void *) ret, M, K, N, threads
-        );
-        end = std::chrono::high_resolution_clock::now();
-        print_time("[mkl-call-total]", end - start);
+        if (openblas) {
+            const int status = openblas_gemm(
+                type, (void *) R.get(), (void *) S.get(), (void *) ret, M, K,
+                N, threads, options.openblas_huge_pages ? 1 : 0
+            );
+            end = std::chrono::high_resolution_clock::now();
+            print_time("[openblas-call-total]", end - start);
+            if (status != 0) return SPALM_BASELINE_ERROR;
+        } else {
+            baseline(
+                type, "MKL dense-dense", Ri, Rj, (void *) Rv, (void *) R.get(),
+                Si, Sj, (void *) Sv, (void *) S.get(), (void *) ret, M, K, N,
+                threads
+            );
+            end = std::chrono::high_resolution_clock::now();
+            print_time("[mkl-call-total]", end - start);
+        }
         const auto release_begin = end;
-        mkl_free_buffers();
+        // OpenBLAS keeps its buffers until the process exits (no API frees
+        // them); MKL's are released here, as before.
+        if (!openblas) mkl_free_buffers();
         R.reset();
         S.reset();
         print_time(
@@ -496,9 +539,10 @@ int spalm_matmul(
     // The join dimension every later stage uses; key compaction shrinks it.
     int K = K_input;
     // An uninitialized result (result_zeroed = 0) is overwritten by the
-    // forced MKL backends; every other path accumulates into it, so it is
-    // zeroed here, and the zero-work exits zero it for the MKL backends.
-    const bool forced_mkl = force_mkl_dense || force_mkl_sparse;
+    // forced baselines (MKL, OpenBLAS); every other path accumulates into
+    // it, so it is zeroed here, and the zero-work exits zero it for the
+    // forced baselines.
+    const bool forced_mkl = forced_baseline();
     const size_t result_bytes = (size_t) M * N * sizeof(T);
     // Sparse output (sparse_out): no dense result; every exit before the
     // multiplication leaves it without blocks.
@@ -623,27 +667,26 @@ int spalm_matmul(
         std::chrono::high_resolution_clock::now() - prepare_begin
     );
 
-    // Forced MKL backends need no slices or cost estimate.
+    // Forced baselines need no slices or cost estimate.
     const auto forced_backend = spalm_dispatch::select(
-        force_mkl_dense, force_mkl_sparse, false, false, false
+        force_mkl_dense, force_mkl_sparse, false, false, false,
+        force_openblas_dense
     );
     if (forced_backend != spalm_dispatch::Backend::Internal) {
-        std::cout << "[backend] "
-                  << (forced_backend == spalm_dispatch::Backend::MklDense
-                          ? "mkl-dense"
-                          : "mkl-sparse")
+        std::cout << "[backend] " << spalm_dispatch::name(forced_backend)
                   << " (forced)" << std::endl;
         const auto start = std::chrono::high_resolution_clock::now();
         int status = SPALM_INVALID_ARGUMENT;
         if (sparse_out && dense_request &&
-            forced_backend == spalm_dispatch::Backend::MklDense &&
-            !request_dense_result("forced mkl-dense")) {
-            return SPALM_INTERNAL_ERROR;
+            spalm_dispatch::is_dense_baseline(forced_backend)) {
+            const std::string why =
+                std::string("forced ") + spalm_dispatch::name(forced_backend);
+            if (!request_dense_result(why.c_str())) return SPALM_INTERNAL_ERROR;
         }
         if (!sparse_out) {
-            status = run_mkl_backend(
+            status = run_baseline_backend(
                 forced_backend, type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, ret,
-                threads
+                threads, options
             );
         } else if (forced_backend == spalm_dispatch::Backend::MklSparse) {
             if (dense_request) {
@@ -654,7 +697,8 @@ int spalm_matmul(
                 type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, threads, *sparse_out
             );
         } else {
-            std::cerr << "spalm: MKL dense has no sparse output" << std::endl;
+            std::cerr << "spalm: " << spalm_dispatch::name(forced_backend)
+                      << " has no sparse output" << std::endl;
         }
         print_time(
             "[forced-backend-total]",
@@ -798,6 +842,7 @@ int spalm_matmul(
     }
 
     int status = SPALM_OK;
+    // The forced baselines returned above; only MKL falls back.
     const auto backend = spalm_dispatch::select(
         force_mkl_dense, force_mkl_sparse, fallback,
         total_dense_mm_cost >
@@ -839,8 +884,9 @@ int spalm_matmul(
             "[fallback-slice-deallocate]",
             std::chrono::high_resolution_clock::now() - release_begin
         );
-        status = run_mkl_backend(
-            backend, type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, ret, threads
+        status = run_baseline_backend(
+            backend, type, Ri, Rj, Rv, Si, Sj, Sv, M, K, N, ret, threads,
+            options
         );
     } else {
         std::cout << "[backend] spalm-internal sparse=" << do_sparse_mm
@@ -904,6 +950,7 @@ static constexpr const char *kKnownConfKeys[] = {
     "asl_min_cost_ratio", "asl_max_levels", "r_block_huge_bytes",
     "s_blocks_huge_bytes", "ss_column_block_min_cols",
     "ss_column_block_cache_divisor", "log_candidate_work",
+    "openblas_huge_pages",
     // DuckDB operator (duckdb-spalm)
     "result_base_offset", "result_compact_rows", "result_fresh_mapping",
     "result_huge_pages", "result_parallel_zero", "result_prefault",
@@ -955,6 +1002,7 @@ static void print_conf(
               << o.ss_column_block_cache_divisor
               << " ss_output_page_entries=" << o.ss_output_page_entries
               << " result_zeroed=" << o.result_zeroed
+              << " openblas_huge_pages=" << o.openblas_huge_pages
               << " log_candidate_work=" << o.log_candidate_work << std::endl;
     bool any = false;
     for (int i = 0; i < n; i++) {
@@ -1058,6 +1106,13 @@ static int spalm_impl(
     // An explicit slice_length is used as given.
     options.result_zeroed = get_int("result_zeroed", 1) != 0;
     options.log_candidate_work = get_int("log_candidate_work", 0) != 0;
+    {
+        const int huge = get_int("openblas_huge_pages", 0);
+        if (huge != 0 && huge != 1) {
+            return invalid("openblas_huge_pages must be 0 or 1");
+        }
+        options.openblas_huge_pages = huge != 0;
+    }
     options.auto_slice_length = get_str("slice_length", nullptr) == nullptr
                                     ? get_int("auto_slice_length", 1)
                                     : 0;

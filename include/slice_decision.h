@@ -28,9 +28,16 @@ extern int left_dense_threshold;
 extern unsigned long long dense_mm_threshold;
 extern bool fallback;
 extern bool no_features;
-// Set by the FORCE_MKL_DENSE / FORCE_MKL_SPARSE init methods.
+// Set by the FORCE_MKL_DENSE / FORCE_MKL_SPARSE / FORCE_OPENBLAS_DENSE init
+// methods (at most one of them).
 extern bool force_mkl_dense;
 extern bool force_mkl_sparse;
+extern bool force_openblas_dense;
+// Any of the forced baselines above: no slices, no cost model, and an
+// uninitialized result (result_zeroed = 0) is overwritten, not zeroed.
+inline bool forced_baseline() {
+    return force_mkl_dense || force_mkl_sparse || force_openblas_dense;
+}
 inline constexpr int DEFAULT_BUCKET_LOG_CURVATURE = 50;
 inline bool use_log_buckets = false;
 // ~10% of buckets fall below 1% density

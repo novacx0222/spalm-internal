@@ -93,4 +93,10 @@ struct cpu_execution_options {
     // alternatives offline. Decisions and results do not change; the counts
     // take one pass over each input (key: log_candidate_work, 0 or 1).
     bool log_candidate_work = false;
+
+    // FORCE_OPENBLAS_DENSE: OpenBLAS's GEMM buffers on 2 MiB transparent
+    // huge pages, as MKL's are (huge_pages.h). Needs the SPALM-patched
+    // libopenblas (scripts/build_openblas.sh); fixed once OpenBLAS is loaded
+    // in the process (key: openblas_huge_pages, 0 or 1).
+    bool openblas_huge_pages = false;
 };

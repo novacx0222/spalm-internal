@@ -27,7 +27,13 @@ static void scalar_baseline(
 static void *test_dlopen(const char *, int) {
     return reinterpret_cast<void *>(1);
 }
-static void *test_dlsym(void *, const char *) {
+static int scalar_openblas(
+    int, void *, void *, void *, const int, const int, const int, const int,
+    const int
+);
+static void *test_dlsym(void *, const char *name) {
+    if (std::strcmp(name, "run_baseline_openblas") == 0)
+        return reinterpret_cast<void *>(&scalar_openblas);
     return reinterpret_cast<void *>(&scalar_baseline);
 }
 #define dlopen test_dlopen
@@ -127,6 +133,30 @@ static void scalar_baseline(
         baseline_typed<double>(
             method, ri, rj, rv, rd, si, sj, sv, sd, output, m, k, n
         );
+}
+
+// run_baseline_openblas: the dense product from the inputs spalm.so filled
+// (the same as for MKL dense), overwriting the result.
+template <class T>
+static void openblas_typed(void *rd, void *sd, void *output, int m, int k, int n) {
+    for (int r = 0; r < m; ++r)
+        for (int s = 0; s < n; ++s) {
+            T sum = 0;
+            for (int j = 0; j < k; ++j)
+                sum += static_cast<T *>(rd)[size_t(r) * k + j] *
+                       static_cast<T *>(sd)[size_t(s) * k + j];
+            static_cast<T *>(output)[size_t(r) * n + s] = sum;
+        }
+}
+static int scalar_openblas(
+    int type, void *rd, void *sd, void *output, const int m, const int k,
+    const int n, const int, const int
+) {
+    ++backend_calls;
+    seen_k = k;
+    if (type == 0) openblas_typed<float>(rd, sd, output, m, k, n);
+    else openblas_typed<double>(rd, sd, output, m, k, n);
+    return 0;
 }
 
 template <class T> void check_dispatch() {
@@ -290,21 +320,27 @@ template <class T> void check_key_compaction() {
             assert(output[i] == (s_cols == sj ? reference[i] : T(0)));
         return log.str();
     };
-    for (int mode = 0; mode < 4; ++mode) {
+    // Modes: SS, DD, MKL dense, MKL sparse, OpenBLAS dense (its stub sees
+    // only the dense inputs, so no entry counts).
+    for (int mode = 0; mode < 5; ++mode) {
         assert(init_decision_thresholds(
             mode == 1 ? "dense_bm_inner_kernel" : "sparse", type, "cpu"
         ));
         force_mkl_dense = mode == 2;
         force_mkl_sparse = mode == 3;
+        force_openblas_dense = mode == 4;
+        seen_r_nnz = seen_s_nnz = -1;
         auto log = run(true, sj);
         assert(backend_calls == 1 && seen_k == 5);
-        assert(seen_r_nnz == 6 && seen_s_nnz == 5);
+        if (mode != 4) assert(seen_r_nnz == 6 && seen_s_nnz == 5);
         assert(
             log.find("[csr-key-stats] K=1000->5 compacted") != std::string::npos
         );
         run(false, sj);
-        assert(backend_calls == 1 && seen_k == K && seen_r_nnz == 7);
+        assert(backend_calls == 1 && seen_k == K);
+        if (mode != 4) assert(seen_r_nnz == 7);
     }
+    force_openblas_dense = false;
     // No common key: nothing reaches a backend.
     int disjoint[] = {1, 2, 4, 6, 7, 8};
     assert(init_decision_thresholds("sparse", type, "cpu"));
