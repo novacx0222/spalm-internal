@@ -54,11 +54,14 @@ mkdir -p "$OUT"
 cp -L "$SRC/libopenblas.so" "$OUT/libopenblas.so.tmp"
 mv "$OUT/libopenblas.so.tmp" "$OUT/libopenblas.so"
 
-# The library must use libgomp (not libiomp5) and carry the patch.
+# The library must use libgomp (not libiomp5) and carry the patch. The
+# outputs are captured first: with pipefail, "nm | grep -q" fails when grep
+# stops at its first match and nm then dies of SIGPIPE.
 LDD="$(ldd "$OUT/libopenblas.so")"
-echo "$LDD" | grep -q 'libgomp.so' || { echo "libopenblas.so does not load libgomp:"; echo "$LDD"; exit 1; }
-if echo "$LDD" | grep -q 'libiomp5'; then echo "libopenblas.so loads libiomp5"; exit 1; fi
-nm -D --defined-only "$OUT/libopenblas.so" | grep -q ' openblas_spalm_thp_buffers$' \
+grep -q 'libgomp.so' <<< "$LDD" || { echo "libopenblas.so does not load libgomp:"; echo "$LDD"; exit 1; }
+if grep -q 'libiomp5' <<< "$LDD"; then echo "libopenblas.so loads libiomp5"; exit 1; fi
+SYMBOLS="$(nm -D --defined-only "$OUT/libopenblas.so")"
+grep -q ' openblas_spalm_thp_buffers$' <<< "$SYMBOLS" \
     || { echo "libopenblas.so lacks openblas_spalm_thp_buffers (patch not applied?)"; exit 1; }
 
 {
